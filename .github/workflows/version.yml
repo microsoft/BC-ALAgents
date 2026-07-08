@@ -7,8 +7,8 @@
 # fresh, pinnable version — consumers (BCApps, BC-Bench) pin `uses:`/`engine_ref`
 # to the tag instead of a raw SHA.
 #
-# Each run creates a git tag at the merged commit and a GitHub Release with
-# auto-generated notes.
+# Each run creates a lightweight git tag at the merged commit. GitHub Releases
+# (with notes) are cut manually for notable updates.
 
 name: Version on merge
 
@@ -17,7 +17,7 @@ on:
     branches:
       - main
 
-# Only the release/tag creation needs write; nothing here runs untrusted input.
+# Only the tag creation needs write; nothing here runs untrusted input.
 permissions:
   contents: write
 
@@ -46,12 +46,7 @@ jobs:
           echo "version=$version" >> "$GITHUB_OUTPUT"
           echo "Computed engine version: $version"
 
-      - name: Create tag and GitHub Release
-        env:
-          GH_TOKEN: ${{ github.token }}
+      - name: Create and push tag
         run: |
-          gh release create "${{ steps.version.outputs.version }}" \
-            --repo "${{ github.repository }}" \
-            --target "${{ github.sha }}" \
-            --title "${{ steps.version.outputs.version }}" \
-            --generate-notes
+          git tag "${{ steps.version.outputs.version }}" "${{ github.sha }}"
+          git push origin "${{ steps.version.outputs.version }}"
