@@ -3,9 +3,10 @@
 # Version format: v{major}.{minor}.{bcquality}.{build}
 #   {major}.{minor} — base read from the repo-root VERSION file (bump it
 #                     deliberately for a new minor/major line).
-#   {bcquality}     — the BCQuality content version this engine is pinned to,
-#                     read from `bcquality.version` in agent/bcquality.config.yaml
-#                     (BCQuality cuts a release ~monthly; bumped with its `ref`).
+#   {bcquality}     — the MINOR of the BCQuality version this engine is pinned
+#                     to, read from `bcquality.version` (major.minor) in
+#                     agent/bcquality.config.yaml. BCQuality bumps its minor
+#                     ~monthly; set it there together with `ref`.
 #   {build}         — incremented within the current {major}.{minor} line and
 #                     reset whenever minor bumps (counts existing tags on the line).
 # Each merge therefore produces a fresh, pinnable version — consumers (BCApps,
@@ -51,13 +52,14 @@ jobs:
           major="${base%%.*}"
           minor="${base#*.}"
 
-          # BCQuality content version (3rd segment): the `version:` line under
-          # `bcquality:` in the config, bumped with `ref` on each monthly release.
-          bcq="$(grep -E '^[[:space:]]*version:[[:space:]]*[0-9]+' agent/bcquality.config.yaml | head -1 | grep -oE '[0-9]+' | head -1)"
-          if [[ -z "$bcq" ]]; then
-            echo "::error::agent/bcquality.config.yaml must contain a numeric 'version:' under bcquality:"
+          # BCQuality version (3rd segment = its MINOR): the `version: major.minor`
+          # line under `bcquality:` in the config, bumped with `ref` monthly.
+          bcq_full="$(grep -E '^[[:space:]]*version:[[:space:]]*"?[0-9]+\.[0-9]+' agent/bcquality.config.yaml | head -1 | grep -oE '[0-9]+\.[0-9]+' | head -1)"
+          if [[ -z "$bcq_full" ]]; then
+            echo "::error::agent/bcquality.config.yaml must contain a 'version: major.minor' under bcquality:"
             exit 1
           fi
+          bcq="${bcq_full#*.}"
 
           # Build id (4th segment): incremented within this major.minor line,
           # reset when minor bumps. Counts existing tags on the line.
