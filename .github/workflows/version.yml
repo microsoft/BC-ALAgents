@@ -5,8 +5,9 @@
 #                     deliberately for a new minor/major line).
 #   {bcquality}     — the MINOR of the BCQuality version this engine is pinned
 #                     to, read from `bcquality.version` (major.minor) in
-#                     agent/bcquality.config.yaml. BCQuality bumps its minor
-#                     ~monthly; set it there together with `ref`.
+#                     agent/bcquality.config.yaml. BCQuality's minor only ever
+#                     increments (never resets, even across a major bump), so
+#                     this segment is always unique. Bumped ~monthly with `ref`.
 #   {build}         — incremented within the current {major}.{minor} line and
 #                     reset whenever minor bumps (counts existing tags on the line).
 # Each merge therefore produces a fresh, pinnable version — consumers (BCApps,
