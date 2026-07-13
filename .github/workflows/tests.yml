@@ -1,0 +1,30 @@
+# Runs the PowerShell unit tests (Pester) for the orchestrator's pure helpers.
+# These cover suggestion placement, cross-file dedup signatures, and glob/location
+# matching - the logic most likely to silently corrupt comments if it regresses.
+
+name: Tests
+
+on:
+  pull_request:
+  push:
+    branches:
+      - main
+
+permissions:
+  contents: read
+
+jobs:
+  pester:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Pester
+        shell: pwsh
+        run: Install-Module Pester -MinimumVersion 5.0.0 -Scope CurrentUser -Force -SkipPublisherCheck
+
+      - name: Run tests
+        shell: pwsh
+        run: |
+          $result = Invoke-Pester -Path tests -Output Detailed -PassThru
+          if ($result.FailedCount -gt 0) { throw "$($result.FailedCount) test(s) failed." }
