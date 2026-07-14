@@ -236,6 +236,19 @@ Describe 'Domain metadata' {
         (Get-ExistingCommentKeys -Domain 'security').Keys.Count | Should -Be 2
     }
 
+    It 'does not match a new lowercase exact key to a capitalized target' {
+        $script:DomainComments = @(
+            [pscustomobject]@{
+                body = Get-AgentDomainMetadata -Domain 'security'
+                path = 'src/exact.al'; line = 2; side = 'RIGHT'
+            }
+        )
+        Mock Get-ReviewComments { $script:DomainComments }
+
+        (Get-ExistingCommentKeys -Domain 'security').Keys.Count | Should -Be 1
+        (Get-ExistingCommentKeys -Domain 'Security').Keys.Count | Should -Be 0
+    }
+
     It 'reads both legacy single-token heading formats' {
         $script:DomainComments = @(
             [pscustomobject]@{
