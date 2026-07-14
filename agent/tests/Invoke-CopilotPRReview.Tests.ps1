@@ -1,3 +1,15 @@
+[Diagnostics.CodeAnalysis.SuppressMessageAttribute(
+    'PSUseDeclaredVarsMoreThanAssignments',
+    '',
+    Justification = 'The imported functions resolve these test fixtures through PowerShell dynamic scope.'
+)]
+[Diagnostics.CodeAnalysis.SuppressMessageAttribute(
+    'PSUseBOMForUnicodeEncodedFile',
+    '',
+    Justification = 'The test intentionally covers Unicode domain labels and rendered Unicode output.'
+)]
+param()
+
 BeforeAll {
     $scriptPath = Join-Path (Join-Path (Split-Path -Parent $PSScriptRoot) 'scripts') 'Invoke-CopilotPRReview.ps1'
     $tokens = $null
@@ -15,7 +27,8 @@ BeforeAll {
         param($node)
         $node -is [System.Management.Automation.Language.FunctionDefinitionAst]
     }, $true) | ForEach-Object {
-        Invoke-Expression $_.Extent.Text
+        $functionDefinition = [scriptblock]::Create($_.Extent.Text)
+        . $functionDefinition
     }
 
     $DomainMap = @{
