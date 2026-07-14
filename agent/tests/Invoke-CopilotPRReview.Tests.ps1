@@ -305,7 +305,7 @@ Describe 'Domain grouping and caps' {
             [pscustomobject]@{ inline = $Findings.Count; fallback = 0 }
         }
 
-        $summary = Post-FindingsByDomain -Findings $findings -LineMaps @{} -ChangedFileSet @{}
+        $summary = Publish-FindingsByDomain -Findings $findings -LineMaps @{} -ChangedFileSet @{}
         $summary.Count | Should -Be $labels.Count
         foreach ($label in $labels) {
             $summary.ContainsKey($label) | Should -BeTrue

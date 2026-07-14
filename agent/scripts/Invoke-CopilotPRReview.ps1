@@ -2405,7 +2405,7 @@ function Write-FindingsBreakdown {
     }
 }
 
-function Post-FindingsByDomain {
+function Publish-FindingsByDomain {
     param(
         [object[]] $Findings,
         [hashtable] $LineMaps,
@@ -2824,7 +2824,7 @@ $domainSummary = Get-OrdinalDictionary
 $shouldPostFindings = $report.Outcome -in @('completed', 'partial')
 
 if ($shouldPostFindings -and $report.Findings.Count -gt 0) {
-    $domainSummary = Post-FindingsByDomain -Findings $report.Findings `
+    $domainSummary = Publish-FindingsByDomain -Findings $report.Findings `
         -LineMaps $lineMaps -ChangedFileSet $changedFileSet
 } elseif ($report.Outcome -in @('not-applicable', 'no-knowledge')) {
     Write-Host "Outcome '$($report.Outcome)' — no findings posted; updating summary only."
