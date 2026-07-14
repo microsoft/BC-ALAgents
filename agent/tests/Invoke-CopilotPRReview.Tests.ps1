@@ -297,7 +297,9 @@ Describe 'Domain grouping and caps' {
         foreach ($label in $labels) {
             $summary.ContainsKey($label) | Should -BeTrue
             $summary[$label].findings | Should -Be 1
-            Should -Invoke Post-Findings -Times 1 -ParameterFilter { $Domain -ceq $label }
+            Should -Invoke Post-Findings -Times 1 -ParameterFilter {
+                [System.StringComparer]::Ordinal.Equals($Domain, $label)
+            }
         }
 
         $body = Build-SummaryBody -Outcome completed -OutcomeReason '' -DomainSummary $summary `
@@ -328,6 +330,20 @@ Describe 'Domain grouping and caps' {
 }
 
 Describe 'Domain rendering safety' {
+    It 'preserves domain case in fallback headings' {
+        $finding = [pscustomobject]@{
+            domain = 'API'
+            severity = 'High'
+            issue = ''
+            recommendation = ''
+            suggestedCode = ''
+            references = @()
+            isAgentFinding = $false
+        }
+
+        Build-CommentBody -Finding $finding | Should -Match '### High API finding'
+    }
+
     It 'escapes domain labels in LaTeX comment preheaders' {
         $finding = [pscustomobject]@{
             domain = 'API | 100%_safe & C#'

@@ -1941,7 +1941,7 @@ function Build-CommentBody {
         @()
     }
     $lead = if ($leadSplit.Count -gt 0) { $leadSplit[0].Trim() } else {
-        "$severity $(ConvertTo-MarkdownTableCell -Value $domain.ToLowerInvariant()) finding"
+        "$severity $(ConvertTo-MarkdownTableCell -Value $domain) finding"
     }
     # Remainder of the issue paragraph after the lead sentence. The lead is
     # already shown as the H3 heading, so re-emitting the full issue body would
