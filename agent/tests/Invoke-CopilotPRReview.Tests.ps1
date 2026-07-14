@@ -136,20 +136,30 @@ Describe 'Agent domain normalization' {
 Describe 'Domain metadata' {
     It 'round-trips a multi-word domain through collision-safe metadata' {
         $metadata = Get-AgentDomainMetadata -Domain 'Breaking Changes'
+        $parsed = Get-CommentDomainMetadata -Body $metadata
+
+        $parsed.Kind | Should -BeExactly 'ExactKey'
         Get-CommentDomainMetadataKey -Body $metadata |
             Should -Be (ConvertTo-DomainMetadataKey -Domain 'Breaking Changes')
     }
 
     It 'reads legacy single-token metadata' {
-        Get-CommentDomainMetadataKey -Body '<!-- agent_domain: security -->' |
+        $metadata = '<!-- agent_domain: security -->'
+        (Get-CommentDomainMetadata -Body $metadata).Kind | Should -BeExactly 'LegacyLabel'
+        Get-CommentDomainMetadataKey -Body $metadata |
             Should -Be (ConvertTo-DomainMetadataKey -Domain 'security')
     }
 
     It 'does not collide special-character or hyphen-equivalent labels' {
+        $decomposed = "Cafe$([char]0x0301)"
         $labels = @(
             'Breaking Changes',
             'API & Web Services',
             'API/Web Services',
+            'API',
+            'api',
+            'API Web Services',
+            'API  Web Services',
             'C#',
             'C++',
             '!!!',
@@ -158,6 +168,8 @@ Describe 'Domain metadata' {
             'A B',
             'A_B',
             'Sécurité',
+            'Café',
+            $decomposed,
             'Security',
             'security'
         )
@@ -226,14 +238,48 @@ Describe 'Domain grouping and caps' {
                     @{
                         id = 'unicode'; domain = 'Sécurité'; severity = 'minor'; message = 'Sixth'
                         location = @{ file = 'src/a.al'; line = 6 }; references = @()
+                    },
+                    @{
+                        id = 'api-upper'; domain = 'API'; severity = 'minor'; message = 'Seventh'
+                        location = @{ file = 'src/a.al'; line = 7 }; references = @()
+                    },
+                    @{
+                        id = 'api-lower'; domain = 'api'; severity = 'minor'; message = 'Eighth'
+                        location = @{ file = 'src/a.al'; line = 8 }; references = @()
+                    },
+                    @{
+                        id = 'space-one'; domain = 'API Web Services'; severity = 'minor'; message = 'Ninth'
+                        location = @{ file = 'src/a.al'; line = 9 }; references = @()
+                    },
+                    @{
+                        id = 'space-two'; domain = 'API  Web Services'; severity = 'minor'; message = 'Tenth'
+                        location = @{ file = 'src/a.al'; line = 10 }; references = @()
+                    },
+                    @{
+                        id = 'composed'; domain = 'Café'; severity = 'minor'; message = 'Eleventh'
+                        location = @{ file = 'src/a.al'; line = 11 }; references = @()
+                    },
+                    @{
+                        id = 'decomposed'; domain = "Cafe$([char]0x0301)"; severity = 'minor'; message = 'Twelfth'
+                        location = @{ file = 'src/a.al'; line = 12 }; references = @()
                     }
                 )
             } | ConvertTo-Json -Depth 8
 
             $findings = (Parse-BCQualityReport -Output $json).Findings
-            $findings.Count | Should -Be 5
+            $findings.Count | Should -Be 11
             @(Get-OrdinalSortedDomainLabels -Labels $findings.domain) |
-                Should -Be @('API & Web Services', 'API/Web Services', 'Security', 'Sécurité', 'security')
+                Should -Contain 'API'
+            @(Get-OrdinalSortedDomainLabels -Labels $findings.domain) |
+                Should -Contain 'api'
+            @(Get-OrdinalSortedDomainLabels -Labels $findings.domain) |
+                Should -Contain 'API Web Services'
+            @(Get-OrdinalSortedDomainLabels -Labels $findings.domain) |
+                Should -Contain 'API  Web Services'
+            @(Get-OrdinalSortedDomainLabels -Labels $findings.domain) |
+                Should -Contain 'Café'
+            @(Get-OrdinalSortedDomainLabels -Labels $findings.domain) |
+                Should -Contain "Cafe$([char]0x0301)"
             ($findings | Where-Object domain -CEQ 'API & Web Services').severity | Should -Be 'High'
         }
         finally {
@@ -259,6 +305,20 @@ Describe 'Domain rendering safety' {
         $body | Should -Match '\\&'
         $body | Should -Match 'C\\#'
         $body | Should -Not -Match '<!-- agent_domain:'
+    }
+
+    It 'preserves exact case in the empty-message fallback heading' {
+        $finding = [pscustomobject]@{
+            domain = 'API'
+            severity = 'High'
+            issue = ''
+            recommendation = ''
+            suggestedCode = ''
+            references = @()
+            isAgentFinding = $false
+        }
+
+        Build-CommentBody -Finding $finding | Should -Match '(?m)^### High API finding$'
     }
 
     It 'escapes markdown table separators, formatting, and HTML' {

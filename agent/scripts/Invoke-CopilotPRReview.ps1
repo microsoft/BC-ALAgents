@@ -1925,7 +1925,7 @@ function Build-CommentBody {
         @()
     }
     $lead = if ($leadSplit.Count -gt 0) { $leadSplit[0].Trim() } else {
-        "$severity $(ConvertTo-MarkdownTableCell -Value $domain.ToLowerInvariant()) finding"
+        "$severity $(ConvertTo-MarkdownTableCell -Value $domain) finding"
     }
     # Remainder of the issue paragraph after the lead sentence. The lead is
     # already shown as the H3 heading, so re-emitting the full issue body would
@@ -2009,54 +2009,49 @@ function Add-CommentNotice {
 # ---------------------------------------------------------------------------
 # Duplicate detection
 # ---------------------------------------------------------------------------
-function Get-CommentDomainMetadataKey {
+function Get-CommentDomainMetadata {
     param([string] $Body)
 
     $bodyValue = $Body ?? ''
     if ($bodyValue -match '<!-- agent_domain_key:\s*([A-Za-z0-9_-]+)\s*-->') {
-        return $Matches[1]
+        return [pscustomobject]@{ Kind = 'ExactKey'; Value = $Matches[1] }
     }
 
     # Backward compatibility for comments emitted before collision-safe keys.
     if ($bodyValue -match '<!-- agent_domain:\s*([a-z0-9_-]+)\s*-->') {
-        return ConvertTo-DomainMetadataKey -Domain $Matches[1]
+        return [pscustomobject]@{ Kind = 'LegacyLabel'; Value = $Matches[1] }
     }
 
     $newHeadingPattern = '^#{1,6}\s+(?:🔴|🟠|🟡|🟢|⚪)?\s*(Critical|High|Medium|Low)\s+([^\r\n]+?)\s+-'
     $oldHeadingPattern = '^#{1,6}\s+([^\r\n]+?)\s+-\s+(Critical|High|Medium|Low)\s+Severity'
     if ($bodyValue -match $newHeadingPattern) {
-        return ConvertTo-DomainMetadataKey -Domain $Matches[2]
+        return [pscustomobject]@{ Kind = 'LegacyLabel'; Value = $Matches[2] }
     }
     if ($bodyValue -match $oldHeadingPattern) {
-        return ConvertTo-DomainMetadataKey -Domain $Matches[1]
+        return [pscustomobject]@{ Kind = 'LegacyLabel'; Value = $Matches[1] }
     }
     return $null
+}
+
+function Get-CommentDomainMetadataKey {
+    param([string] $Body)
+
+    $metadata = Get-CommentDomainMetadata -Body $Body
+    if (-not $metadata) { return $null }
+    if ($metadata.Kind -eq 'ExactKey') { return $metadata.Value }
+    return ConvertTo-DomainMetadataKey -Domain $metadata.Value
 }
 
 function Test-CommentDomainMatch {
     param([string] $Body, [string] $Domain)
 
-    $bodyValue = $Body ?? ''
-    if ($bodyValue -match '<!-- agent_domain_key:\s*([A-Za-z0-9_-]+)\s*-->') {
-        return $Matches[1] -ceq (ConvertTo-DomainMetadataKey -Domain $Domain)
-    }
+    $metadata = Get-CommentDomainMetadata -Body $Body
+    if (-not $metadata) { return $false }
 
-    # Legacy metadata and headings stored display-derived single-token values.
-    # Preserve their historical case-insensitive comparison without weakening
-    # the exact identity used by newly emitted metadata.
-    if ($bodyValue -match '<!-- agent_domain:\s*([a-z0-9_-]+)\s*-->') {
-        return [string]::Equals($Matches[1], $Domain, [System.StringComparison]::OrdinalIgnoreCase)
+    if ($metadata.Kind -eq 'ExactKey') {
+        return $metadata.Value -ceq (ConvertTo-DomainMetadataKey -Domain $Domain)
     }
-
-    $newHeadingPattern = '^#{1,6}\s+(?:🔴|🟠|🟡|🟢|⚪)?\s*(Critical|High|Medium|Low)\s+([^\r\n]+?)\s+-'
-    $oldHeadingPattern = '^#{1,6}\s+([^\r\n]+?)\s+-\s+(Critical|High|Medium|Low)\s+Severity'
-    if ($bodyValue -match $newHeadingPattern) {
-        return [string]::Equals($Matches[2], $Domain, [System.StringComparison]::OrdinalIgnoreCase)
-    }
-    if ($bodyValue -match $oldHeadingPattern) {
-        return [string]::Equals($Matches[1], $Domain, [System.StringComparison]::OrdinalIgnoreCase)
-    }
-    return $false
+    return [string]::Equals($metadata.Value, $Domain, [System.StringComparison]::OrdinalIgnoreCase)
 }
 
 function Get-ExistingCommentKeys {
