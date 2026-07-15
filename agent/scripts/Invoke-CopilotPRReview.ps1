@@ -26,9 +26,9 @@
          the PR head is exposed via a sibling worktree path.
       4. Parse the agent's findings-report (DO contract), map BCQuality
          severities (blocker/major/minor/info) to the existing
-         Critical/High/Medium/Low taxonomy, derive domain labels from
-         each finding's from-sub-skill, and surface knowledge references
-         in each inline comment.
+         Critical/High/Medium/Low taxonomy, prefer each finding's emitted
+         domain label (with a legacy from-sub-skill fallback), and surface
+         knowledge references in each inline comment.
       5. Upsert a single PR summary comment that reports per-domain
          counts, knowledge-files suppressed by layer precedence, skill
          sub-skills the super-skill skipped, and the orchestrator's own
@@ -128,9 +128,9 @@ $ReportFileName   = '_review-report.json'
 $SeverityOrder = @{ Critical = 0; High = 1; Medium = 2; Low = 3 }
 $BCQualitySeverityMap = @{ blocker = 'Critical'; major = 'High'; minor = 'Medium'; info = 'Low' }
 
-# Mapping of BCQuality sub-skill ids to the orchestrator's existing domain
-# labels (used for inline-comment metadata and per-domain counts in the
-# summary). New sub-skills land in 'Other' until added here.
+# Legacy fallback mapping for BCQuality refs that predate findings[].domain.
+# Current producers own their human-readable labels, so new domains must not be
+# duplicated here. Unmapped legacy sub-skills fall back to Other.
 $DomainMap = @{
     'al-security-review'     = 'Security'
     'al-privacy-review'      = 'Privacy'
@@ -939,16 +939,54 @@ function Convert-BCQualitySeverity {
     return $null
 }
 
+function Get-ExplicitFindingDomain {
+    param([object] $Finding)
+
+    if (-not $Finding -or -not $Finding.PSObject) { return $null }
+
+    # Prefer the contract's lowercase spelling, while accepting objects created
+    # by case-preserving PowerShell callers that expose Domain instead.
+    foreach ($propertyName in @('domain', 'Domain')) {
+        $property = $Finding.PSObject.Properties |
+            Where-Object { $_.Name -ceq $propertyName } |
+            Select-Object -First 1
+        if ($property -and $null -ne $property.Value) {
+            $label = ([string]$property.Value).Trim()
+            if (-not [string]::IsNullOrWhiteSpace($label)) { return $label }
+        }
+    }
+    return $null
+}
+
 function Resolve-FindingDomain {
     param([object] $Finding)
+
+    $explicitDomain = Get-ExplicitFindingDomain -Finding $Finding
+    if ($explicitDomain) { return $explicitDomain }
+
     $fromSub = $null
     if ($Finding -and $Finding.PSObject -and $Finding.PSObject.Properties.Match('from-sub-skill').Count -gt 0) {
         $fromSub = [string]$Finding.'from-sub-skill'
     } elseif ($Finding -and $Finding.PSObject -and $Finding.PSObject.Properties.Match('from_sub_skill').Count -gt 0) {
         $fromSub = [string]$Finding.from_sub_skill
     }
+    $fromSub = ($fromSub ?? '').Trim()
     if ($fromSub -and $DomainMap.ContainsKey($fromSub)) { return $DomainMap[$fromSub] }
     return 'Other'
+}
+
+function Get-OrdinalDictionary {
+    return [System.Collections.Generic.Dictionary[string, object]]::new(
+        [System.StringComparer]::Ordinal
+    )
+}
+
+function Get-OrdinalSortedKey {
+    param([System.Collections.IDictionary] $Dictionary)
+
+    [string[]]$keys = @($Dictionary.Keys)
+    [Array]::Sort($keys, [System.StringComparer]::Ordinal)
+    return $keys
 }
 
 function Find-BalancedJsonCandidates {
@@ -1399,12 +1437,13 @@ function Parse-BCQualityReport {
             }
         }
 
+        $explicitDomain = Get-ExplicitFindingDomain -Finding $f
         $domain = Resolve-FindingDomain -Finding $f
-        # If the finding is marked as agent-finding via knowledge-backed=false
-        # but lacks from-sub-skill="agent", the domain map fell through to
-        # 'Other' — override so agent findings consistently land in the
-        # 'Agent' domain bucket.
-        if ($isAgentFinding -and $domain -eq 'Other') { $domain = 'Agent' }
+        # Preserve emitted labels even for agent-judgement findings: leaf skills
+        # may intentionally keep their own domain. Only retain the historical
+        # Agent override when an older producer supplied no label and no mapped
+        # sub-skill domain.
+        if ($isAgentFinding -and -not $explicitDomain -and $domain -eq 'Other') { $domain = 'Agent' }
 
         # Split the message on a conventional 'Recommendation:' or 'Fix:'
         # marker so the inline comment can render guidance separately. The
@@ -1509,13 +1548,13 @@ function Parse-BCQualityReport {
     $subResultCount = $subResults.Count
 
     # Per-domain cap, then global sort.
-    $byDomain = @{}
+    $byDomain = Get-OrdinalDictionary
     foreach ($f in $normalized) {
         if (-not $byDomain.ContainsKey($f.domain)) { $byDomain[$f.domain] = [System.Collections.Generic.List[object]]::new() }
         $byDomain[$f.domain].Add($f) | Out-Null
     }
     $capped = [System.Collections.Generic.List[object]]::new()
-    foreach ($d in $byDomain.Keys) {
+    foreach ($d in (Get-OrdinalSortedKey -Dictionary $byDomain)) {
         $sorted = $byDomain[$d] |
             Sort-Object @{Expression = { $SeverityOrder[$_.severity] }}, filePath, lineNumber |
             Select-Object -First $MaxFindings
@@ -1566,11 +1605,11 @@ function Write-ConsumedBCQualityLog {
 
     # Aggregate per-skill data from SubResults; fall back to from-sub-skill on
     # findings when the super-skill did not return sub-results[].
-    $skillMap = [ordered]@{}
+    $skillMap = Get-OrdinalDictionary
     foreach ($sr in $subResults) {
         if ($null -eq $sr) { continue }
         $sid = if ($sr.id) { [string]$sr.id } else { '(unknown)' }
-        if (-not $skillMap.Contains($sid)) {
+        if (-not $skillMap.ContainsKey($sid)) {
             $skillMap[$sid] = [pscustomobject]@{
                 Outcome      = [string]$sr.outcome
                 FindingCount = if ($null -ne $sr.findingCount) { [int]$sr.findingCount } else { 0 }
@@ -1592,7 +1631,7 @@ function Write-ConsumedBCQualityLog {
             if ($null -eq $f) { continue }
             $bucket = [string]$f.domain
             if (-not $bucket) { $bucket = 'Other' }
-            if (-not $skillMap.Contains($bucket)) {
+            if (-not $skillMap.ContainsKey($bucket)) {
                 $skillMap[$bucket] = [pscustomobject]@{
                     Outcome      = ''
                     FindingCount = 0
@@ -1610,7 +1649,12 @@ function Write-ConsumedBCQualityLog {
         Write-Host '  (no sub-skills reported by the agent)'
     } else {
         Write-Host "Sub-skills executed ($($skillMap.Count)):"
-        foreach ($sid in $skillMap.Keys) {
+        $skillKeys = if ($useDomainFallback) {
+            Get-OrdinalSortedKey -Dictionary $skillMap
+        } else {
+            @($skillMap.Keys)
+        }
+        foreach ($sid in $skillKeys) {
             $entry = $skillMap[$sid]
             $parts = [System.Collections.Generic.List[string]]::new()
             if ($entry.Outcome)          { $parts.Add("outcome=$($entry.Outcome)") | Out-Null }
@@ -1785,9 +1829,26 @@ function Get-AgentLabelMetadata {
     return "<!-- agent_label: $AgentLabel -->"
 }
 
+function ConvertTo-DomainMetadataKey {
+    param([string] $Domain)
+
+    if ([string]::IsNullOrWhiteSpace($Domain)) { return '' }
+    $bytes = [System.Text.Encoding]::UTF8.GetBytes($Domain.Trim())
+    return [Convert]::ToBase64String($bytes).TrimEnd('=').Replace('+', '-').Replace('/', '_')
+}
+
+function ConvertTo-LegacyDomainKey {
+    param([string] $Domain)
+
+    if ([string]::IsNullOrWhiteSpace($Domain)) { return '' }
+    return $Domain.Trim().ToLowerInvariant()
+}
+
 function Get-AgentDomainMetadata {
     param([string] $Domain)
-    return "<!-- agent_domain: $($Domain.ToLowerInvariant()) -->"
+    # The key is base64url-encoded rather than slugged: visually similar labels
+    # such as C#, C++, "a-b", and "a b" must never share a dedup bucket.
+    return "<!-- agent_domain_key: $(ConvertTo-DomainMetadataKey -Domain $Domain) -->"
 }
 
 function Get-AgentFindingMetadata {
@@ -1860,6 +1921,51 @@ function Build-ReferenceLink {
     return "[$path]($url)"
 }
 
+function ConvertTo-LaTexText {
+    param([string] $Value)
+
+    $singleLine = [regex]::Replace(($Value ?? ''), '[\r\n\t]+', ' ')
+    $escaped = [regex]::Replace($singleLine, '[\\{}$&#%_^~]', {
+        param($match)
+        switch ($match.Value) {
+            '\' { return '\textbackslash{}' }
+            '{' { return '\{' }
+            '}' { return '\}' }
+            '$' { return '\$' }
+            '&' { return '\&' }
+            '#' { return '\#' }
+            '%' { return '\%' }
+            '_' { return '\_' }
+            '^' { return '\textasciicircum{}' }
+            '~' { return '\textasciitilde{}' }
+        }
+    })
+    return $escaped.Replace(' ', '\ ')
+}
+
+function ConvertTo-MarkdownTableCell {
+    param([string] $Value)
+
+    $singleLine = [regex]::Replace(($Value ?? ''), '[\r\n\t]+', ' ')
+    $escaped = $singleLine.Replace('\', '\\').
+        Replace('|', '\|').
+        Replace('`', '\`').
+        Replace('*', '\*').
+        Replace('_', '\_').
+        Replace('~', '\~').
+        Replace('[', '\[').
+        Replace(']', '\]').
+        Replace('(', '\(').
+        Replace(')', '\)').
+        Replace('#', '\#').
+        Replace('!', '\!')
+    $encoded = [System.Net.WebUtility]::HtmlEncode($escaped)
+    return $encoded.
+        Replace('$', '&#36;').
+        Replace('@', '&#64;').
+        Replace(':', '&#58;')
+}
+
 function Build-CommentBody {
     param([object] $Finding, [switch] $SuppressSuggestion)
 
@@ -1872,20 +1978,20 @@ function Build-CommentBody {
     $isAgentFinding = [bool]$Finding.isAgentFinding
 
     $normalizedIssue = [regex]::Replace($issue, '\s+', ' ').Trim()
-    $leadSplit = if ($normalizedIssue) {
-        $normalizedIssue -split '(?<=[.!?])\s+', 2
+    [string[]]$leadSplit = if ($normalizedIssue) {
+        @($normalizedIssue -split '(?<=[.!?])\s+', 2)
     } else {
         @()
     }
     $lead = if ($leadSplit.Count -gt 0) { $leadSplit[0].Trim() } else {
-        "$severity $($domain.ToLowerInvariant()) finding"
+        "$severity $(ConvertTo-MarkdownTableCell -Value $domain) finding"
     }
     # Remainder of the issue paragraph after the lead sentence. The lead is
     # already shown as the H3 heading, so re-emitting the full issue body would
     # duplicate that first sentence in the comment.
     $issueRemainder = if ($leadSplit.Count -gt 1) { $leadSplit[1].Trim() } else { '' }
 
-    $preheaderDomain = (($domain -split '\s+') -join '\ ')
+    $preheaderDomain = ConvertTo-LaTexText -Value $domain
     $preheader = '$\textbf{' + (Get-SeverityBadge -Severity $severity) + '\ ' + $severity + '\ Severity\ —\ ' + $preheaderDomain + '} \quad \color{gray}{\texttt{\small Iteration\ ' + $ReviewIteration + '}}$'
 
     $lines = [System.Collections.Generic.List[string]]::new()
@@ -1930,7 +2036,7 @@ function Build-CommentBody {
             if (-not $ref.path) { continue }
             $lines.Add("- $(Build-ReferenceLink -Reference $ref)") | Out-Null
         }
-    } elseif ($isAgentFinding -and $domain -ne 'Agent') {
+    } elseif ($isAgentFinding -and $domain -cne 'Agent') {
         # Distinguish agent-judgement findings from knowledge-backed ones so
         # the reader can tell which bucket this falls into, without
         # undermining a finding that may still be high-confidence and
@@ -1962,28 +2068,58 @@ function Add-CommentNotice {
 # ---------------------------------------------------------------------------
 # Duplicate detection
 # ---------------------------------------------------------------------------
+function Get-CommentDomainMetadataKey {
+    param([string] $Body)
+
+    $bodyValue = $Body ?? ''
+    if ($bodyValue -match '<!-- agent_domain_key:\s*([A-Za-z0-9_-]+)\s*-->') {
+        return [pscustomobject]@{ Kind = 'Exact'; Key = $Matches[1] }
+    }
+
+    # Legacy comments used lowercased single-token metadata or headings.
+    # Keep that lossy comparison isolated from exact metadata emitted today.
+    if ($bodyValue -match '<!-- agent_domain:\s*([A-Za-z0-9_-]+)\s*-->') {
+        return [pscustomobject]@{
+            Kind = 'Legacy'
+            Key = ConvertTo-LegacyDomainKey -Domain $Matches[1]
+        }
+    }
+
+    $newHeadingPattern = '^#{1,6}\s+(?:🔴|🟠|🟡|🟢|⚪)?\s*(Critical|High|Medium|Low)\s+([A-Za-z0-9_-]+)\s+-'
+    $oldHeadingPattern = '^#{1,6}\s+([A-Za-z0-9_-]+)\s+-\s+(Critical|High|Medium|Low)\s+Severity'
+    if ($bodyValue -match $newHeadingPattern) {
+        return [pscustomobject]@{
+            Kind = 'Legacy'
+            Key = ConvertTo-LegacyDomainKey -Domain $Matches[2]
+        }
+    }
+    if ($bodyValue -match $oldHeadingPattern) {
+        return [pscustomobject]@{
+            Kind = 'Legacy'
+            Key = ConvertTo-LegacyDomainKey -Domain $Matches[1]
+        }
+    }
+    return $null
+}
+
 function Get-ExistingCommentKeys {
     param([string] $Domain)
 
     $keys = [System.Collections.Generic.HashSet[string]]::new()
     $locations = [System.Collections.Generic.List[object]]::new()
-    $metadataPattern = '<!-- agent_domain:\s*([a-z0-9_-]+)\s*-->'
-    $newHeadingPattern = '^#{1,6}\s+(?:🔴|🟠|🟡|🟢|⚪)?\s*(Critical|High|Medium|Low)\s+([A-Za-z0-9_-]+)\s+-'
-    $oldHeadingPattern = '^#{1,6}\s+([A-Za-z0-9_-]+)\s+-\s+(Critical|High|Medium|Low)\s+Severity'
+    $targetExactKey = ConvertTo-DomainMetadataKey -Domain $Domain
+    $targetLegacyKey = ConvertTo-LegacyDomainKey -Domain $Domain
 
     foreach ($comment in (Get-ReviewComments)) {
         $body = $comment.body ?? ''
-        $commentDomain = $null
-
-        if ($body -match $metadataPattern) {
-            $commentDomain = $Matches[1].ToLower()
-        } elseif ($body -match $newHeadingPattern) {
-            $commentDomain = $Matches[2].ToLower()
-        } elseif ($body -match $oldHeadingPattern) {
-            $commentDomain = $Matches[1].ToLower()
+        $commentMetadata = Get-CommentDomainMetadataKey -Body $body
+        if ($null -eq $commentMetadata) { continue }
+        $matchesDomain = if ($commentMetadata.Kind -ceq 'Exact') {
+            $commentMetadata.Key -ceq $targetExactKey
+        } else {
+            $commentMetadata.Key -ceq $targetLegacyKey
         }
-
-        if ($commentDomain -ne $Domain.ToLower()) { continue }
+        if (-not $matchesDomain) { continue }
         $path = $comment.path ?? ''
         $line = $comment.line ?? $comment.original_line ?? 0
         $side = $comment.side ?? 'RIGHT'
@@ -2154,7 +2290,7 @@ function Load-FilterReport {
 function Build-SummaryBody {
     param(
         [string] $Outcome, [string] $OutcomeReason,
-        [hashtable] $DomainSummary,
+        [System.Collections.IDictionary] $DomainSummary,
         [object[]] $Suppressed,
         [object[]] $SkippedSubSkills,
         [object] $FilterReport
@@ -2196,13 +2332,14 @@ function Build-SummaryBody {
         $lines.Add('|---|---:|---:|---:|---:|---:|') | Out-Null
         $totalBacked = 0
         $totalAgent  = 0
-        foreach ($d in ($DomainSummary.Keys | Sort-Object)) {
+        foreach ($d in (Get-OrdinalSortedKey -Dictionary $DomainSummary)) {
             $entry = $DomainSummary[$d]
             $backed = if ($entry.ContainsKey('knowledgeBacked')) { [int]$entry.knowledgeBacked } else { [int]$entry.findings }
             $agent  = if ($entry.ContainsKey('agentFindings'))   { [int]$entry.agentFindings }   else { 0 }
             $totalBacked += $backed
             $totalAgent  += $agent
-            $lines.Add("| $d | $($entry.findings) | $backed | $agent | $($entry.inline) | $($entry.fallback) |") | Out-Null
+            $safeDomain = ConvertTo-MarkdownTableCell -Value ([string]$d)
+            $lines.Add("| $safeDomain | $($entry.findings) | $backed | $agent | $($entry.inline) | $($entry.fallback) |") | Out-Null
         }
         if (($totalBacked + $totalAgent) -gt 0) {
             $lines.Add('') | Out-Null
@@ -2274,7 +2411,7 @@ function Write-FindingsBreakdown {
     param([object[]] $Findings)
 
     $sev = [ordered]@{ Critical = 0; High = 0; Medium = 0; Low = 0 }
-    $domains = @{}
+    $domains = Get-OrdinalDictionary
     $backed = 0
     $agent  = 0
     foreach ($f in @($Findings)) {
@@ -2290,9 +2427,47 @@ function Write-FindingsBreakdown {
     Write-LogPhaseDetail "By severity: $sevLine"
     Write-LogPhaseDetail "By origin:   knowledge-backed: $backed  agent: $agent"
     if ($domains.Count -gt 0) {
-        $domainLine = ($domains.Keys | Sort-Object | ForEach-Object { "$($_): $($domains[$_])" }) -join '  '
+        $domainLine = (Get-OrdinalSortedKey -Dictionary $domains |
+            ForEach-Object { "$($_): $($domains[$_])" }) -join '  '
         Write-LogPhaseDetail "By domain:   $domainLine"
     }
+}
+
+function Publish-FindingsByDomain {
+    param(
+        [object[]] $Findings,
+        [hashtable] $LineMaps,
+        [hashtable] $ChangedFileSet
+    )
+
+    $findingsByDomain = Get-OrdinalDictionary
+    foreach ($finding in $Findings) {
+        $domain = [string]$finding.domain
+        if (-not $findingsByDomain.ContainsKey($domain)) {
+            $findingsByDomain[$domain] = [System.Collections.Generic.List[object]]::new()
+        }
+        $findingsByDomain[$domain].Add($finding) | Out-Null
+    }
+
+    $domainSummary = Get-OrdinalDictionary
+    foreach ($domain in (Get-OrdinalSortedKey -Dictionary $findingsByDomain)) {
+        $domainFindings = @($findingsByDomain[$domain])
+        Write-Host "Posting $($domainFindings.Count) $domain finding(s)…"
+        $posted = Post-Findings -Domain $domain -Findings $domainFindings `
+            -LineMaps $LineMaps -ChangedFileSet $ChangedFileSet
+        $agentCount = @($domainFindings | Where-Object { $_.isAgentFinding }).Count
+        $backedCount = $domainFindings.Count - $agentCount
+        Write-LogPhaseDetail "inline: $($posted.inline)  fallback: $($posted.fallback)  knowledge-backed: $backedCount  agent: $agentCount"
+        $domainSummary[$domain] = @{
+            findings        = $domainFindings.Count
+            inline          = $posted.inline
+            fallback        = $posted.fallback
+            knowledgeBacked = $backedCount
+            agentFindings   = $agentCount
+        }
+    }
+
+    return $domainSummary
 }
 
 function Test-MechanicalLookingFinding {
@@ -2671,32 +2846,12 @@ if ($ReviewSource -eq 'local') {
 
 # --- Phase 4: Post comments -------------------------------------------------
 Write-LogGroup 'Post comments'
-$domainSummary = @{}
+$domainSummary = Get-OrdinalDictionary
 $shouldPostFindings = $report.Outcome -in @('completed', 'partial')
 
 if ($shouldPostFindings -and $report.Findings.Count -gt 0) {
-    $findingsByDomain = @{}
-    foreach ($finding in $report.Findings) {
-        $d = $finding.domain
-        if (-not $findingsByDomain.ContainsKey($d)) { $findingsByDomain[$d] = [System.Collections.Generic.List[object]]::new() }
-        $findingsByDomain[$d].Add($finding) | Out-Null
-    }
-
-    foreach ($d in ($findingsByDomain.Keys | Sort-Object)) {
-        $df = @($findingsByDomain[$d])
-        Write-Host "Posting $($df.Count) $d finding(s)…"
-        $posted = Post-Findings -Domain $d -Findings $df -LineMaps $lineMaps -ChangedFileSet $changedFileSet
-        $agentCount  = @($df | Where-Object { $_.isAgentFinding }).Count
-        $backedCount = $df.Count - $agentCount
-        Write-LogPhaseDetail "inline: $($posted.inline)  fallback: $($posted.fallback)  knowledge-backed: $backedCount  agent: $agentCount"
-        $domainSummary[$d] = @{
-            findings        = $df.Count
-            inline          = $posted.inline
-            fallback        = $posted.fallback
-            knowledgeBacked = $backedCount
-            agentFindings   = $agentCount
-        }
-    }
+    $domainSummary = Publish-FindingsByDomain -Findings $report.Findings `
+        -LineMaps $lineMaps -ChangedFileSet $changedFileSet
 } elseif ($report.Outcome -in @('not-applicable', 'no-knowledge')) {
     Write-Host "Outcome '$($report.Outcome)' — no findings posted; updating summary only."
 } elseif ($report.Outcome -eq 'failed') {

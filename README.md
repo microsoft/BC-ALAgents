@@ -61,13 +61,18 @@ automatically. To review a specific PR (e.g. from `workflow_dispatch`), pass
 
 ### Versioning
 
-Every merge to `main` cuts a new `X.Y.Z` git tag: `X` is the major workflow
-contract version (currently `1`), `Y` automatically increments for each engine
-commit, and `Z` is the minor of the pinned BCQuality content version. The
-floating `latest` tag moves to that same commit. Consumers can follow `@latest`
-or pin `uses:` and `engine_ref` to an immutable version tag (for example,
-`@1.12.3`) to reproduce a review. GitHub Releases (with notes) are cut manually
-for notable updates.
+Engine tags use `X.Y.Z`. `X.Y` comes from the repo-root [`VERSION`](VERSION)
+file and identifies the orchestrator contract/implementation; `Z` is the
+monotonically increasing BCQuality content minor from
+`bcquality.version` in [`agent/bcquality.config.yaml`](agent/bcquality.config.yaml).
+After a merge to `main`, `.github/workflows/version.yml` creates an immutable
+`X.Y.Z` tag only when that version does not already exist, then force-moves the
+floating `latest` tag to the merge commit. A merge that changes neither
+`VERSION` nor `bcquality.version` does not publish a new tag or move `latest`.
+
+Consumers may pin an immutable tag for reproducibility or follow `@latest`.
+Keep the reusable workflow ref and its `engine_ref` input aligned so both jobs
+check out the same engine version.
 
 ### Inputs (selected)
 
@@ -83,6 +88,56 @@ BCQuality policy (`bcquality_repo`, `bcquality_ref`, `enabled_layers`,
 `disabled_skills`, `knowledge_allow`, `knowledge_deny`) and reviewer behaviour
 (`copilot_model`, `max_findings_per_domain`, `fail_on_parse_error`, …) can also
 be overridden per-input. See `.github/workflows/review.yml` for the full list.
+
+### Domain labels
+
+BCQuality owns each finding's human-readable `domain` label. The orchestrator
+prefers a non-empty `findings[].domain` value (and accepts PowerShell's
+capitalized `Domain` spelling), then renders and groups that label without
+maintaining a duplicate domain taxonomy. For compatibility with older
+BCQuality refs, findings without an emitted label fall back to the legacy
+`from-sub-skill`/`from_sub_skill` map in `Invoke-CopilotPRReview.ps1`, and
+unknown sub-skills fall back to **Other**. Agent findings retain an explicitly
+emitted domain; only unlabeled legacy agent findings use the **Agent** fallback.
+
+The shared DO schema keeps `domain` optional for legacy producers, but current
+BCQuality review leaves emit a trimmed, single-line, control-free, non-empty
+short display label on every finding, including leaf agent findings.
+`al-code-review` preserves that optional value verbatim during rollup and does
+not derive or overwrite it from `from-sub-skill`; its own cross-cutting findings
+use exactly **Agent**.
+Accordingly, this consumer never replaces a present non-empty label. It consults
+the legacy map, then **Other**, only when the producer label is absent or empty.
+After outer whitespace is trimmed, domain identity is otherwise lossless:
+internal whitespace, punctuation, case, and Unicode representation remain
+significant. New comment metadata encodes those exact UTF-8 bytes; only legacy
+single-token metadata and headings use a separate lowercase compatibility path.
+
+### BCQuality dependency and rollout
+
+The reusable workflow accepts three levels of BCQuality configuration:
+
+1. A caller-provided `config_path`, resolved from the target repository.
+2. Individual workflow inputs such as `bcquality_repo` and `bcquality_ref`,
+   which override the selected config through environment variables.
+3. When neither is supplied, the engine-owned
+   [`agent/bcquality.config.yaml`](agent/bcquality.config.yaml), whose
+   `bcquality.ref` is the reproducible source-of-truth pin.
+
+A BCQuality dependency update changes both `bcquality.ref` to a reviewed commit
+and `bcquality.version` to that content release. The latter changes `Z` in the
+engine's `X.Y.Z` tag, causing the version workflow to publish the newly vouched
+combination and move `latest`.
+
+For additive producer/consumer contract changes, roll out producer-first:
+
+1. Merge and release the BCQuality producer change.
+2. Merge and release the backward-compatible engine consumer change.
+3. Update `agent/bcquality.config.yaml` to the BCQuality release commit that
+   contains the producer change, update `bcquality.version` with it, and verify
+   the workflow's resolved `bcquality_sha` plus representative rendered output.
+
+Do not pin the engine to an unmerged BCQuality pull-request commit.
 
 ## Security model
 
