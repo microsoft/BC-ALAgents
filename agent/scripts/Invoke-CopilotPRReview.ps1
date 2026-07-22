@@ -1217,6 +1217,41 @@ function Repair-ResumeFenceJson {
     return $result
 }
 
+function Test-UnverifiableCompileClaim {
+    <#
+    Engine-layer precision guard. The orchestrator runs no AL compiler or
+    analyzer, so it cannot verify an absolute "this will not compile" /
+    syntax-error assertion. When an *unbacked agent-judgement* finding rests on
+    such a claim it is an unverifiable hallucination class (ADO bug 643212: a
+    double-`var` "won't compile" claim on code that in fact compiled and
+    merged). Only agent findings are gated here; knowledge-backed findings
+    (references present) are never touched. Returns $true when the text asserts
+    a hard compile/syntax/build failure the engine cannot confirm.
+    #>
+    param([string] $Text)
+
+    if ([string]::IsNullOrWhiteSpace($Text)) { return $false }
+
+    $compileFailurePatterns = @(
+        "won'?t\s+compile",
+        'will\s+not\s+compile',
+        'does\s+not\s+compile',
+        "doesn'?t\s+compile",
+        'fails?\s+to\s+compile',
+        'fail(?:s|ed|ure)?\s+compilation',
+        'compil(?:ation|er|e)\s+error',
+        'syntax\s+error',
+        'parse\s+error',
+        "won'?t\s+build",
+        'will\s+not\s+build',
+        'fails?\s+to\s+build'
+    )
+    foreach ($pattern in $compileFailurePatterns) {
+        if ($Text -match "(?i)$pattern") { return $true }
+    }
+    return $false
+}
+
 function Parse-BCQualityReport {
     <#
     Parses Copilot CLI output into a findings-report. Returns a PSCustomObject:
@@ -1351,6 +1386,7 @@ function Parse-BCQualityReport {
     $normalized = [System.Collections.Generic.List[object]]::new()
     $backedMinRank = $SeverityOrder[$MinimumSeverity]
     $agentMinRank  = $SeverityOrder[$AgentMinimumSeverity]
+    $suppressedCompileClaims = 0
 
     foreach ($f in $rawFindings) {
         if ($null -eq $f) { continue }
@@ -1421,6 +1457,16 @@ function Parse-BCQualityReport {
         $message = ''
         if ($f.PSObject.Properties.Match('message').Count -gt 0) { $message = [string]$f.message }
 
+        # Engine-layer precision guard (ADO 643212): the orchestrator never runs
+        # an AL compiler/analyzer, so an unbacked agent-judgement finding whose
+        # core claim is an absolute compile/syntax/build failure is unverifiable
+        # by construction. Drop it rather than post a likely hallucination.
+        # Knowledge-backed findings (references present) are never gated here.
+        if ($isAgentFinding -and (Test-UnverifiableCompileClaim -Text $message)) {
+            $suppressedCompileClaims++
+            continue
+        }
+
         $confidence = ''
         if ($f.PSObject.Properties.Match('confidence').Count -gt 0) { $confidence = [string]$f.confidence }
 
@@ -1476,6 +1522,10 @@ function Parse-BCQualityReport {
             rawId           = $rawId
             isAgentFinding  = $isAgentFinding
         }) | Out-Null
+    }
+
+    if ($suppressedCompileClaims -gt 0) {
+        Write-LogPhaseDetail "Suppressed $suppressedCompileClaims unverifiable compile/syntax-failure claim(s) from agent findings (engine runs no compiler; see ADO 643212)."
     }
 
     $suppressed = @()

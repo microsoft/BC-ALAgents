@@ -146,6 +146,80 @@ Describe 'Agent domain normalization' {
     }
 }
 
+Describe 'Test-UnverifiableCompileClaim' {
+    It 'flags absolute compile/syntax/build failure assertions' -ForEach @(
+        @{ Text = "This declares var twice, so the object will not compile." }
+        @{ Text = "Two consecutive var keywords: it won't compile." }
+        @{ Text = "The identifier does not compile without quotes." }
+        @{ Text = 'This is a syntax error.' }
+        @{ Text = 'Causes a compilation error at build time.' }
+        @{ Text = "The enum value fails to compile." }
+        @{ Text = "This change won't build." }
+    ) {
+        Test-UnverifiableCompileClaim -Text $Text | Should -BeTrue
+    }
+
+    It 'does not flag ordinary findings without a compile-failure claim' -ForEach @(
+        @{ Text = 'Missing ToolTip on the bound field.' }
+        @{ Text = 'Consider caching the record to avoid repeated reads.' }
+        @{ Text = 'Recompile the app after upgrading.' }
+        @{ Text = '' }
+        @{ Text = $null }
+    ) {
+        Test-UnverifiableCompileClaim -Text $Text | Should -BeFalse
+    }
+}
+
+Describe 'Agent compile-claim suppression' {
+    It 'drops an unbacked agent finding that asserts a compile failure' {
+        $json = @{
+            outcome = 'completed'
+            findings = @(@{
+                id = 'agent:cross-cutting'
+                'from-sub-skill' = 'agent'
+                severity = 'major'
+                message = 'Declares the var keyword twice in a row, so the object will not compile.'
+                location = @{ file = 'src/a.al'; line = 88 }
+                references = @()
+            })
+        } | ConvertTo-Json -Depth 8
+
+        (Parse-BCQualityReport -Output $json).Findings.Count | Should -Be 0
+    }
+
+    It 'keeps a knowledge-backed finding even when it mentions a compile failure' {
+        $json = @{
+            outcome = 'completed'
+            findings = @(@{
+                id = 'al-upgrade-review'
+                'from-sub-skill' = 'al-upgrade-review'
+                severity = 'major'
+                message = 'Deleting this public enum will not compile in dependent extensions.'
+                location = @{ file = 'src/a.al'; line = 1 }
+                references = @(@{ path = 'knowledge/upgrade/unreleased.md'; sha = 'abc' })
+            })
+        } | ConvertTo-Json -Depth 8
+
+        (Parse-BCQualityReport -Output $json).Findings.Count | Should -Be 1
+    }
+
+    It 'keeps an agent finding that makes no compile-failure claim' {
+        $json = @{
+            outcome = 'completed'
+            findings = @(@{
+                id = 'agent:cross-cutting'
+                'from-sub-skill' = 'agent'
+                severity = 'major'
+                message = 'Hardcoded test document numbers risk collision.'
+                location = @{ file = 'src/a.al'; line = 471 }
+                references = @()
+            })
+        } | ConvertTo-Json -Depth 8
+
+        (Parse-BCQualityReport -Output $json).Findings.Count | Should -Be 1
+    }
+}
+
 Describe 'Domain metadata' {
     It 'round-trips a multi-word domain through collision-safe metadata' {
         $metadata = Get-AgentDomainMetadata -Domain 'Breaking Changes'
