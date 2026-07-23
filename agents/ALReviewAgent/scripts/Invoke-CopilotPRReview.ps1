@@ -49,6 +49,10 @@
         REVIEW_OUTPUT_DIR                    - artifact output folder
         REVIEW_TARGET_WORKSPACE              - detached PR-head worktree path
         COPILOT_MODEL                        - explicit model name for Copilot CLI
+        COPILOT_REVIEW_LEAF_MODEL            - faster/cheaper model for leaf sub-skill
+                                               child agents (triage tier); empty = default
+        COPILOT_REVIEW_PARALLEL_LEAVES       - true|false (default true): dispatch
+                                               super-skill leaves concurrently, not serially
         MINIMUM_SEVERITY                     - Critical | High | Medium | Low (default: Medium)
         AGENT_MINIMUM_SEVERITY               - severity floor applied only to agent findings
                                                (findings BCQuality knowledge does not back).
@@ -81,10 +85,25 @@ $PrHeadSha        = $env:PR_HEAD_SHA
 $BCQualityRoot    = $env:BCQUALITY_ROOT
 $BCQualitySha     = ($env:BCQUALITY_SHA ?? '').Trim()
 $CopilotModel     = ($env:COPILOT_MODEL ?? '').Trim()
+# Optional faster/cheaper model for leaf sub-skill child agents (triage tier).
+# Empty = leaves inherit the CLI's default child-agent model.
+$LeafModel        = ($env:COPILOT_REVIEW_LEAF_MODEL ?? '').Trim()
+# Dispatch super-skill leaf sub-skills concurrently (isolated child agents)
+# instead of serially. Default on — it is both faster and a stronger guard
+# against the collapsed-scan pathology than serial in-context passes.
+$ParallelLeavesRaw = (($env:COPILOT_REVIEW_PARALLEL_LEAVES ?? 'true') + '').Trim().ToLowerInvariant()
+$ParallelLeaves   = @('1','true','yes','on') -contains $ParallelLeavesRaw
 $MinimumSeverity  = $env:MINIMUM_SEVERITY ?? 'Medium'
 $AgentMinimumSeverity = $env:AGENT_MINIMUM_SEVERITY ?? $MinimumSeverity
 $MaxFindings      = [int]($env:MAX_FINDINGS_PER_DOMAIN ?? 25)
 $CopilotCliTimeoutMinutes = [int]($env:COPILOT_REVIEW_CLI_TIMEOUT_MINUTES ?? 30)
+if ($CopilotCliTimeoutMinutes -lt 0) {
+    throw "COPILOT_REVIEW_CLI_TIMEOUT_MINUTES must be 0 (unlimited) or a positive number."
+}
+$CopilotLogLevel  = (($env:COPILOT_REVIEW_LOG_LEVEL ?? 'error') + '').Trim().ToLowerInvariant()
+if ($CopilotLogLevel -notin @('none', 'error', 'warning', 'info', 'debug', 'all')) {
+    throw "COPILOT_REVIEW_LOG_LEVEL must be one of: none, error, warning, info, debug, all."
+}
 $FailOnParseErrorRaw = (($env:COPILOT_REVIEW_FAIL_ON_PARSE_ERROR ?? 'true') + '').Trim().ToLowerInvariant()
 $FailOnParseError = @('1','true','yes','on') -contains $FailOnParseErrorRaw
 # The overview summary comment is opt-in noise: it is off by default so only
@@ -94,6 +113,15 @@ $PostSummaryRaw   = (($env:COPILOT_REVIEW_POST_SUMMARY ?? 'false') + '').Trim().
 $PostSummaryComment = @('1','true','yes','on') -contains $PostSummaryRaw
 $CommentDelay     = [double]($env:COMMENT_DELAY_SECONDS ?? 0.5)
 $ReviewApplyTo    = $env:REVIEW_APPLY_TO ?? '**'
+# Optional git pathspec (semicolon-separated) that scopes the diff itself.
+# Used by local wrappers to review a subfolder without shadowing the diff at
+# post-processing time. Empty = review the full diff.
+$ReviewPathSpec   = ($env:REVIEW_PATH_SPEC ?? '').Trim()
+# Diff separator between base and HEAD. Default '...' (merge-base semantics —
+# what PR review needs). Set to '..' via REVIEW_DIFF_STYLE=direct when the base
+# is a synthesized commit with no shared ancestry (e.g. local "whole tree"
+# audit mode).
+$ReviewDiffStyle  = if ((($env:REVIEW_DIFF_STYLE ?? '') + '').Trim().ToLowerInvariant() -eq 'direct') { '..' } else { '...' }
 $ReviewOutputDir  = $env:REVIEW_OUTPUT_DIR ?? (Join-Path $TrustedWorkspace 'review-output')
 $BaseBranch       = $env:BASE_BRANCH ?? 'main'
 $AgentLabelRaw    = ($env:COPILOT_REVIEW_AGENT_LABEL ?? '').Trim()
@@ -271,8 +299,8 @@ function Assert-Config {
         if (-not (Get-Command copilot -ErrorAction SilentlyContinue)) {
             throw 'Copilot CLI not found in PATH. Install @github/copilot before running this script.'
         }
-        if ($CopilotCliTimeoutMinutes -lt 1) {
-            throw "COPILOT_REVIEW_CLI_TIMEOUT_MINUTES must be a positive integer. Actual: $CopilotCliTimeoutMinutes"
+        if ($CopilotCliTimeoutMinutes -lt 0) {
+            throw "COPILOT_REVIEW_CLI_TIMEOUT_MINUTES must be 0 (unlimited) or a positive integer. Actual: $CopilotCliTimeoutMinutes"
         }
     }
 
@@ -422,14 +450,25 @@ function Invoke-GitCommandAuthenticated {
     }
 }
 
+function Get-PathSpecArgs {
+    if (-not $ReviewPathSpec) { return @() }
+    $specs = @($ReviewPathSpec -split ';' | ForEach-Object { $_.Trim() } | Where-Object { $_ })
+    if (-not $specs) { return @() }
+    return @('--') + $specs
+}
+
 function Get-GitChangedFiles {
-    $output = Invoke-GitCommand -Arguments @('-C', $AnalysisWorkspace, 'diff', '--name-only', "$DiffBaseRef...HEAD")
+    $args = @('-C', $AnalysisWorkspace, 'diff', '--name-only', "$DiffBaseRef$ReviewDiffStyle`HEAD") + (Get-PathSpecArgs)
+    $output = Invoke-GitCommand -Arguments $args
     return @($output | Where-Object { $_ -and $_.Trim() })
 }
 
 function Get-GitFilePatch {
     param([string] $FilePath)
-    $output = Invoke-GitCommand -Arguments @('-C', $AnalysisWorkspace, 'diff', "$DiffBaseRef...HEAD", '--', $FilePath)
+    # Path-scoped diff for a specific file. The pathspec above is only used
+    # to narrow the changed-files list; per-file diffs remain unscoped so we
+    # still get the full patch for each surviving file.
+    $output = Invoke-GitCommand -Arguments @('-C', $AnalysisWorkspace, 'diff', "$DiffBaseRef$ReviewDiffStyle`HEAD", '--', $FilePath)
     return ($output -join "`n")
 }
 
@@ -693,6 +732,136 @@ function Build-BootstrapPrompt {
     $prWorktree = ($AnalysisWorkspace -replace '\\', '/')
     $taskCtxRel = '_task-context.json'
     $reviewLabel = if ($ReviewSource -eq 'local') { "$Repository (local review)" } else { "$Repository (PR #$PrNumber)" }
+    $changedFileCount = @($changedFileNames).Count
+
+    $pathSpecLine = ''
+    $pathSpecSuffix = ''
+    if ($ReviewPathSpec) {
+        $specs = @($ReviewPathSpec -split ';' | ForEach-Object { $_.Trim() } | Where-Object { $_ })
+        if ($specs) {
+            $pathSpecSuffix = ' -- ' + ($specs -join ' ')
+            $pathSpecLine = "`nSCOPE: Restrict every git diff to these pathspecs (append verbatim to each diff command): $pathSpecSuffix`nDo NOT review files outside this scope even if they appear in the full diff.`n"
+        }
+    }
+
+    # --- Execution strategy for super-skills (parallel vs serial leaves) ----
+    $leafModelLine = ''
+    if ($LeafModel) {
+        $leafModelLine = "`n- Run each leaf child agent on the model '$LeafModel' (a faster triage tier); reserve the heavier default model for the super-skill self-review pass."
+    }
+    if ($ParallelLeaves) {
+        $executionSection = @"
+EXECUTION STRATEGY FOR SUPER-SKILLS (orchestrator directive):
+The super-skill's "Execution discipline" requires each leaf sub-skill to run in
+an ISOLATED context and forbids collapsing several leaves into one shared scan.
+To honor that isolation AND cut wall-clock time, dispatch the leaves
+CONCURRENTLY — but you MUST collect their results and roll them up yourself in
+the SAME turn. Follow these rules exactly:
+
+- Dispatch the leaves as PARALLEL, BLOCKING child agents: in a single step,
+  issue all leaf Task calls together (one Task tool call per leaf, emitted in
+  the same assistant step so they execute concurrently). Give each child its
+  domain-filtered knowledge slice PLUS the full authoritative worklist (see
+  WORKLIST PINNING below). Do NOT hand a leaf a pre-narrowed file subset drawn
+  from your own sampling — that is the primary cause of coverage loss in
+  parallel mode.
+
+WORKLIST PINNING (CRITICAL — required for coverage parity with serial mode):
+Because each leaf runs isolated, it CANNOT see the files you sampled while
+grounding yourself. If you let a leaf guess its own scope from a handful of
+sampled files it will drastically under-scan. Prevent this as follows:
+- In every leaf's Task prompt, pass the path ./_review-changed-files.txt (the
+  full authoritative file list, $changedFileCount file(s)) and instruct the
+  leaf to READ IT ITSELF and treat it as the complete candidate set. The leaf
+  determines its worklist by scanning that full list — never by trusting a
+  subset you pre-selected.
+- CROSS-CUTTING domains — al-performance, al-privacy, al-upgrade, al-security,
+  al-style, al-error-handling — apply to EVERY AL file. For these leaves the
+  worklist is ALL $changedFileCount files. Explicitly instruct each of these
+  leaves that its worklist == the entire file list and it MUST NOT narrow it;
+  its reported worklist=<N> should equal the full AL-file count. A worklist of
+  a handful of files for any of these domains is a coverage bug.
+- CONSTRUCT-GATED domains — al-query, al-web-services, al-telemetry,
+  al-interfaces, al-events, al-breaking-changes, al-ui, al-data-modeling,
+  al-appsource — legitimately scope to files that contain the relevant
+  construct. But the leaf must still SCAN the full list (or the shared object
+  index) to find every such file; it may only exclude a file after confirming
+  the construct is absent, never because it was not in your sample.
+- CRITICAL — do NOT use detached / background / fire-and-forget agents, and do
+  NOT dispatch a leaf and then "wait for a completion notification" or let a
+  child go idle. Those modes end your turn before the results are aggregated and
+  the run is lost. Each Task call MUST block until that leaf returns its
+  findings-report to you, in this same turn.
+- CRITICAL — do NOT end your turn, stop, or yield after dispatching the leaves.
+  Stay active until every leaf has RETURNED its findings-report to you, you have
+  recorded all of them into ``sub-results``, run the self-review pass, rolled up
+  the aggregate, AND written the final report file (see OUTPUT FORMAT). The run
+  is complete ONLY when ./$ReportFileName contains the aggregated report.
+- Do NOT merge leaves into one rolled-up reasoning step; each leaf must produce
+  its own complete findings-report, which you then aggregate.
+- Run the super-skill's own self-review pass as the final step, AFTER every leaf
+  has returned, then roll up per the skill's contract.$leafModelLine
+
+PROGRESS MARKERS (orchestrator evidence of per-leaf execution):
+As each leaf sub-skill returns and its sub-result is recorded, emit exactly one
+line (order among parallel leaves does not matter):
+
+     [sub-skill al-<name>-review: worklist=<N> findings=<M>]
+
+where <N> is that leaf's worklist count and <M> its emitted finding count.
+After the self-review pass completes, emit exactly:
+
+     [self-review: agent-findings=<M>]
+
+These markers are the orchestrator's proof that leaves ran isolated rather than
+collapsed; emit them in addition to whatever the skill instructs.
+"@
+    }
+    else {
+        $executionSection = @"
+When entry.md dispatches a super-skill (al-code-review or another composed
+skill), follow that skill's own "Execution discipline" section verbatim for HOW
+to walk its sub-skills and run its self-review pass. The skill file is
+authoritative; do not improvise or substitute your own procedure.$leafModelLine
+
+PROGRESS MARKERS (orchestrator output contract for super-skills):
+So the orchestrator can verify the super-skill executed its sub-skills serially
+rather than collapsing them into one rolled-up scan, emit a one-line stdout
+progress marker as each step completes:
+
+- After a leaf sub-skill has completed and its sub-result has been recorded into
+  ``sub-results``, and before starting the next sub-skill, emit exactly:
+
+     [sub-skill al-<name>-review: worklist=<N> findings=<M>]
+
+  where <N> is that leaf's worklist count and <M> its emitted finding count.
+- After the super-skill's self-review pass completes, emit exactly:
+
+     [self-review: agent-findings=<M>]
+
+These markers are the orchestrator's evidence of per-iteration execution, not
+the skill's own contract; emit them in addition to whatever the skill instructs.
+"@
+    }
+
+    $objectIndexSection = @"
+
+SHARED OBJECT INDEX:
+./_review-object-index.txt is a pre-computed inventory of every AL object in the
+worklist (file path + object header line: type, id, name), built once by the
+orchestrator. Leaf sub-skills SHOULD consult it to locate objects of interest
+instead of re-grepping the whole tree from scratch, which avoids each leaf
+re-scanning every file.
+"@
+
+    $severitySection = @"
+
+SEVERITY FLOOR:
+The orchestrator discards every finding below severity '$MinimumSeverity'
+(finding severities blocker/major/minor/info map to Critical/High/Medium/Low).
+Do not spend effort authoring messages or ``suggested-code`` for findings below
+that floor; concentrate each leaf on '$MinimumSeverity'-and-above defects.
+"@
 
     return @"
 TASK:
@@ -701,12 +870,21 @@ Review the pull request changes against $DiffBaseRef.
 The pull request worktree is at: $prWorktree
 The base branch is: $DiffBaseRef
 The repository is: $reviewLabel
-
+$pathSpecLine
 Use git commands to analyze the changes:
-- git -C "$prWorktree" diff $DiffBaseRef...HEAD to see all changes
-- git -C "$prWorktree" diff $DiffBaseRef...HEAD -- <file> to see changes in a specific file
-- git -C "$prWorktree" diff --name-only $DiffBaseRef...HEAD to list changed files
+- git -C "$prWorktree" --no-pager diff $DiffBaseRef$ReviewDiffStyle`HEAD$pathSpecSuffix to see all changes
+- git -C "$prWorktree" --no-pager diff $DiffBaseRef$ReviewDiffStyle`HEAD -- <file> to see changes in a specific file
+- git -C "$prWorktree" --no-pager diff --name-only $DiffBaseRef$ReviewDiffStyle`HEAD$pathSpecSuffix to list changed files
 
+AUTHORITATIVE WORKLIST:
+The orchestrator already resolved $changedFileCount changed file(s) and wrote
+their repository-relative paths to ./_review-changed-files.txt. Read that file
+before dispatching review skills. It is authoritative even if shell output is
+empty, truncated, or summarized. When it contains AL files, you MUST evaluate
+those files and MUST NOT return "no AL changes." In whole-tree/local audits,
+files can appear as additions relative to an empty base; review their current
+contents from $prWorktree.
+$objectIndexSection
 CONTRACT:
 The current working directory is a BCQuality checkout. BCQuality is the
 authoritative knowledge layer for Business Central code review and the
@@ -738,36 +916,11 @@ Your bootstrap procedure is:
    output — the orchestrator will render and post them, clearly
    labelled as agent findings.
 
-When entry.md dispatches a super-skill (al-code-review or another
-composed skill), follow that skill's own "Execution discipline"
-section verbatim for HOW to walk its sub-skills and run its
-self-review pass. The skill file is authoritative; do not improvise
-or substitute your own procedure.
-
-PROGRESS MARKERS (orchestrator output contract for super-skills):
-So the orchestrator can verify the super-skill executed its
-sub-skills serially rather than collapsing them into one rolled-up
-scan, emit a one-line stdout progress marker as each step completes:
-
-- After a leaf sub-skill has completed and its sub-result has been
-  recorded into ``sub-results``, and before starting the next
-  sub-skill, emit exactly:
-
-     [sub-skill al-<name>-review: worklist=<N> findings=<M>]
-
-  where <N> is that leaf's worklist count and <M> its emitted
-  finding count.
-- After the super-skill's self-review pass completes, emit exactly:
-
-     [self-review: agent-findings=<M>]
-
-These markers are the orchestrator's evidence of per-iteration
-execution, not the skill's own contract; emit them in addition to
-whatever the skill instructs.
-
+$executionSection
+$severitySection
 OUTPUT FORMAT:
-1. The progress markers above, in order — one per sub-skill, then the
-   self-review marker. Each on its own line.
+1. The progress markers above (one per sub-skill, then the self-review
+   marker; order among leaves does not matter). Each on its own line.
 2. Write the complete JSON findings-report (per the DO output contract
    in ./skills/do.md) to the file ./$ReportFileName in your current
    working directory, overwriting any existing file. Write the JSON
@@ -816,16 +969,22 @@ function Invoke-CopilotCli {
     # --allow-all-tools is required for non-interactive runs. --add-dir
     # grants the sandbox access to the PR worktree, which lives outside the
     # CLI's working directory ($BCQualityRoot) and would otherwise be denied
-    # for read/git operations. --no-color and --log-level error keep stdout
-    # free of ANSI sequences and CLI diagnostics.
+    # for read/git operations. --no-color keeps stdout free of ANSI sequences;
+    # the log level defaults to error but local runs can opt into usage logs.
     $copilotArgs = @(
         '--allow-all-tools',
         '--no-custom-instructions',
         '--no-color',
-        '--log-level', 'error',
+        '--log-level', $CopilotLogLevel,
         '--add-dir', $AnalysisWorkspace,
         '-p', $Prompt
     )
+    # Local runs commonly need to touch tools/binaries outside $AnalysisWorkspace
+    # (e.g. git.exe under Program Files). Opt-in via COPILOT_ALLOW_ALL_PATHS
+    # so CI PR reviews keep their tighter sandbox.
+    if ((($env:COPILOT_ALLOW_ALL_PATHS ?? '') + '').Trim().ToLowerInvariant() -in @('1','true','yes','on')) {
+        $copilotArgs = @('--allow-all-paths') + $copilotArgs
+    }
     if ($CopilotModel) { $copilotArgs += "--model=$CopilotModel" }
 
     # Pass only a safe allowlist of env vars to the subprocess; inject Copilot token
@@ -838,6 +997,9 @@ function Invoke-CopilotCli {
     }
     $cleanEnv['GH_TOKEN'] = $CopilotToken
     $cleanEnv['CI']       = 'true'
+    $cleanEnv['GIT_PAGER'] = 'cat'
+    $cleanEnv['PAGER'] = 'cat'
+    $cleanEnv['GIT_TERMINAL_PROMPT'] = '0'
 
     $transcriptBuilder = [System.Text.StringBuilder]::new()
     $process   = $null
@@ -882,8 +1044,14 @@ function Invoke-CopilotCli {
         $null = $process.Start()
         $stdoutTask = $process.StandardOutput.ReadToEndAsync()
         $stderrTask = $process.StandardError.ReadToEndAsync()
-        $timeoutMs = $CopilotCliTimeoutMinutes * 60 * 1000
-        $completed = $process.WaitForExit($timeoutMs)
+        if ($CopilotCliTimeoutMinutes -eq 0) {
+            $process.WaitForExit()
+            $completed = $true
+        }
+        else {
+            $timeoutMs = $CopilotCliTimeoutMinutes * 60 * 1000
+            $completed = $process.WaitForExit($timeoutMs)
+        }
         if (-not $completed) {
             try { $process.Kill($true) } catch { Write-Error "Failed to terminate timed out Copilot CLI process: $($_.Exception.Message)" }
             throw "Copilot CLI timed out after $CopilotCliTimeoutMinutes minutes."
@@ -2658,9 +2826,33 @@ else {
     Checkout-PrBranch
 }
 
-Write-Host "Fetching changed files via git diff ($DiffBaseRef...HEAD)"
+Write-Host "Fetching changed files via git diff ($DiffBaseRef$ReviewDiffStyle`HEAD)"
 $changedFileNames = @(Get-GitChangedFiles)
 Write-Host "Found $($changedFileNames.Count) changed file(s)"
+$changedFilesManifest = Join-Path $BCQualityRoot '_review-changed-files.txt'
+Set-Content -LiteralPath $changedFilesManifest -Value $changedFileNames -Encoding UTF8
+Write-LogPhaseDetail "Changed-file manifest written to $changedFilesManifest"
+
+# Shared object index: pre-compute the AL object inventory ONCE so leaf
+# sub-skills can locate objects without each re-grepping the whole tree
+# (cuts the cached re-ingestion cost that dominates large runs).
+$objectIndexPath = Join-Path $BCQualityRoot '_review-object-index.txt'
+$objHeaderRe = '^\s*(tableextension|pageextension|enumextension|permissionsetextension|reportextension|table|page|codeunit|report|xmlport|query|enum|interface|controladdin|permissionset|profile|entitlement|dotnet)\b'
+$objIndexLines = New-Object System.Collections.Generic.List[string]
+foreach ($cf in $changedFileNames) {
+    if ($cf -notmatch '\.al$') { continue }
+    $objFull = Join-Path $AnalysisWorkspace $cf
+    if (-not (Test-Path -LiteralPath $objFull)) { continue }
+    try {
+        foreach ($line in [System.IO.File]::ReadLines($objFull)) {
+            $t = $line.Trim()
+            if ($t -and $t -match $objHeaderRe) { $objIndexLines.Add("$cf`t$t"); break }
+        }
+    }
+    catch { }
+}
+Set-Content -LiteralPath $objectIndexPath -Value $objIndexLines -Encoding UTF8
+Write-LogPhaseDetail "Object index written to $objectIndexPath ($($objIndexLines.Count) objects)"
 $displayCap = 50
 $displayFiles = @($changedFileNames | Select-Object -First $displayCap)
 foreach ($cf in $displayFiles) { Write-LogPhaseDetail "- $cf" }
@@ -2769,9 +2961,9 @@ Write-ConsumedBCQualityLog -Report $report
 
 # Diagnostic: scan the agent output for the per-iteration progress
 # markers the bootstrap prompt asks the super-skill to emit. Their
-# presence means the model walked the sub-skills serially; their
-# absence means it most likely produced one rolled-up scan (the
-# known parity-loss pathology). Surface a count either way so we can
+# presence means the model walked the sub-skills as isolated per-leaf
+# passes (serial or parallel); their absence means it most likely
+# produced one rolled-up scan (the known parity-loss pathology). Surface a count either way so we can
 # correlate marker presence with finding density in CI logs.
 # Guard against null/empty $output explicitly so a missing model
 # response surfaces as a distinct log event rather than an
@@ -2797,7 +2989,7 @@ if ($markerCount -gt 0) {
     # The dispatched skill emitted multiple sub-results but the model
     # did not produce the per-iteration markers. That is the rolled-up-
     # scan pathology described in microsoft/skills/review/al-code-review.md.
-    Write-LogWarn 'Super-skill collapsed iterations' "The dispatched super-skill emitted $($report.SubResultCount) sub-results but no [sub-skill ...] progress markers appeared in stdout. The model likely produced one rolled-up scan instead of walking the sub-skills serially, which is the known parity-loss pathology. See microsoft/skills/review/al-code-review.md - Execution discipline; if this persists, escalate to orchestrator-driven per-leaf invocation."
+    Write-LogWarn 'Super-skill collapsed iterations' "The dispatched super-skill emitted $($report.SubResultCount) sub-results but no [sub-skill ...] progress markers appeared in stdout. The model likely produced one rolled-up scan instead of dispatching the sub-skills as isolated per-leaf passes (serial or parallel), which is the known parity-loss pathology. See microsoft/skills/review/al-code-review.md - Execution discipline; if this persists, escalate to orchestrator-driven per-leaf invocation."
 }
 
 # Backstop: detect a known pathology where al-code-review collapses the
