@@ -38,7 +38,18 @@
 
 .PARAMETER BCQualityRoot
     Path to a BCQuality checkout (https://github.com/microsoft/BCQuality).
-    Required.
+    Optional. When omitted, BCQuality is cloned/refreshed into a local cache
+    (~/.copilot/cache/bc-review/BCQuality) automatically. Pass an explicit
+    path (e.g. from CI or BC-Bench) to use a checkout you already manage.
+
+.PARAMETER MaxAgeDays
+    Only used when -BCQualityRoot is omitted. If the cached BCQuality clone's
+    HEAD is older than this many days, it is fast-forwarded. Default 7. Set to
+    a negative value to never auto-update the cache.
+
+.PARAMETER RefreshBCQuality
+    Only used when -BCQualityRoot is omitted. Force a fetch + reset of the
+    cached BCQuality clone regardless of age (e.g. "use the latest rules").
 
 .PARAMETER ConfigPath
     Path to a bcquality.config.yaml. Defaults to agents/ALReviewAgent/bcquality.config.yaml
@@ -115,7 +126,9 @@ param(
     [Parameter(Mandatory)][string] $RepoPath,
     [ValidateSet('Branch', 'Existing')][string] $Mode = 'Branch',
     [string] $BaseRef,
-    [Parameter(Mandatory)][string] $BCQualityRoot,
+    [string] $BCQualityRoot,
+    [int]    $MaxAgeDays = 7,
+    [switch] $RefreshBCQuality,
     [string] $ConfigPath,
     [string] $OutputDir,
     [ValidateSet('Critical', 'High', 'Medium', 'Low')][string] $MinimumSeverity = 'Medium',
@@ -135,6 +148,60 @@ $ErrorActionPreference = 'Stop'
 # full tree, so "Existing" mode reviews every tracked file.
 $EmptyTreeSha = '4b825dc642cb6eb9a060e54bf8d69288fbee4904'
 
+# ---------------------------------------------------------------------------
+# BCQuality knowledge base. It is NOT bundled with the reviewer engine, so
+# when the caller does not pass -BCQualityRoot we clone/refresh it into a
+# local cache (~/.copilot/cache/bc-review/BCQuality) here. Age-gated by
+# -MaxAgeDays (default 7; <0 disables auto-update); -RefreshBCQuality forces
+# a fetch. Callers that already have a checkout (CI, BC-Bench) pass
+# -BCQualityRoot and this is skipped entirely.
+# ---------------------------------------------------------------------------
+function Resolve-BCQualityRoot {
+    param([int] $MaxAgeDays = 7, [switch] $Force)
+
+    if (-not (Get-Command git -ErrorAction SilentlyContinue)) {
+        throw 'git is required to fetch BCQuality but was not found on PATH. Pass -BCQualityRoot to use an existing checkout.'
+    }
+    $cacheDir = Join-Path $env:USERPROFILE '.copilot/cache/bc-review'
+    New-Item -ItemType Directory -Force -Path $cacheDir | Out-Null
+    $bcqPath = Join-Path $cacheDir 'BCQuality'
+    $bcqUrl  = 'https://github.com/microsoft/BCQuality.git'
+
+    if (-not (Test-Path (Join-Path $bcqPath '.git'))) {
+        Write-Host "[local-review] Cloning BCQuality into $bcqPath"
+        & git clone --depth 1 $bcqUrl $bcqPath 2>&1 | ForEach-Object { Write-Host "[local-review] $_" }
+        if ($LASTEXITCODE -ne 0) { throw "git clone of $bcqUrl failed" }
+        return $bcqPath
+    }
+
+    if ($MaxAgeDays -lt 0 -and -not $Force) {
+        Write-Host "[local-review] BCQuality: update skipped (MaxAgeDays=$MaxAgeDays)."
+        return $bcqPath
+    }
+
+    $headEpoch = & git -C $bcqPath log -1 --format=%ct 2>$null
+    $ageDays = if ($headEpoch) {
+        [int](([DateTimeOffset]::UtcNow.ToUnixTimeSeconds() - [int64]$headEpoch) / 86400)
+    } else { 9999 }
+
+    if ($Force -or $ageDays -ge $MaxAgeDays) {
+        Write-Host "[local-review] BCQuality: HEAD is $ageDays day(s) old, updating."
+        # Refetch + reset is robust for a shallow read-only cache mirror
+        # (a plain ff-only pull fails on divergent shallow history).
+        & git -C $bcqPath fetch --depth 1 origin HEAD 2>&1 | ForEach-Object { Write-Host "[local-review] $_" }
+        if ($LASTEXITCODE -eq 0) {
+            & git -C $bcqPath reset --hard FETCH_HEAD 2>&1 | Out-Null
+        }
+        else {
+            Write-Host "[local-review] BCQuality: fetch failed, using existing clone."
+        }
+    }
+    else {
+        Write-Host "[local-review] BCQuality: up to date ($ageDays day(s) old)."
+    }
+    return $bcqPath
+}
+
 $agentRoot = Split-Path -Parent (Split-Path -Parent $PSCommandPath)
 $reviewScript = Join-Path $agentRoot 'scripts/Invoke-CopilotPRReview.ps1'
 $configScript = Join-Path $agentRoot 'scripts/Get-BCQualityConfig.ps1'
@@ -142,6 +209,9 @@ $filterScript = Join-Path $agentRoot 'scripts/Invoke-BCQualityFilter.ps1'
 if (-not $ConfigPath) { $ConfigPath = Join-Path $agentRoot 'bcquality.config.yaml' }
 
 $RepoPath      = (Resolve-Path $RepoPath).Path
+if (-not $BCQualityRoot) {
+    $BCQualityRoot = Resolve-BCQualityRoot -MaxAgeDays $MaxAgeDays -Force:$RefreshBCQuality
+}
 $BCQualityRoot = (Resolve-Path $BCQualityRoot).Path
 $ConfigPath    = (Resolve-Path $ConfigPath).Path
 

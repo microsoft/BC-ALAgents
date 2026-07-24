@@ -9,16 +9,21 @@ argument-hint: "[--branch | --existing] [--fix] [--severity <level>] [path]"
 Runs the BC AL review agent against a local codebase. The reviewer engine
 (`agents/ALReviewAgent/scripts/Invoke-LocalReview.ps1`) ships in **this**
 repo, so it is always in lockstep with the skill. The only external
-dependency is the `microsoft/BCQuality` knowledge base, which a bootstrap
-step clones/updates into a local cache on first use.
+dependency is the `microsoft/BCQuality` knowledge base, which the reviewer
+clones/updates into a local cache (`~/.copilot/cache/bc-review`) on first use.
 
 ## Skill directory resolution
 
-This skill may be installed via a **symlink** (plugin install). Before
-invoking any bundled file (`scripts/Ensure-BCQuality.ps1`), resolve the
-skill's real directory from the symlink target first, then use absolute
-paths. The bootstrap resolves the reviewer engine relative to its own real
-location, so it must run from the actual file, not the symlink.
+This skill may be installed via a **symlink** (plugin install). Resolve the
+skill's real directory from the symlink target first, then compute the
+reviewer engine path relative to it - the engine lives two levels up:
+
+```
+<skill-dir>/../../scripts/Invoke-LocalReview.ps1
+```
+
+Always invoke via that resolved real path, not through the symlink, so the
+engine resolves its co-located helpers correctly.
 
 ## Prerequisites (check silently before first run)
 
@@ -72,35 +77,20 @@ Also determine:
 - **BaseRef** (Branch mode only) - leave unset; the wrapper auto-resolves upstream merge-base to `main`. Pass it only if the user names one.
 - **Path** - optional subtree/glob to scope findings (e.g. `src/FooModule` or `app/**/*.al`).
 
-### 2. Bootstrap the knowledge base
+### 2. Run the reviewer
 
-Run the bundled bootstrap helper (resolve the real skill dir first, per
-"Skill directory resolution"). It ensures `microsoft/BCQuality` is cloned
-and fresh, resolves the co-located reviewer engine, and emits a single JSON
-line on stdout with both paths. All log output goes to stderr.
-
-```powershell
-pwsh -NoProfile -File "<skill-dir>/scripts/Ensure-BCQuality.ps1"
-```
-
-Parse the last stdout line as JSON to get `bcquality` and `reviewer_script`.
-If the command fails, surface the stderr to the user and stop.
-
-To force a BCQuality refresh (e.g. the user says "use the latest rules"):
-
-```powershell
-pwsh -NoProfile -File "<skill-dir>/scripts/Ensure-BCQuality.ps1" -Force
-```
-
-### 3. Run the reviewer
-
-Invoke the resolved `reviewer_script` (`Invoke-LocalReview.ps1`). Never
+Invoke the resolved reviewer engine
+(`<skill-dir>/../../scripts/Invoke-LocalReview.ps1`). It clones/refreshes the
+`microsoft/BCQuality` knowledge base into `~/.copilot/cache/bc-review` on
+first use automatically, so no separate bootstrap step is needed. Never
 invent flags - the wrapper's full parameter set is exactly:
 
 `-RepoPath <path>` (required)
 `-Mode Branch|Existing` (default Branch)
 `-BaseRef <ref>` (optional; Branch mode)
-`-BCQualityRoot <path>` (required - use the JSON's `bcquality`)
+`-BCQualityRoot <path>` (optional; omit to auto-clone/refresh into the cache. Pass a path only if the user points at an existing BCQuality checkout)
+`-MaxAgeDays <int>` (optional; cache refresh threshold, default 7)
+`-RefreshBCQuality` (switch; force-refresh the cached BCQuality - use when the user says "use the latest rules")
 `-ConfigPath <path>` (optional; defaults to the engine's `agents/ALReviewAgent/bcquality.config.yaml`)
 `-OutputDir <path>` (optional; default `<repo>/.bc-review`)
 `-MinimumSeverity Critical|High|Medium|Low` (default Medium)
@@ -113,16 +103,15 @@ invent flags - the wrapper's full parameter set is exactly:
 `-NoParallelLeaves` (switch; disable concurrent leaf dispatch)
 
 ```powershell
-pwsh -NoProfile -File <reviewer_script> `
+pwsh -NoProfile -File "<skill-dir>/../../scripts/Invoke-LocalReview.ps1" `
     -RepoPath <repo> `
-    -Mode Branch `
-    -BCQualityRoot <bcquality>
+    -Mode Branch
 ```
 
 The reviewer takes 2-10 minutes. Do not add your own timeout; the engine has
 a 30-minute cap built in. Stream output so the user sees progress.
 
-### 4. Summarize findings + run metrics
+### 3. Summarize findings + run metrics
 
 After completion, read two files from `<OutputDir>` (default `<RepoPath>/.bc-review/`):
 
@@ -136,7 +125,7 @@ one-line verdict so the user gets the headline before any detail.
 **A. Headline verdict** - one line, e.g.
 `No blocking findings` or `3 findings (1 High, 2 Medium) - no code changed`.
 Always state explicitly that this was a **read-only review - no files were
-modified** (unless the run used `-Fix`; see step 5).
+modified** (unless the run used `-Fix`; see step 4).
 
 **B. Run metrics** - one line, e.g.
 `03:47 - 42 calls - 128,540 tokens - ~64 credits (claude-opus-4.7)`.
@@ -167,7 +156,7 @@ Append the `(fix available)` marker only when that finding has
 **E. Next steps** - a short bullet list tailored to what was found:
 - If any finding has `suggested-code`: "N of M findings have auto-appliable
   fixes - say *fix them* to apply."
-- Offer the most relevant follow-ups from step 5 (e.g. narrow to criticals,
+- Offer the most relevant follow-ups from step 4 (e.g. narrow to criticals,
   scope to a folder).
 - Full details: point to the `_review-report.json` and `_run-metrics.json`
   paths.
@@ -175,7 +164,7 @@ Append the `(fix available)` marker only when that finding has
 Keep the whole thing compact - tables and one-line bullets, no walls of
 prose. The user can drill into any finding on request.
 
-### 5. Follow-up actions
+### 4. Follow-up actions
 
 Anticipate and offer:
 
