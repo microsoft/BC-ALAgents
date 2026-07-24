@@ -1,0 +1,37 @@
+{
+  "skill": { "id": "al-code-review", "version": 1 },
+  "outcome": "completed",
+  "summary": {
+    "counts": { "blocker": 0, "major": 1, "minor": 1, "info": 0 },
+    "coverage": { "worklist-size": 2, "items-evaluated": 2 }
+  },
+  "findings": [
+    {
+      "id": "microsoft/knowledge/performance/avoid-findset-inside-loop.md",
+      "severity": "major",
+      "message": "FindSet is called inside the loop that also calls MODIFY, so every iteration issues a fresh server round-trip. Recommendation: read the set once before the loop and use a separate record variable for the write.",
+      "location": {
+        "file": "src/Sales/SalesLine.Table.al",
+        "line": 142,
+        "range": { "start-line": 140, "end-line": 145 }
+      },
+      "references": [
+        { "path": "microsoft/knowledge/performance/avoid-findset-inside-loop.md" }
+      ],
+      "confidence": "high",
+      "from-sub-skill": "al-performance-review"
+    },
+    {
+      "id": "agent:translatable-error-literal",
+      "severity": "minor",
+      "message": "Error() is raised with a hard-coded literal, so the text cannot be translated. Fix: move the text into a Label and raise the Label instead.",
+      "location": { "file": "src/Sales/SalesPost.Codeunit.al", "line": 88 },
+      "references": [],
+      "confidence": "medium",
+      "from-sub-skill": "agent"
+    }
+  ],
+  "suppressed": [],
+  "sub-results": [],
+  "skipped-sub-skills": []
+}
