@@ -1,0 +1,25 @@
+{
+  "findings": [
+    {
+      "id": "al-performance-review:1",
+      "location": { "file": "src/Sales/SalesLine.Table.al", "line": 142 },
+      "severity": "major",
+      "domain": "performance",
+      "confidence": "high",
+      "message": "FindSet is called inside the loop that also calls MODIFY, so every iteration issues a fresh server round-trip. Recommendation: read the set once before the loop and use a separate record variable for the write.",
+      "references": [
+        { "path": "microsoft/knowledge/performance/avoid-findset-inside-loop.md", "sha": "a1b2c3d4e5f6a7b8c9d0e1f2a3b4c5d6e7f8a9b0" }
+      ]
+    },
+    {
+      "id": "agent:2",
+      "from-sub-skill": "agent",
+      "location": { "file": "src/Sales/SalesPost.Codeunit.al", "line": 88 },
+      "severity": "minor",
+      "domain": "error-handling",
+      "confidence": "medium",
+      "message": "Error() is raised with a hard-coded literal, so the text cannot be translated. Fix: move the text into a Label and raise the Label instead.",
+      "references": []
+    }
+  ]
+}
