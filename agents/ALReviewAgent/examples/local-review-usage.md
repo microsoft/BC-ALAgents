@@ -53,7 +53,7 @@ pwsh -NoProfile -File .\agents\ALReviewAgent\scripts\Invoke-LocalReview.ps1 `
     -MinimumSeverity Low
 
 $report = Get-Content "$out\_review-report.json" -Raw | ConvertFrom-Json
-$report.findings | Format-Table @{n='file';e={$_.location.file}}, @{n='line';e={$_.location.line}}, severity, domain
+$report.findings | Format-Table @{n='file';e={$_.location.file}}, @{n='line';e={$_.location.line}}, severity, @{n='skill';e={$_.'from-sub-skill'}}
 ```
 
 ## Output contract
@@ -63,41 +63,72 @@ per the BCQuality `skills/do.md` DO output contract. A run-metrics summary is
 written alongside it at `<OutputDir>/_run-metrics.json` (wall time, token usage,
 estimated credits).
 
-`_review-report.json` shape (see [`sample-review-report.json`](./sample-review-report.json)
-for a full example):
+`_review-report.json` is an envelope, not a bare array — consumers read the
+top-level **`findings`** array (see
+[`sample-review-report.json`](./sample-review-report.json) for a full example):
 
 ```jsonc
 {
+  "skill":   { "id": "al-code-review", "version": 1 },
+  "outcome": "completed",             // completed | not-applicable | no-knowledge | partial | failed
+  "summary": {
+    "counts":   { "blocker": 0, "major": 1, "minor": 1, "info": 0 },
+    "coverage": { "worklist-size": 2, "items-evaluated": 2 }
+  },
   "findings": [
     {
-      "location": { "file": "src/Sales/SalesLine.Table.al", "line": 142 },
-      "severity": "major",          // blocker | major | minor | info
-      "domain":   "performance",    // optional label
+      "id":       "microsoft/knowledge/performance/avoid-findset-inside-loop.md",
+      "severity": "major",            // blocker | major | minor | info
       "message":  "...Recommendation: ...",
-      "references": [               // knowledge-backed: BCQuality article(s)
-        { "path": "microsoft/knowledge/performance/....md", "sha": "..." }
-      ]
+      "location": {
+        "file": "src/Sales/SalesLine.Table.al",   // repo-relative, forward slashes
+        "line": 142,
+        "range": { "start-line": 140, "end-line": 145 }   // optional
+      },
+      "references": [                 // knowledge-backed: BCQuality article(s)
+        { "path": "microsoft/knowledge/performance/avoid-findset-inside-loop.md" }
+      ],
+      "confidence":     "high",       // high | medium | low
+      "from-sub-skill": "al-performance-review"
     }
-  ]
+  ],
+  "suppressed": [],                   // findings the agent raised then suppressed
+  "sub-results": [],                  // per-leaf raw reports
+  "skipped-sub-skills": []
 }
 ```
 
 Field notes for consumers:
 
+- **Read `findings` off the top-level envelope.** The file also carries
+  `skill`, `outcome`, `summary`, `suppressed`, `sub-results`, and
+  `skipped-sub-skills`; a consumer that only scores findings just takes
+  `.findings`. An `outcome` of `completed` with an empty `findings` array means
+  "ran, found nothing" — not an error.
 - **Location** is nested: `location.file` (repo-relative, forward slashes) and
-  `location.line`. There is no flat `filePath` / `lineNumber`.
+  `location.line` (plus optional `location.range`). There is no flat
+  `filePath` / `lineNumber`.
 - **`severity`** uses the DO vocabulary `blocker | major | minor | info`. Map to
   your own scale if needed (e.g. `blocker->critical, major->high, minor->low,
   info->low`).
+- **`id`** — for a knowledge-backed finding the `id` **equals**
+  `references[0].path` (the primary article). For an agent finding it is a slug
+  prefixed with `agent:`.
 - **`message`** is a single string. Skills conventionally split guidance with a
   `Recommendation:` or `Fix:` marker, but that is best-effort, not guaranteed.
 - **`references`** is non-empty for knowledge-backed findings (each entry is a
-  BCQuality article `path` + `sha`). An **agent finding** (the reviewer's own
-  judgement, not backed by a specific article) has empty `references` and is
-  marked with either `from-sub-skill: "agent"` or an `id` starting with
-  `agent:`.
-- Additional optional fields you may see: `id`, `confidence`,
-  `suggested-code`, `from-sub-skill`.
+  BCQuality article `{ "path": ... }`; a `sha` may also appear but the engine
+  currently emits `path` only). An **agent finding** — the reviewer's own
+  judgement, not backed by an article — has `references: []` and an `id` that
+  starts with `agent:`. `from-sub-skill` is present on *every* finding (the
+  producing leaf skill's id, e.g. `al-performance-review`) and is the literal
+  string `"agent"` only for an agent finding the super-skill produced itself, so
+  use empty `references` + the `agent:` id prefix as the reliable agent-finding
+  markers.
+- There is **no `domain`** field. Derive a domain from `from-sub-skill` if you
+  need one.
+- Additional optional fields you may see: `suggested-code`,
+  `suggested-code-omission-reason`.
 
 If the agent produced no report file, the run fails loudly rather than emitting
 an empty report — treat a missing `_review-report.json` as an error, not "zero
