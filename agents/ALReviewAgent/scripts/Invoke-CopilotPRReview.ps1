@@ -2902,30 +2902,36 @@ else {
 Write-Host "Fetching changed files via git diff ($DiffRange)"
 $changedFileNames = @(Get-GitChangedFiles)
 Write-Host "Found $($changedFileNames.Count) changed file(s)"
-$changedFilesManifest = Join-Path $BCQualityRoot '_review-changed-files.txt'
-Set-Content -LiteralPath $changedFilesManifest -Value $changedFileNames -Encoding UTF8
-Write-LogPhaseDetail "Changed-file manifest written to $changedFilesManifest"
+# The changed-file manifest and object index are inputs to the Copilot CLI /
+# leaf sub-skills and are written into BCQUALITY_ROOT, which is only set in the
+# generate/all phases (the publish/post job never clones BCQuality). Skip them
+# in post to avoid Join-Path binding against a null $BCQualityRoot.
+if ($ReviewPhase -ne 'post') {
+    $changedFilesManifest = Join-Path $BCQualityRoot '_review-changed-files.txt'
+    Set-Content -LiteralPath $changedFilesManifest -Value $changedFileNames -Encoding UTF8
+    Write-LogPhaseDetail "Changed-file manifest written to $changedFilesManifest"
 
-# Shared object index: pre-compute the AL object inventory ONCE so leaf
-# sub-skills can locate objects without each re-grepping the whole tree
-# (cuts the cached re-ingestion cost that dominates large runs).
-$objectIndexPath = Join-Path $BCQualityRoot '_review-object-index.txt'
-$objHeaderRe = '^\s*(tableextension|pageextension|enumextension|permissionsetextension|reportextension|table|page|codeunit|report|xmlport|query|enum|interface|controladdin|permissionset|profile|entitlement|dotnet)\b'
-$objIndexLines = New-Object System.Collections.Generic.List[string]
-foreach ($cf in $changedFileNames) {
-    if ($cf -notmatch '\.al$') { continue }
-    $objFull = Join-Path $AnalysisWorkspace $cf
-    if (-not (Test-Path -LiteralPath $objFull)) { continue }
-    try {
-        foreach ($line in [System.IO.File]::ReadLines($objFull)) {
-            $t = $line.Trim()
-            if ($t -and $t -match $objHeaderRe) { $objIndexLines.Add("$cf`t$t"); break }
+    # Shared object index: pre-compute the AL object inventory ONCE so leaf
+    # sub-skills can locate objects without each re-grepping the whole tree
+    # (cuts the cached re-ingestion cost that dominates large runs).
+    $objectIndexPath = Join-Path $BCQualityRoot '_review-object-index.txt'
+    $objHeaderRe = '^\s*(tableextension|pageextension|enumextension|permissionsetextension|reportextension|table|page|codeunit|report|xmlport|query|enum|interface|controladdin|permissionset|profile|entitlement|dotnet)\b'
+    $objIndexLines = New-Object System.Collections.Generic.List[string]
+    foreach ($cf in $changedFileNames) {
+        if ($cf -notmatch '\.al$') { continue }
+        $objFull = Join-Path $AnalysisWorkspace $cf
+        if (-not (Test-Path -LiteralPath $objFull)) { continue }
+        try {
+            foreach ($line in [System.IO.File]::ReadLines($objFull)) {
+                $t = $line.Trim()
+                if ($t -and $t -match $objHeaderRe) { $objIndexLines.Add("$cf`t$t"); break }
+            }
         }
+        catch { }
     }
-    catch { }
+    Set-Content -LiteralPath $objectIndexPath -Value $objIndexLines -Encoding UTF8
+    Write-LogPhaseDetail "Object index written to $objectIndexPath ($($objIndexLines.Count) objects)"
 }
-Set-Content -LiteralPath $objectIndexPath -Value $objIndexLines -Encoding UTF8
-Write-LogPhaseDetail "Object index written to $objectIndexPath ($($objIndexLines.Count) objects)"
 $displayCap = 50
 $displayFiles = @($changedFileNames | Select-Object -First $displayCap)
 foreach ($cf in $displayFiles) { Write-LogPhaseDetail "- $cf" }
