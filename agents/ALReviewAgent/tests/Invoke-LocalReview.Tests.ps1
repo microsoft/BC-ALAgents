@@ -73,6 +73,23 @@ err: ${escape}[36mTokens     ↑ 1,234,567 (1,100,000 cached) • ↓ 86,543 (26
         $metrics.credits | Should -Be 800
     }
 
+    It 'parses summaries that include written cache tokens' {
+        $transcript = Join-Path $TestDrive 'written-cache-agent-transcript.log'
+        @'
+err: AI Credits 1383 (7m 11s)
+err: Tokens     ↑ 9.8m (8.8m cached, 1.0m written) • ↓ 97.8k (29.2k reasoning)
+'@ | Set-Content -LiteralPath $transcript
+
+        $metrics = Get-CopilotSummaryMetrics -TranscriptPath $transcript
+
+        $metrics.input_tokens | Should -Be 9800000
+        $metrics.cached_tokens | Should -Be 8800000
+        $metrics.output_tokens | Should -Be 97800
+        $metrics.reasoning_tokens | Should -Be 29200
+        $metrics.total_tokens | Should -Be 9897800
+        $metrics.credits | Should -Be 1383
+    }
+
     It 'returns null when the transcript has no completion summary' {
         $transcript = Join-Path $TestDrive 'empty-transcript.log'
         'out: review completed' | Set-Content -LiteralPath $transcript

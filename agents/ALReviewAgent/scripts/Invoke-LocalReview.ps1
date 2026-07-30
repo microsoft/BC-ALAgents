@@ -363,7 +363,7 @@ function Get-CopilotSummaryMetrics {
     )
     $tokenMatches = [regex]::Matches(
         $raw,
-        "(?m)^(?:err:\s*)?Tokens\s+↑\s*($metricNumberPattern)(?:\s+\(($metricNumberPattern)\s+cached\))?\s+•\s+↓\s*($metricNumberPattern)(?:\s+\(($metricNumberPattern)\s+reasoning\))?"
+        "(?m)^(?:err:\s*)?Tokens\s+↑\s*($metricNumberPattern)(?:\s+\(($metricNumberPattern)\s+cached(?:,\s*$metricNumberPattern\s+written)?\))?\s+•\s+↓\s*($metricNumberPattern)(?:\s+\(($metricNumberPattern)\s+reasoning\))?"
     )
     if ($creditMatches.Count -eq 0 -and $tokenMatches.Count -eq 0) {
         return $null
