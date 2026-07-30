@@ -30,6 +30,7 @@ Describe 'ConvertFrom-CopilotCompactNumber' {
     It 'expands compact token and credit values' {
         ConvertFrom-CopilotCompactNumber '1.2m' | Should -Be 1200000
         ConvertFrom-CopilotCompactNumber '8.6k' | Should -Be 8600
+        ConvertFrom-CopilotCompactNumber '1,234,567' | Should -Be 1234567
         ConvertFrom-CopilotCompactNumber '14.4' | Should -Be 14.4
     }
 }
@@ -52,6 +53,24 @@ err: Resume     copilot --resume=example
         $metrics.reasoning_tokens | Should -Be 2600
         $metrics.total_tokens | Should -Be 1208600
         $metrics.credits | Should -Be 138
+    }
+
+    It 'parses comma-formatted values and ignores ANSI formatting' {
+        $transcript = Join-Path $TestDrive 'formatted-agent-transcript.log'
+        $escape = [char]27
+        @"
+err: ${escape}[36mAI Credits 800 (11m 15s)${escape}[0m
+err: ${escape}[36mTokens     ↑ 1,234,567 (1,100,000 cached) • ↓ 86,543 (26,000 reasoning)${escape}[0m
+"@ | Set-Content -LiteralPath $transcript
+
+        $metrics = Get-CopilotSummaryMetrics -TranscriptPath $transcript
+
+        $metrics.input_tokens | Should -Be 1234567
+        $metrics.cached_tokens | Should -Be 1100000
+        $metrics.output_tokens | Should -Be 86543
+        $metrics.reasoning_tokens | Should -Be 26000
+        $metrics.total_tokens | Should -Be 1321110
+        $metrics.credits | Should -Be 800
     }
 
     It 'returns null when the transcript has no completion summary' {

@@ -355,13 +355,15 @@ function Get-CopilotSummaryMetrics {
     }
 
     $raw = Get-Content -LiteralPath $TranscriptPath -Raw
+    $raw = $raw -replace '\x1B\[[0-?]*[ -/]*[@-~]', ''
+    $metricNumberPattern = '[0-9][0-9,]*(?:\.[0-9]+)?[kKmM]?'
     $creditMatches = [regex]::Matches(
         $raw,
-        '(?m)^(?:err:\s*)?AI Credits\s+([0-9]+(?:\.[0-9]+)?[kKmM]?)'
+        "(?m)^(?:err:\s*)?AI Credits\s+($metricNumberPattern)"
     )
     $tokenMatches = [regex]::Matches(
         $raw,
-        '(?m)^(?:err:\s*)?Tokens\s+↑\s*([0-9]+(?:\.[0-9]+)?[kKmM]?)(?:\s+\(([0-9]+(?:\.[0-9]+)?[kKmM]?)\s+cached\))?\s+•\s+↓\s*([0-9]+(?:\.[0-9]+)?[kKmM]?)(?:\s+\(([0-9]+(?:\.[0-9]+)?[kKmM]?)\s+reasoning\))?'
+        "(?m)^(?:err:\s*)?Tokens\s+↑\s*($metricNumberPattern)(?:\s+\(($metricNumberPattern)\s+cached\))?\s+•\s+↓\s*($metricNumberPattern)(?:\s+\(($metricNumberPattern)\s+reasoning\))?"
     )
     if ($creditMatches.Count -eq 0 -and $tokenMatches.Count -eq 0) {
         return $null
