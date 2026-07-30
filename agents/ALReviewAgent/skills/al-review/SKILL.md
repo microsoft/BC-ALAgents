@@ -183,7 +183,16 @@ prose. The user can drill into any finding on request.
 
 Anticipate and offer:
 
-- **"fix them"** / **"apply the fixes"** -> re-run with `-Fix` (and optionally a higher `-MinimumSeverity` to limit scope). Fixes land in the worktree; do NOT commit unless asked. After a `-Fix` run, re-summarize: state which files were modified and that changes are staged in the worktree (uncommitted), then suggest the user review the diff.
+- **"fix them"** / **"apply the fixes"** after a completed review -> do **not**
+  rerun the review or launch another Copilot agent. Invoke the co-located
+  deterministic fixer instead:
+  `<skill-dir>/../../scripts/Apply-LocalReviewSuggestions.ps1 -RepoPath <repo>
+  -ReportPath <output-dir>/_review-report.json -MinimumSeverity <level>`.
+  It applies only literal `suggested-code` replacements and normally completes
+  in seconds. Read `_fix-results.json`, report which files were modified, and
+  clearly list findings skipped because they require judgment. Do not commit.
+- **"review and fix"** in the initial request -> run once with `-Fix`; this may
+  use an AI fix pass for findings without mechanical suggestions.
 - **"only criticals"** -> re-run with `-MinimumSeverity Critical`.
 - **"show me finding N"** -> open the referenced file/line.
 - **"review against release-24"** -> re-run with `-BaseRef origin/release-24`.
