@@ -193,6 +193,12 @@ Anticipate and offer:
   clearly list findings skipped because they require judgment. Do not commit.
 - **"review and fix"** in the initial request -> run once with `-Fix`; this may
   use an AI fix pass for findings without mechanical suggestions.
+- **"use AI to fix the remaining findings"** -> invoke
+  `<skill-dir>/../../scripts/Invoke-LocalReviewFixes.ps1 -RepoPath <repo>
+  -ReportPath <output-dir>/_review-report.json -MinimumSeverity <level>
+  -OnlyWithoutSuggestedCode`. This launches one fix agent against the existing
+  report and does **not** rerun the review. To fix one issue, additionally pass
+  `-FindingId <finding-id>`.
 - **"only criticals"** -> re-run with `-MinimumSeverity Critical`.
 - **"show me finding N"** -> open the referenced file/line.
 - **"review against release-24"** -> re-run with `-BaseRef origin/release-24`.

@@ -107,3 +107,16 @@ Describe 'Unavailable metrics representation' {
         $source | Should -Match '\$metrics\.estimated_credits = \$null'
     }
 }
+
+Describe 'Initial review and fix flow' {
+    It 'applies mechanical suggestions before sending only remaining findings to AI' {
+        $source = Get-Content -LiteralPath $scriptPath -Raw
+        $suggestionIndex = $source.IndexOf('& $suggestionScript')
+        $aiFixIndex = $source.IndexOf('& $fixScript')
+
+        $suggestionIndex | Should -BeGreaterOrEqual 0
+        $aiFixIndex | Should -BeGreaterThan $suggestionIndex
+        $source | Should -Match '-OnlyWithoutSuggestedCode:\$mechanicalApplied'
+        $source | Should -Match 'AI fix pass failed \(review results remain valid\)'
+    }
+}

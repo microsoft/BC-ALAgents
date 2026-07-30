@@ -67,7 +67,13 @@ if (-not $ResultPath) {
 }
 
 $report = Get-Content -LiteralPath $ReportPath -Raw | ConvertFrom-Json
-$findings = @($report.findings)
+$findingsProperty = $report.PSObject.Properties['findings']
+$findings = if ($null -ne $findingsProperty -and $null -ne $findingsProperty.Value) {
+    @($findingsProperty.Value)
+}
+else {
+    @()
+}
 $severityRank = @{
     blocker = 4
     major   = 3
