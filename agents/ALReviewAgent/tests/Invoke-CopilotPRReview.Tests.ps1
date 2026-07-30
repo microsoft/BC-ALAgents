@@ -474,3 +474,39 @@ Describe 'Build-BootstrapPrompt' {
         $script:BootstrapPrompt | Should -Not -Match 'diff --name-only origin/main to list changed files'
     }
 }
+
+Describe 'Repair-ShellEscapedQuotes' {
+    # Mirrors the real bug: a suggested-code field whose AL Label content is
+    # emitted through a single-quoted shell argument leaves the POSIX
+    # close/escape/reopen idiom '\'' in _review-report.json. That 4-char
+    # sequence is invalid JSON and is rejected by strict parsers (Python's
+    # json.loads in BC-Bench; .NET System.Text.Json here), even though
+    # PowerShell's own ConvertFrom-Json happens to tolerate it.
+    It 'collapses the POSIX shell single-quote escape so a strict parser accepts the report' {
+        $corrupt = '{"suggested-code":"BearerTok: Label ' + "'\''" + '******' + "'\''" + ', Locked = true;"}'
+        { [System.Text.Json.JsonDocument]::Parse($corrupt) } | Should -Throw
+
+        $repaired = Repair-ShellEscapedQuotes -Text $corrupt
+        $repaired.Contains("'\''") | Should -BeFalse
+        $doc = [System.Text.Json.JsonDocument]::Parse($repaired)
+        $doc.RootElement.GetProperty('suggested-code').GetString() |
+            Should -Be "BearerTok: Label '******', Locked = true;"
+    }
+
+    It 'preserves valid JSON string escapes (backslash-quote and backslash-n)' {
+        $json = '{"message":"He said \"hi\"\nnext line"}'
+        Repair-ShellEscapedQuotes -Text $json | Should -Be $json
+    }
+
+    It 'leaves clean text unchanged and is idempotent' {
+        $clean = '{"a":"no shell quotes here"}'
+        $once = Repair-ShellEscapedQuotes -Text $clean
+        $once | Should -Be $clean
+        Repair-ShellEscapedQuotes -Text $once | Should -Be $clean
+    }
+
+    It 'passes empty and null input through unchanged' {
+        Repair-ShellEscapedQuotes -Text '' | Should -Be ''
+        Repair-ShellEscapedQuotes -Text $null | Should -BeNullOrEmpty
+    }
+}

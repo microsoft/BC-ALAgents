@@ -1499,6 +1499,26 @@ function Repair-ResumeFenceJson {
     return $result
 }
 
+function Repair-ShellEscapedQuotes {
+    <#
+    Normalizes POSIX shell single-quote escaping that can leak into the
+    findings report. When a suggested-code field carries AL content with a
+    single-quoted token (e.g. a Label like BearerTok: Label '******') and the
+    agent emits it through a single-quoted shell argument, the shell
+    close/escape/reopen idiom '\'' can survive verbatim into
+    _review-report.json. The 4-char sequence '\'' is invalid JSON (a
+    backslash-escaped single quote is not a legal string escape), so both
+    ConvertFrom-Json and json.loads reject the entire report. Collapsing the
+    exact sequence back to a bare single quote restores valid JSON. That
+    sequence can never appear in well-formed JSON (a bare ' is only legal
+    inside a string and \' is always invalid), so the replacement is safe
+    globally; AL doubles quotes ('') to escape them and never emits '\''.
+    #>
+    param([string] $Text)
+    if (-not $Text) { return $Text }
+    return $Text.Replace("'\''", "'")
+}
+
 function Parse-BCQualityReport {
     <#
     Parses Copilot CLI output into a findings-report. Returns a PSCustomObject:
@@ -1527,7 +1547,7 @@ function Parse-BCQualityReport {
     #      output (handles cases where the fenced block was mangled in
     #      transit, e.g. only partially captured by the async output reader).
     #   3. The trimmed output as-is.
-    $repaired = Repair-InterruptedAgentJson -Output $Output
+    $repaired = Repair-InterruptedAgentJson -Output (Repair-ShellEscapedQuotes -Text $Output)
     $stripped = [regex]::Replace($repaired, "`e\[[\d;]*[A-Za-z]", '')
 
     $candidates = [System.Collections.Generic.List[string]]::new()
@@ -3056,6 +3076,17 @@ if ($ReviewPhase -ne 'post') {
     if (Test-Path -LiteralPath $reportFilePath) {
         $reportContent = Get-Content -LiteralPath $reportFilePath -Raw
         if (-not [string]::IsNullOrWhiteSpace($reportContent)) {
+            # The agent occasionally writes POSIX shell-escaped single quotes
+            # ('\'') into suggested-code, which is invalid JSON. Normalize the
+            # on-disk report so every downstream consumer reads valid JSON: this
+            # process's parser AND the local-review wrapper that copies the file
+            # to its OutputDir for BC-Bench (which never runs this parser).
+            $normalizedReport = Repair-ShellEscapedQuotes -Text $reportContent
+            if ($normalizedReport -ne $reportContent) {
+                Set-Content -LiteralPath $reportFilePath -Value $normalizedReport -Encoding UTF8
+                Write-LogPhaseDetail "Normalized shell-escaped quotes in '$reportFilePath'."
+                $reportContent = $normalizedReport
+            }
             Write-LogPhaseDetail "Harvested structured report from '$reportFilePath' ($($reportContent.Length) chars); superseding scraped stdout."
             $output = $reportContent
         } else {
