@@ -84,6 +84,17 @@ $PrNumber         = [int]($env:PR_NUMBER ?? 0)
 $PrHeadSha        = $env:PR_HEAD_SHA
 $BCQualityRoot    = $env:BCQUALITY_ROOT
 $BCQualitySha     = ($env:BCQUALITY_SHA ?? '').Trim()
+# BCQuality consumption mode. 'cwd' (default, legacy) runs the Copilot CLI with
+# its working directory set to the BCQuality clone, so the agent reads
+# ./skills/entry.md directly and writes per-run artifacts into the clone. 'plugin'
+# mounts the same clone read-only via --plugin-dir and invokes the
+# bcquality-al-review skill, re-homing per-run artifacts to $ReviewOutputDir. The
+# toggle exists for A/B validation; keep 'cwd' as the default so existing CI and
+# BC-Bench behavior is unchanged until 'plugin' is proven at parity.
+$BCQualityConsume = (($env:BCQUALITY_CONSUME ?? 'cwd') + '').Trim().ToLowerInvariant()
+if ($BCQualityConsume -notin @('cwd', 'plugin')) {
+    throw "BCQUALITY_CONSUME must be 'cwd' or 'plugin' (got '$BCQualityConsume')"
+}
 $CopilotModel     = ($env:COPILOT_MODEL ?? '').Trim()
 # Optional faster/cheaper model for leaf sub-skill child agents (triage tier).
 # Empty = leaves inherit the CLI's default child-agent model.
@@ -158,6 +169,15 @@ $AgentOutputFile  = 'agent-output.txt'
 # echoed to the terminal can be silently cut off and lost to stdout scraping.
 # Harvesting the report from this file instead makes result capture reliable.
 $ReportFileName   = '_review-report.json'
+
+# Working directory for the Copilot CLI and the home of the per-run agent
+# artifacts (_task-context.json, _review-changed-files.txt,
+# _review-object-index.txt, $ReportFileName). In 'cwd' mode this is the BCQuality
+# clone (the agent's CWD IS the knowledge tree). In 'plugin' mode the clone is
+# mounted read-only via --plugin-dir, so the artifacts live in $ReviewOutputDir
+# instead. Every prompt path to these artifacts is CWD-relative, so it resolves
+# correctly under either root without further changes.
+$AgentWorkDir = if ($BCQualityConsume -eq 'plugin') { $ReviewOutputDir } else { $BCQualityRoot }
 
 # Severity taxonomy used by the comment renderer and the MINIMUM_SEVERITY gate.
 # Lower rank = more severe. BCQuality emits blocker/major/minor/info; we map
@@ -719,7 +739,7 @@ function Build-TaskContext {
 function Save-TaskContext {
     param([object] $TaskContext)
 
-    $path = Join-Path $BCQualityRoot '_task-context.json'
+    $path = Join-Path $AgentWorkDir '_task-context.json'
     $json = $TaskContext | ConvertTo-Json -Depth 10
     Set-Content -LiteralPath $path -Value $json -Encoding UTF8
     Write-Host "Task context written to $path"
@@ -740,7 +760,7 @@ function Clear-BCQualityRunArtifacts {
     #      primary diff access is degraded.
     # Removing them before the run guarantees the agent and the harvester only
     # ever see artifacts produced by the current run.
-    if (-not $BCQualityRoot -or -not (Test-Path -LiteralPath $BCQualityRoot)) { return }
+    if (-not $AgentWorkDir -or -not (Test-Path -LiteralPath $AgentWorkDir)) { return }
 
     # NOTE: _filter-report.json is deliberately NOT cleared here. It is produced
     # by the upstream BCQuality filter step (before this engine runs) and is
@@ -757,7 +777,7 @@ function Clear-BCQualityRunArtifacts {
 
     $removed = 0
     foreach ($pattern in $stalePatterns) {
-        foreach ($file in (Get-ChildItem -LiteralPath $BCQualityRoot -File -Filter $pattern -ErrorAction SilentlyContinue)) {
+        foreach ($file in (Get-ChildItem -LiteralPath $AgentWorkDir -File -Filter $pattern -ErrorAction SilentlyContinue)) {
             try {
                 Remove-Item -LiteralPath $file.FullName -Force -ErrorAction Stop
                 $removed++
@@ -768,7 +788,7 @@ function Clear-BCQualityRunArtifacts {
     }
 
     if ($removed -gt 0) {
-        Write-Host "Cleared $removed stale review artifact(s) from $BCQualityRoot"
+        Write-Host "Cleared $removed stale review artifact(s) from $AgentWorkDir"
     }
 }
 
@@ -912,6 +932,59 @@ Do not spend effort authoring messages or ``suggested-code`` for findings below
 that floor; concentrate each leaf on '$MinimumSeverity'-and-above defects.
 "@
 
+    # --- BCQuality consumption: 'cwd' (read ./skills/entry.md from CWD) vs
+    # 'plugin' (invoke the bcquality-al-review skill mounted via --plugin-dir). Only
+    # the CONTRACT access line, the bootstrap procedure, and the DO-contract path
+    # reference differ; every other prompt path is CWD-relative and mode-agnostic.
+    $bcqRootFwd = ($BCQualityRoot -replace '\\', '/')
+    if ($BCQualityConsume -eq 'plugin') {
+        $bcqAccessLine = "BCQuality is mounted as a Copilot CLI plugin at PLUGIN_ROOT ``$bcqRootFwd`` and contributes the skill ``bcquality-al-review``; your working directory is a scratch output directory, NOT the BCQuality tree."
+        $doContractRef = 'as defined by the bcquality-al-review skill'
+        $bootstrapProcedure = @"
+Your bootstrap procedure is:
+1. Invoke the plugin skill named ``bcquality-al-review``. Its PLUGIN_ROOT is
+   $bcqRootFwd; use that exact path wherever the skill refers to PLUGIN_ROOT (do
+   NOT search the filesystem for it). The skill drives BCQuality's Entry protocol
+   (entry.md -> dispatch record -> action skills) internally against PLUGIN_ROOT.
+2. The task context for this run is at ./$taskCtxRel. Read it and hand its
+   contents to the skill as the ``task-context`` input.
+3. Follow the skill verbatim: for each dispatched action skill it reads the
+   referenced file and executes its Source -> Relevance -> Worklist -> Action
+   steps, consulting PLUGIN_ROOT/skills/read.md and PLUGIN_ROOT/skills/do.md as
+   needed. The skill file is authoritative; do not improvise or substitute your
+   own procedure.
+4. Produce a single JSON findings-report per the skill's DO output contract. If
+   the dispatched skill is a super-skill, its top-level findings[] aggregates the
+   leaf findings. Findings the skill surfaces without a backing knowledge article
+   (``references: []`` and ``from-sub-skill: "agent"`` per the DO contract) are
+   valid output — the orchestrator will render and post them, clearly labelled as
+   agent findings.
+"@
+    }
+    else {
+        $bcqAccessLine = 'The current working directory is a BCQuality checkout.'
+        $doContractRef = 'in ./skills/do.md'
+        $bootstrapProcedure = @"
+Your bootstrap procedure is:
+1. Read ./skills/entry.md first. It is the entry-point skill: feed it
+   the task context and obtain a dispatch record naming the action
+   skill(s) to invoke next.
+2. The task context for this run is at ./$taskCtxRel. Treat it as the
+   ``task-context`` input to entry.md.
+3. For each dispatched action skill in the dispatch record, read the
+   referenced file and execute its Source -> Relevance -> Worklist ->
+   Action steps. Read ./skills/read.md and ./skills/do.md on demand
+   when first needed.
+4. Produce a single JSON findings-report per the DO output contract
+   defined in ./skills/do.md. If the dispatched skill is a super-skill,
+   its top-level findings[] aggregates the leaf findings. Findings the
+   skill surfaces without a backing knowledge article (``references: []``
+   and ``from-sub-skill: "agent"`` per the DO contract) are valid
+   output — the orchestrator will render and post them, clearly
+   labelled as agent findings.
+"@
+    }
+
     return @"
 TASK:
 Review the pull request changes against $DiffBaseRef.
@@ -935,7 +1008,7 @@ files can appear as additions relative to an empty base; review their current
 contents from $prWorktree.
 $objectIndexSection
 CONTRACT:
-The current working directory is a BCQuality checkout. BCQuality is the
+$bcqAccessLine BCQuality is the
 authoritative knowledge layer for Business Central code review and the
 discovery surface for review skills. This orchestrator carries no
 review knowledge of its own.
@@ -947,23 +1020,7 @@ BCQuality knowledge article directly backs them. Follow the skills'
 guidance verbatim — the skills define the contract; do not invent your
 own.
 
-Your bootstrap procedure is:
-1. Read ./skills/entry.md first. It is the entry-point skill: feed it
-   the task context and obtain a dispatch record naming the action
-   skill(s) to invoke next.
-2. The task context for this run is at ./$taskCtxRel. Treat it as the
-   ``task-context`` input to entry.md.
-3. For each dispatched action skill in the dispatch record, read the
-   referenced file and execute its Source -> Relevance -> Worklist ->
-   Action steps. Read ./skills/read.md and ./skills/do.md on demand
-   when first needed.
-4. Produce a single JSON findings-report per the DO output contract
-   defined in ./skills/do.md. If the dispatched skill is a super-skill,
-   its top-level findings[] aggregates the leaf findings. Findings the
-   skill surfaces without a backing knowledge article (``references: []``
-   and ``from-sub-skill: "agent"`` per the DO contract) are valid
-   output — the orchestrator will render and post them, clearly
-   labelled as agent findings.
+$bootstrapProcedure
 
 $executionSection
 $severitySection
@@ -971,7 +1028,7 @@ OUTPUT FORMAT:
 1. The progress markers above (one per sub-skill, then the self-review
    marker; order among leaves does not matter). Each on its own line.
 2. Write the complete JSON findings-report (per the DO output contract
-   in ./skills/do.md) to the file ./$ReportFileName in your current
+   $doContractRef) to the file ./$ReportFileName in your current
    working directory, overwriting any existing file. Write the JSON
    straight to the file — do NOT build it by echoing to the terminal
    and do NOT rely on terminal output surviving, because large terminal
@@ -1028,6 +1085,13 @@ function Invoke-CopilotCli {
         '--add-dir', $AnalysisWorkspace,
         '-p', $Prompt
     )
+    # In 'plugin' mode, mount the BCQuality clone as a Copilot CLI plugin (exposing
+    # the bcquality-al-review skill) and grant read access to its tree via
+    # --add-dir, because the clone is no longer the CLI working directory. In 'cwd'
+    # mode neither flag is added and the agent reads the tree from its CWD as before.
+    if ($BCQualityConsume -eq 'plugin') {
+        $copilotArgs = @('--plugin-dir', $BCQualityRoot, '--add-dir', $BCQualityRoot) + $copilotArgs
+    }
     # Local runs commonly need to touch tools/binaries outside $AnalysisWorkspace
     # (e.g. git.exe under Program Files). Opt-in via COPILOT_ALLOW_ALL_PATHS
     # so CI PR reviews keep their tighter sandbox.
@@ -1062,7 +1126,8 @@ function Invoke-CopilotCli {
         $startInfo.RedirectStandardOutput = $true
         $startInfo.RedirectStandardError  = $true
         $startInfo.StandardOutputEncoding = [System.Text.Encoding]::UTF8
-        $startInfo.WorkingDirectory       = $BCQualityRoot
+        if (-not (Test-Path -LiteralPath $AgentWorkDir)) { $null = New-Item -ItemType Directory -Path $AgentWorkDir -Force }
+        $startInfo.WorkingDirectory       = $AgentWorkDir
 
         foreach ($arg in $copilotArgs) { $startInfo.ArgumentList.Add($arg) }
 
@@ -2907,14 +2972,15 @@ Write-Host "Found $($changedFileNames.Count) changed file(s)"
 # generate/all phases (the publish/post job never clones BCQuality). Skip them
 # in post to avoid Join-Path binding against a null $BCQualityRoot.
 if ($ReviewPhase -ne 'post') {
-    $changedFilesManifest = Join-Path $BCQualityRoot '_review-changed-files.txt'
+    if ($BCQualityConsume -eq 'plugin') { $null = New-Item -ItemType Directory -Path $AgentWorkDir -Force }
+    $changedFilesManifest = Join-Path $AgentWorkDir '_review-changed-files.txt'
     Set-Content -LiteralPath $changedFilesManifest -Value $changedFileNames -Encoding UTF8
     Write-LogPhaseDetail "Changed-file manifest written to $changedFilesManifest"
 
     # Shared object index: pre-compute the AL object inventory ONCE so leaf
     # sub-skills can locate objects without each re-grepping the whole tree
     # (cuts the cached re-ingestion cost that dominates large runs).
-    $objectIndexPath = Join-Path $BCQualityRoot '_review-object-index.txt'
+    $objectIndexPath = Join-Path $AgentWorkDir '_review-object-index.txt'
     $objHeaderRe = '^\s*(tableextension|pageextension|enumextension|permissionsetextension|reportextension|table|page|codeunit|report|xmlport|query|enum|interface|controladdin|permissionset|profile|entitlement|dotnet)\b'
     $objIndexLines = New-Object System.Collections.Generic.List[string]
     foreach ($cf in $changedFileNames) {
@@ -2986,7 +3052,7 @@ if ($ReviewPhase -ne 'post') {
     # prompt directs the model to also write the complete report to
     # $ReportFileName in $BCQualityRoot; when present, that file is the
     # authoritative, untruncated source and supersedes the scraped stdout.
-    $reportFilePath = Join-Path $BCQualityRoot $ReportFileName
+    $reportFilePath = Join-Path $AgentWorkDir $ReportFileName
     if (Test-Path -LiteralPath $reportFilePath) {
         $reportContent = Get-Content -LiteralPath $reportFilePath -Raw
         if (-not [string]::IsNullOrWhiteSpace($reportContent)) {
