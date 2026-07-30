@@ -327,6 +327,77 @@ function Restore-LocalGitConfig {
     }
 }
 
+function ConvertFrom-CopilotCompactNumber {
+    param([Parameter(Mandatory)][string] $Value)
+
+    $normalized = $Value.Trim().Replace(',', '')
+    if ($normalized -notmatch '^([0-9]+(?:\.[0-9]+)?)([kKmM]?)$') {
+        throw "Unsupported Copilot metric value: '$Value'"
+    }
+
+    $number = [double]::Parse(
+        $Matches[1],
+        [System.Globalization.CultureInfo]::InvariantCulture
+    )
+    $multiplier = switch ($Matches[2].ToLowerInvariant()) {
+        'k' { 1000 }
+        'm' { 1000000 }
+        default { 1 }
+    }
+    return $number * $multiplier
+}
+
+function Get-CopilotSummaryMetrics {
+    param([Parameter(Mandatory)][string] $TranscriptPath)
+
+    if (-not (Test-Path -LiteralPath $TranscriptPath -PathType Leaf)) {
+        return $null
+    }
+
+    $raw = Get-Content -LiteralPath $TranscriptPath -Raw
+    $creditMatches = [regex]::Matches(
+        $raw,
+        '(?m)^(?:err:\s*)?AI Credits\s+([0-9]+(?:\.[0-9]+)?[kKmM]?)'
+    )
+    $tokenMatches = [regex]::Matches(
+        $raw,
+        '(?m)^(?:err:\s*)?Tokens\s+↑\s*([0-9]+(?:\.[0-9]+)?[kKmM]?)(?:\s+\(([0-9]+(?:\.[0-9]+)?[kKmM]?)\s+cached\))?\s+•\s+↓\s*([0-9]+(?:\.[0-9]+)?[kKmM]?)(?:\s+\(([0-9]+(?:\.[0-9]+)?[kKmM]?)\s+reasoning\))?'
+    )
+    if ($creditMatches.Count -eq 0 -and $tokenMatches.Count -eq 0) {
+        return $null
+    }
+
+    $credits = 0.0
+    if ($creditMatches.Count -gt 0) {
+        $credits = ConvertFrom-CopilotCompactNumber $creditMatches[-1].Groups[1].Value
+    }
+
+    $inputTokens = 0L
+    $cachedTokens = 0L
+    $outputTokens = 0L
+    $reasoningTokens = 0L
+    if ($tokenMatches.Count -gt 0) {
+        $match = $tokenMatches[-1]
+        $inputTokens = [int64](ConvertFrom-CopilotCompactNumber $match.Groups[1].Value)
+        if ($match.Groups[2].Success) {
+            $cachedTokens = [int64](ConvertFrom-CopilotCompactNumber $match.Groups[2].Value)
+        }
+        $outputTokens = [int64](ConvertFrom-CopilotCompactNumber $match.Groups[3].Value)
+        if ($match.Groups[4].Success) {
+            $reasoningTokens = [int64](ConvertFrom-CopilotCompactNumber $match.Groups[4].Value)
+        }
+    }
+
+    return [pscustomobject]@{
+        input_tokens     = $inputTokens
+        cached_tokens    = $cachedTokens
+        output_tokens    = $outputTokens
+        reasoning_tokens = $reasoningTokens
+        total_tokens     = $inputTokens + $outputTokens
+        credits          = $credits
+    }
+}
+
 function Resolve-BranchBase {
     if ($BaseRef) { return $BaseRef }
     $upstream = & git -C $RepoPath rev-parse --abbrev-ref '@{u}' 2>$null
@@ -549,10 +620,13 @@ try {
         wall_time_display  = ('{0:mm\:ss}' -f $sw.Elapsed)
         model              = $env:COPILOT_MODEL
         prompt_tokens      = 0
+        cached_tokens      = 0
         completion_tokens  = 0
+        reasoning_tokens   = 0
         total_tokens       = 0
         api_calls          = 0
         estimated_credits  = 0.0
+        metrics_source     = 'unavailable'
         cost_note          = 'Credits derived from Copilot CLI token_prices (per 1M tokens). These are AI-credit units, not USD.'
         log_files_scanned  = @()
     }
@@ -592,6 +666,48 @@ try {
             $metrics['token_price_output_per_batch'] = $outputRate
             $metrics['token_price_batch_size']       = $batchSize
         }
+        if ($metrics.total_tokens -gt 0 -or $metrics.estimated_credits -gt 0) {
+            $metrics.metrics_source = 'process-logs'
+        }
+    }
+
+    # Copilot CLI always prints its aggregate token and AI-credit summary at
+    # process exit. Newer CLI log files may omit per-call usage records, so use
+    # the captured transcript as an authoritative aggregate fallback.
+    $transcriptMetrics = Get-CopilotSummaryMetrics -TranscriptPath (Join-Path $OutputDir 'agent-transcript.log')
+    if ($transcriptMetrics) {
+        $usedTranscript = $false
+        if ($metrics.total_tokens -eq 0 -and $transcriptMetrics.total_tokens -gt 0) {
+            $metrics.prompt_tokens = $transcriptMetrics.input_tokens
+            $metrics.cached_tokens = $transcriptMetrics.cached_tokens
+            $metrics.completion_tokens = $transcriptMetrics.output_tokens
+            $metrics.reasoning_tokens = $transcriptMetrics.reasoning_tokens
+            $metrics.total_tokens = $transcriptMetrics.total_tokens
+            $usedTranscript = $true
+        }
+        if ($metrics.estimated_credits -eq 0 -and $transcriptMetrics.credits -gt 0) {
+            $metrics.estimated_credits = $transcriptMetrics.credits
+            $usedTranscript = $true
+        }
+        if ($usedTranscript) {
+            $metrics.metrics_source = if ($metrics.metrics_source -eq 'process-logs') {
+                'process-logs+copilot-cli-summary'
+            }
+            else {
+                'copilot-cli-summary'
+            }
+            $metrics.cost_note = 'Credits and aggregate tokens reported by the Copilot CLI completion summary. Credits are AI-credit units, not USD.'
+        }
+    }
+
+    if ($metrics.metrics_source -eq 'unavailable') {
+        $metrics.prompt_tokens = $null
+        $metrics.cached_tokens = $null
+        $metrics.completion_tokens = $null
+        $metrics.reasoning_tokens = $null
+        $metrics.total_tokens = $null
+        $metrics.estimated_credits = $null
+        $metrics.cost_note = 'Copilot CLI usage metrics were unavailable from both process logs and the completion summary.'
     }
 
     $metricsPath = Join-Path $OutputDir '_run-metrics.json'

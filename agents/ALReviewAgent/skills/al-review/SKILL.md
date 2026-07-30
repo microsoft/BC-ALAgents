@@ -116,8 +116,9 @@ a 30-minute cap built in. Stream output so the user sees progress.
 After completion, read two files from `<OutputDir>` (default `<RepoPath>/.bc-review/`):
 
 - `_review-report.json` - findings (BCQuality skills contract)
-- `_run-metrics.json` - `wall_time_display`, `api_calls`, `prompt_tokens`,
-  `completion_tokens`, `total_tokens`, `estimated_credits`, `model`
+- `_run-metrics.json` - `wall_time_display`, `prompt_tokens`,
+  `completion_tokens`, `total_tokens`, `estimated_credits`, `model`, and
+  `metrics_source`
 
 Present a clean, scannable report using this exact structure. Lead with a
 one-line verdict so the user gets the headline before any detail.
@@ -127,13 +128,7 @@ one-line verdict so the user gets the headline before any detail.
 Always state explicitly that this was a **read-only review - no files were
 modified** (unless the run used `-Fix`; see step 4).
 
-**B. Run metrics** - one line, e.g.
-`03:47 - 42 calls - 128,540 tokens - ~64 credits (claude-opus-4.7)`.
-Credits are AI-credit units (not USD), from the Copilot CLI `token_prices`.
-If `estimated_credits` and `api_calls` are both 0, the log scan probably
-missed the process logs - say so instead of implying it was free.
-
-**C. Severity table** - map blocker->Critical, major->High, minor->Medium,
+**B. Severity table** - map blocker->Critical, major->High, minor->Medium,
 info->Low. Render as a compact markdown table so counts are scannable:
 
 | Severity | Count |
@@ -146,20 +141,40 @@ info->Low. Render as a compact markdown table so counts are scannable:
 Omit zero-count rows when the list is long; always keep the table if there
 is at least one finding.
 
-**D. Findings by domain** - group under domain headings (Security,
+**C. Findings by domain** - group under domain headings (Security,
 Performance, Style, Upgrade, Accessibility, Privacy, Other, Agent). Under
 each, list findings as:
 `- [High] file.al:120 - first sentence of description. (fix available)`
 Append the `(fix available)` marker only when that finding has
 `suggested-code`. Sort domains by highest severity present, then by count.
 
-**E. Next steps** - a short bullet list tailored to what was found:
+**D. Next steps** - a short bullet list tailored to what was found:
 - If any finding has `suggested-code`: "N of M findings have auto-appliable
   fixes - say *fix them* to apply."
 - Offer the most relevant follow-ups from step 4 (e.g. narrow to criticals,
   scope to a folder).
 - Full details: point to the `_review-report.json` and `_run-metrics.json`
   paths.
+
+**E. Run metrics** - always render this as the final section, after findings
+and next steps:
+
+| Metric | Value |
+|---|---:|
+| Time spent | 03:47 |
+| Input tokens | 124,300 |
+| Cached tokens | 110,000 |
+| Output tokens | 4,240 |
+| Reasoning tokens | 1,200 |
+| Total tokens | 128,540 |
+| AI credits | 63.715 |
+| Model | claude-opus-4.7 |
+
+Use thousands separators. Credits are AI-credit units, not USD. Omit the model
+row when `model` is empty. Omit cached or reasoning rows when their values are
+zero or unavailable. When `metrics_source` is `unavailable`, show `Unavailable`
+for token and credit values rather than displaying zeros or replacing the table
+with prose.
 
 Keep the whole thing compact - tables and one-line bullets, no walls of
 prose. The user can drill into any finding on request.
