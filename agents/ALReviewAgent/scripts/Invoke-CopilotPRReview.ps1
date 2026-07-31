@@ -1102,6 +1102,16 @@ function Invoke-CopilotCli {
     if ((($env:COPILOT_ALLOW_ALL_PATHS ?? '') + '').Trim().ToLowerInvariant() -in @('1','true','yes','on')) {
         $copilotArgs = @('--allow-all-paths') + $copilotArgs
     }
+    # Copilot CLI 1.0.77 starts each Windows PowerShell shell tool through a
+    # visible legacy pseudo-terminal. Review agents only need the native file
+    # tools, so keep shell tools unavailable for local Windows reviews. This
+    # prevents one console window from flashing for every leaf child agent.
+    if ($ReviewSource -eq 'local' -and $IsWindows) {
+        $copilotArgs = @(
+            '--excluded-tools',
+            'powershell,read_powershell,write_powershell,stop_powershell,list_powershell'
+        ) + $copilotArgs
+    }
     if ($CopilotModel) { $copilotArgs += "--model=$CopilotModel" }
 
     # Pass only a safe allowlist of env vars to the subprocess. CI generation

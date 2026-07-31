@@ -134,6 +134,15 @@ Describe 'Get-AlReviewFilePaths' {
     It 'returns an empty array for a non-AL diff' {
         @(Get-AlReviewFilePaths -Paths @('README.md', 'src/app.json')).Count | Should -Be 0
     }
+
+    It 'keeps a single AL review path in an array before checking Count' {
+        $source = Get-Content -LiteralPath $scriptPath -Raw
+
+        $source | Should -Match '\$alReviewFiles\s*=\s*@\(Get-AlReviewFilePaths -Paths \$reviewPaths\)'
+        $paths = @(Get-AlReviewFilePaths -Paths @('src/Only.Codeunit.al'))
+        $paths.Count | Should -Be 1
+        $paths[0] | Should -Be 'src/Only.Codeunit.al'
+    }
 }
 
 Describe 'Unavailable metrics representation' {
@@ -183,5 +192,24 @@ Describe 'No-AL review preflight' {
         $source | Should -Match "'--name-status', '--find-renames'"
         $source | Should -Match "'--diff-filter=ACMRTD'"
         $source | Should -Match "metrics_source\s+=\s+'not-applicable'"
+    }
+}
+
+Describe 'Hidden local Windows review execution' {
+    It 'does not launch a nested PowerShell process from the skill' {
+        $skillPath = Join-Path (Split-Path -Parent $PSScriptRoot) 'skills/al-review/SKILL.md'
+        $skill = Get-Content -LiteralPath $skillPath -Raw
+
+        $skill | Should -Not -Match 'pwsh\s+-NoProfile\s+-File'
+        $skill | Should -Match '& \$reviewScript @reviewParameters'
+    }
+
+    It 'disables Copilot PowerShell tools for local Windows reviews' {
+        $reviewScriptPath = Join-Path (Join-Path (Split-Path -Parent $PSScriptRoot) 'scripts') 'Invoke-CopilotPRReview.ps1'
+        $source = Get-Content -LiteralPath $reviewScriptPath -Raw
+
+        $source | Should -Match '\$ReviewSource -eq ''local'' -and \$IsWindows'
+        $source | Should -Match "'--excluded-tools'"
+        $source | Should -Match 'powershell,read_powershell,write_powershell,stop_powershell,list_powershell'
     }
 }

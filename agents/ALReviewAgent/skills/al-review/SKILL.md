@@ -103,10 +103,17 @@ invent flags - the wrapper's full parameter set is exactly:
 `-NoParallelLeaves` (switch; disable concurrent leaf dispatch)
 
 ```powershell
-pwsh -NoProfile -File "<skill-dir>/../../scripts/Invoke-LocalReview.ps1" `
-    -RepoPath <repo> `
-    -Mode Branch
+$reviewScript = "<resolved-skill-dir>/../../scripts/Invoke-LocalReview.ps1"
+$reviewParameters = @{
+    RepoPath = <repo>
+    Mode = 'Branch'
+}
+& $reviewScript @reviewParameters
 ```
+
+Run the script directly in the current PowerShell session. Do not launch a
+nested `pwsh -File` process - the extra process is unnecessary and can flash a
+console window on Windows.
 
 The reviewer takes 2-10 minutes. Do not add your own timeout; the engine has
 a 30-minute cap built in. Stream output so the user sees progress.

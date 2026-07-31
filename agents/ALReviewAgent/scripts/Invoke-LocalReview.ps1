@@ -524,7 +524,7 @@ try {
         throw "Could not enumerate files in review diff '$diffRange'."
     }
     $reviewPaths = ConvertFrom-GitNameStatus -Lines $nameStatusLines
-    $alReviewFiles = Get-AlReviewFilePaths -Paths $reviewPaths
+    $alReviewFiles = @(Get-AlReviewFilePaths -Paths $reviewPaths)
     if ($alReviewFiles.Count -eq 0) {
         $reportPath = Join-Path $OutputDir '_review-report.json'
         [pscustomobject]@{
