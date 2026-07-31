@@ -120,3 +120,16 @@ Describe 'Initial review and fix flow' {
         $source | Should -Match 'AI fix pass failed \(review results remain valid\)'
     }
 }
+
+Describe 'Skill fix choices' {
+    It 'offers four explicit post-review fix workflows' {
+        $skillPath = Join-Path (Split-Path -Parent $PSScriptRoot) 'skills/al-review/SKILL.md'
+        $skill = Get-Content -LiteralPath $skillPath -Raw
+
+        $skill | Should -Match '1\. \*\*Apply reviewer fixes\*\*'
+        $skill | Should -Match '2\. \*\*Fix with an AI agent\*\*'
+        $skill | Should -Match '3\. \*\*Fix and verify\*\*'
+        $skill | Should -Match '4\. \*\*Fix and review again\*\*'
+        $skill | Should -Match 'Do not silently choose the expensive path'
+    }
+}
