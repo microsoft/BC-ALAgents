@@ -194,7 +194,8 @@ Anticipate and offer:
   the same four numbered options shown in the report. Recommend **Apply reviewer
   fixes** when at least one suggestion exists; otherwise recommend **Fix with
   an AI agent**. Do not silently choose the expensive path.
-- **"fix them"** / **"apply the fixes"** after a completed review -> do **not**
+- **"apply reviewer fixes"** / selecting option 1 after a completed review ->
+  do **not**
   rerun the review or launch another Copilot agent. Invoke the co-located
   deterministic fixer instead:
   `<skill-dir>/../../scripts/Apply-LocalReviewSuggestions.ps1 -RepoPath <repo>

@@ -57,6 +57,37 @@ function Get-SuggestedCodeProperty {
     return $null
 }
 
+function Resolve-SafeRepoFilePath {
+    param(
+        [Parameter(Mandatory)][string] $RepoPath,
+        [Parameter(Mandatory)][string] $RelativeFile
+    )
+
+    $comparison = if ($IsWindows) { [StringComparison]::OrdinalIgnoreCase } else { [StringComparison]::Ordinal }
+    $repoPrefix = $RepoPath.TrimEnd([IO.Path]::DirectorySeparatorChar, [IO.Path]::AltDirectorySeparatorChar) +
+        [IO.Path]::DirectorySeparatorChar
+    $relativePath = $RelativeFile.Replace('/', [IO.Path]::DirectorySeparatorChar)
+    $filePath = [IO.Path]::GetFullPath((Join-Path $RepoPath $relativePath))
+    if (-not $filePath.StartsWith($repoPrefix, $comparison)) {
+        throw "Path points outside RepoPath: $RelativeFile"
+    }
+
+    $current = $RepoPath
+    foreach ($segment in $relativePath.Split(
+        [char[]]@([IO.Path]::DirectorySeparatorChar, [IO.Path]::AltDirectorySeparatorChar),
+        [StringSplitOptions]::RemoveEmptyEntries
+    )) {
+        $current = Join-Path $current $segment
+        if (Test-Path -LiteralPath $current) {
+            $item = Get-Item -LiteralPath $current -Force
+            if (($item.Attributes -band [IO.FileAttributes]::ReparsePoint) -ne 0) {
+                throw "Path contains a symbolic link or junction: $RelativeFile"
+            }
+        }
+    }
+    return $filePath
+}
+
 $RepoPath = (Resolve-Path -LiteralPath $RepoPath).Path
 if (-not $ReportPath) {
     $ReportPath = Join-Path $RepoPath '.bc-review/_review-report.json'
@@ -87,14 +118,6 @@ $minimumRank = @{
     Low      = 1
 }[$MinimumSeverity]
 
-$comparison = if ($IsWindows) {
-    [StringComparison]::OrdinalIgnoreCase
-}
-else {
-    [StringComparison]::Ordinal
-}
-$repoPrefix = $RepoPath.TrimEnd([IO.Path]::DirectorySeparatorChar, [IO.Path]::AltDirectorySeparatorChar) +
-    [IO.Path]::DirectorySeparatorChar
 $reportTime = (Get-Item -LiteralPath $ReportPath).LastWriteTimeUtc
 $plans = [Collections.Generic.List[object]]::new()
 $skipped = [Collections.Generic.List[object]]::new()
@@ -130,11 +153,7 @@ foreach ($finding in $findings) {
     }
 
     $relativeFile = [string]$fileProperty.Value
-    $relativePath = $relativeFile.Replace('/', [IO.Path]::DirectorySeparatorChar)
-    $filePath = [IO.Path]::GetFullPath((Join-Path $RepoPath $relativePath))
-    if (-not $filePath.StartsWith($repoPrefix, $comparison)) {
-        throw "Finding '$findingId' points outside RepoPath: $relativeFile"
-    }
+    $filePath = Resolve-SafeRepoFilePath -RepoPath $RepoPath -RelativeFile $relativeFile
     if (-not (Test-Path -LiteralPath $filePath -PathType Leaf)) {
         $skipped.Add([pscustomobject]@{ id = $findingId; reason = 'file-not-found' })
         continue
@@ -226,20 +245,47 @@ foreach ($fileGroup in @($plans | Group-Object filePath)) {
     $state.newText = $state.lines -join $state.newLine
 }
 
-$writtenPaths = [Collections.Generic.List[string]]::new()
+$writePlans = [Collections.Generic.List[object]]::new()
 try {
     foreach ($fileGroup in @($plans | Group-Object filePath)) {
         $state = $fileStates[$fileGroup.Name]
-        [IO.File]::WriteAllText($fileGroup.Name, $state.newText, $state.encoding)
-        $writtenPaths.Add($fileGroup.Name)
+        $directory = Split-Path -Parent $fileGroup.Name
+        $name = Split-Path -Leaf $fileGroup.Name
+        $token = [Guid]::NewGuid().ToString('N')
+        $tempPath = Join-Path $directory ".$name.$token.tmp"
+        $backupPath = Join-Path $directory ".$name.$token.bak"
+        $writePlan = [pscustomobject]@{
+            target = $fileGroup.Name
+            temp   = $tempPath
+            backup = $backupPath
+        }
+        $writePlans.Add($writePlan)
+        [IO.File]::WriteAllText($tempPath, $state.newText, $state.encoding)
+        [IO.File]::Copy($fileGroup.Name, $backupPath, $false)
+    }
+
+    $replaced = [Collections.Generic.List[object]]::new()
+    try {
+        foreach ($writePlan in $writePlans) {
+            [IO.File]::Move($writePlan.temp, $writePlan.target, $true)
+            $replaced.Add($writePlan)
+        }
+    }
+    catch {
+        foreach ($writePlan in $replaced) {
+            [IO.File]::Move($writePlan.backup, $writePlan.target, $true)
+        }
+        throw
     }
 }
-catch {
-    foreach ($writtenPath in $writtenPaths) {
-        $state = $fileStates[$writtenPath]
-        [IO.File]::WriteAllText($writtenPath, $state.originalText, $state.encoding)
+finally {
+    foreach ($writePlan in $writePlans) {
+        foreach ($cleanupPath in @($writePlan.temp, $writePlan.backup)) {
+            if (Test-Path -LiteralPath $cleanupPath) {
+                Remove-Item -LiteralPath $cleanupPath -Force -ErrorAction SilentlyContinue
+            }
+        }
     }
-    throw
 }
 
 $result = [pscustomobject]@{

@@ -412,6 +412,34 @@ function Resolve-BranchBase {
     throw "Could not determine base ref. Pass -BaseRef explicitly."
 }
 
+function Get-AlReviewFilePaths {
+    param([object[]] $Paths = @())
+
+    return @($Paths | ForEach-Object { ([string]$_).Trim() } |
+        Where-Object { $_ -and $_.EndsWith('.al', [StringComparison]::OrdinalIgnoreCase) })
+}
+
+function ConvertFrom-GitNameStatus {
+    param([object[]] $Lines = @())
+
+    $paths = [Collections.Generic.List[string]]::new()
+    foreach ($lineValue in $Lines) {
+        $line = [string]$lineValue
+        if ([string]::IsNullOrWhiteSpace($line)) {
+            continue
+        }
+        $parts = $line -split "`t"
+        if ($parts.Count -lt 2) {
+            continue
+        }
+        $paths.Add($parts[1])
+        if ($parts[0] -match '^[RC]' -and $parts.Count -ge 3) {
+            $paths.Add($parts[2])
+        }
+    }
+    return @($paths)
+}
+
 # ---------------------------------------------------------------------------
 # Prep: figure out base + optionally stage staged-changes into a temp commit
 # ---------------------------------------------------------------------------
@@ -470,6 +498,75 @@ try {
             $tempCommitMade = $true
         }
     }
+
+    # Stop before BCQuality filtering and Copilot startup when the selected
+    # review diff contains no AL source. The AL reviewer cannot produce useful
+    # findings for non-AL changes, so launching its multi-agent pass would only
+    # waste time and AI credits.
+    $effectivePath = if ($Path) { $Path } else { $autoPathSpec }
+    $diffRange = if ($Mode -eq 'Existing') {
+        "$effectiveBase..HEAD"
+    }
+    else {
+        "$effectiveBase...HEAD"
+    }
+    $nameStatusArgs = @(
+        '-C', $RepoPath, 'diff', '--name-status', '--find-renames',
+        '--diff-filter=ACMRTD', $diffRange, '--'
+    )
+    if ($effectivePath) {
+        $nameStatusArgs += @($effectivePath -split ';' | ForEach-Object {
+            ($_ -replace '\\', '/').Trim()
+        } | Where-Object { $_ })
+    }
+    $nameStatusLines = @(& git @nameStatusArgs 2>$null)
+    if ($LASTEXITCODE -ne 0) {
+        throw "Could not enumerate files in review diff '$diffRange'."
+    }
+    $reviewPaths = ConvertFrom-GitNameStatus -Lines $nameStatusLines
+    $alReviewFiles = Get-AlReviewFilePaths -Paths $reviewPaths
+    if ($alReviewFiles.Count -eq 0) {
+        $reportPath = Join-Path $OutputDir '_review-report.json'
+        [pscustomobject]@{
+            skill            = [pscustomobject]@{ id = 'al-code-review'; version = 1 }
+            outcome          = 'not-applicable'
+            'outcome-reason' = 'The selected review diff contains no AL (.al) files.'
+            summary          = [pscustomobject]@{
+                counts   = [pscustomobject]@{ blocker = 0; major = 0; minor = 0; info = 0 }
+                coverage = [pscustomobject]@{ 'worklist-size' = 0; 'items-evaluated' = 0 }
+            }
+            findings         = @()
+            suppressed       = @()
+            'sub-results'    = @()
+            'skipped-sub-skills' = @()
+        } | ConvertTo-Json -Depth 8 | Set-Content -LiteralPath $reportPath -Encoding utf8
+
+        $metricsPath = Join-Path $OutputDir '_run-metrics.json'
+        [pscustomobject]@{
+            wall_time_seconds   = 0
+            wall_time_display   = '00:00'
+            model               = $null
+            prompt_tokens       = 0
+            cached_tokens       = 0
+            completion_tokens   = 0
+            reasoning_tokens    = 0
+            total_tokens        = 0
+            api_calls           = 0
+            estimated_credits   = 0.0
+            metrics_source      = 'not-applicable'
+            cost_note           = 'No Copilot process was launched because the selected diff contains no AL files.'
+            log_files_scanned   = @()
+        } | ConvertTo-Json -Depth 5 | Set-Content -LiteralPath $metricsPath -Encoding utf8
+
+        Write-Host '[local-review] No AL (.al) files found in the selected diff; review skipped.'
+        Write-Host "[local-review] Findings: $reportPath"
+        Write-Host "[local-review] Metrics: $metricsPath"
+        if ($shadowRepo -and (Test-Path $shadowRepo)) {
+            Remove-Item -Recurse -Force $shadowRepo -ErrorAction SilentlyContinue
+        }
+        return
+    }
+    Write-Host "[local-review] AL files in selected diff: $($alReviewFiles.Count)"
 
     # -----------------------------------------------------------------------
     # Relevance pre-pass: skip feature-gated review domains that have zero
@@ -557,7 +654,6 @@ try {
     else { Remove-Item Env:COPILOT_REVIEW_LEAF_MODEL -ErrorAction SilentlyContinue }
     $env:COPILOT_REVIEW_PARALLEL_LEAVES = if ($NoParallelLeaves) { 'false' } else { 'true' }
 
-    $effectivePath = if ($Path) { $Path } else { $autoPathSpec }
     if ($effectivePath) {
         # Prefer the engine's diff-scoping (REVIEW_PATH_SPEC) — narrows what
         # the agent sees, not just what it reports. Also set REVIEW_APPLY_TO
@@ -738,13 +834,13 @@ if ($Fix) {
     $reportPath = Join-Path $OutputDir '_review-report.json'
     $suggestionScript = Join-Path $PSScriptRoot 'Apply-LocalReviewSuggestions.ps1'
     $fixScript = Join-Path $PSScriptRoot 'Invoke-LocalReviewFixes.ps1'
-    $mechanicalApplied = $false
+    $appliedFindingIds = @()
     try {
-        & $suggestionScript `
+        $mechanicalResult = & $suggestionScript `
             -RepoPath $sourceForOutput `
             -ReportPath $reportPath `
-            -MinimumSeverity $MinimumSeverity | Out-Null
-        $mechanicalApplied = $true
+            -MinimumSeverity $MinimumSeverity
+        $appliedFindingIds = @($mechanicalResult.applied | ForEach-Object id)
     }
     catch {
         Write-Warning "Mechanical fix pass failed; AI will receive all findings: $_"
@@ -755,7 +851,7 @@ if ($Fix) {
             -RepoPath $sourceForOutput `
             -ReportPath $reportPath `
             -MinimumSeverity $MinimumSeverity `
-            -OnlyWithoutSuggestedCode:$mechanicalApplied `
+            -ExcludeFindingId $appliedFindingIds `
             -Model $Model | Out-Null
     }
     catch {
