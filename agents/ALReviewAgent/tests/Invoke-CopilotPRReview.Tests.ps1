@@ -566,3 +566,126 @@ Describe 'Repair-ShellEscapedQuotes' {
         Repair-ShellEscapedQuotes -Text $null | Should -BeNullOrEmpty
     }
 }
+
+Describe 'Get-RegionalPathInfo' {
+    It 'parses an src/Apps regional path' {
+        $info = Get-RegionalPathInfo -FilePath 'src/Apps/US/Sales/Foo.Codeunit.al'
+        $info.Tree | Should -Be 'apps'
+        $info.Region | Should -Be 'us'
+        $info.Relative | Should -Be 'Sales/Foo.Codeunit.al'
+    }
+
+    It 'parses an src/Layers regional path and normalizes backslashes/case' {
+        $info = Get-RegionalPathInfo -FilePath '\src\Layers\W1\Bar.al'
+        $info.Tree | Should -Be 'layers'
+        $info.Region | Should -Be 'w1'
+        $info.Path | Should -Be 'src/Layers/W1/Bar.al'
+    }
+
+    It 'returns null for a non-regional path' {
+        Get-RegionalPathInfo -FilePath 'src/System Application/Foo.al' | Should -BeNullOrEmpty
+    }
+}
+
+Describe 'Get-FindingSignature' {
+    It 'is stable across whitespace and case differences' {
+        $a = [pscustomobject]@{ domain = 'Performance'; issue = 'Avoid  N+1'; recommendation = 'Use SetLoadFields' }
+        $b = [pscustomobject]@{ domain = 'performance'; issue = 'avoid n+1';  recommendation = 'use  setloadfields' }
+        (Get-FindingSignature -Finding $a) | Should -Be (Get-FindingSignature -Finding $b)
+    }
+
+    It 'differs when the issue text differs' {
+        $a = [pscustomobject]@{ domain = 'Performance'; issue = 'Avoid N+1'; recommendation = 'Use SetLoadFields' }
+        $b = [pscustomobject]@{ domain = 'Performance'; issue = 'Different'; recommendation = 'Use SetLoadFields' }
+        (Get-FindingSignature -Finding $a) | Should -Not -Be (Get-FindingSignature -Finding $b)
+    }
+}
+
+Describe 'Get-FindingOtherRegions' {
+    It 'returns an empty array when the property is absent (StrictMode-safe)' {
+        (Get-FindingOtherRegions -Finding ([pscustomobject]@{ filePath = 'x' })).Count | Should -Be 0
+    }
+}
+
+Describe 'Group-RegionalFindings' {
+    BeforeAll {
+        function New-RegionalFinding {
+            param([string] $Path, [int] $Line = 10, [string] $Issue = 'Avoid N+1 query', [string] $Rec = 'Use SetLoadFields')
+            [pscustomobject]@{
+                filePath = $Path; lineNumber = $Line; severity = 'Medium'
+                domain = 'Performance'; issue = $Issue; recommendation = $Rec
+            }
+        }
+    }
+
+    It 'collapses an identical finding across regions and prefers W1 as primary' {
+        $findings = @(
+            New-RegionalFinding -Path 'src/Apps/US/Foo.al' -Line 42
+            New-RegionalFinding -Path 'src/Apps/W1/Foo.al' -Line 40
+            New-RegionalFinding -Path 'src/Apps/DE/Foo.al' -Line 44
+        )
+        $result = @(Group-RegionalFindings -Findings $findings)
+        $result.Count | Should -Be 1
+        $result[0].filePath | Should -Be 'src/Apps/W1/Foo.al'
+        $others = Get-FindingOtherRegions -Finding $result[0]
+        $others.Count | Should -Be 2
+        ($others | ForEach-Object { $_.region }) | Should -Be @('DE', 'US')
+        $others[0].line | Should -Be 44
+    }
+
+    It 'picks a deterministic primary when no W1 copy is present' {
+        $findings = @(
+            New-RegionalFinding -Path 'src/Apps/US/Foo.al' -Line 42
+            New-RegionalFinding -Path 'src/Apps/DE/Foo.al' -Line 44
+        )
+        $result = @(Group-RegionalFindings -Findings $findings)
+        $result.Count | Should -Be 1
+        $result[0].filePath | Should -Be 'src/Apps/DE/Foo.al'
+        (Get-FindingOtherRegions -Finding $result[0]).region | Should -Be 'US'
+    }
+
+    It 'does not collapse findings with different signatures' {
+        $findings = @(
+            New-RegionalFinding -Path 'src/Apps/US/Foo.al' -Issue 'Avoid N+1 query'
+            New-RegionalFinding -Path 'src/Apps/W1/Foo.al' -Issue 'Unrelated issue'
+        )
+        (Group-RegionalFindings -Findings $findings).Count | Should -Be 2
+    }
+
+    It 'does not collapse identical findings that stay within one region' {
+        $findings = @(
+            New-RegionalFinding -Path 'src/Apps/US/Foo.al' -Line 10
+            New-RegionalFinding -Path 'src/Apps/US/Bar.al' -Line 99
+        )
+        $result = @(Group-RegionalFindings -Findings $findings)
+        $result.Count | Should -Be 2
+        (Get-FindingOtherRegions -Finding $result[0]).Count | Should -Be 0
+    }
+
+    It 'leaves a non-regional finding untouched even if it shares a signature' {
+        $findings = @(
+            New-RegionalFinding -Path 'src/Apps/US/Foo.al'
+            New-RegionalFinding -Path 'src/Apps/W1/Foo.al'
+            New-RegionalFinding -Path 'src/System Application/Foo.al'
+        )
+        $result = @(Group-RegionalFindings -Findings $findings)
+        $result.Count | Should -Be 2
+        ($result | Where-Object { $_.filePath -eq 'src/System Application/Foo.al' }).Count | Should -Be 1
+    }
+}
+
+Describe 'Format-OtherRegionsNotice' {
+    It 'renders a bullet list of the other regional copies' {
+        $finding = [pscustomobject]@{ otherRegions = @(
+            [pscustomobject]@{ path = 'src/Apps/US/Foo.al'; line = 42; region = 'US' }
+        ) }
+        $notice = Format-OtherRegionsNotice -Finding $finding
+        $notice | Should -Match 'regional copies'
+        $notice | Should -Match 'src/Apps/US/Foo.al:42`'
+        $notice | Should -Match '\(US\)'
+    }
+
+    It 'returns an empty string when there are no other regions' {
+        Format-OtherRegionsNotice -Finding ([pscustomobject]@{ filePath = 'x' }) | Should -Be ''
+    }
+}
