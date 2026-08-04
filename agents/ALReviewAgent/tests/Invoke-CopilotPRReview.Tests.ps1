@@ -587,20 +587,6 @@ Describe 'Get-RegionalPathInfo' {
     }
 }
 
-Describe 'Get-FindingSignature' {
-    It 'is stable across whitespace and case differences' {
-        $a = [pscustomobject]@{ domain = 'Performance'; issue = 'Avoid  N+1'; recommendation = 'Use SetLoadFields' }
-        $b = [pscustomobject]@{ domain = 'performance'; issue = 'avoid n+1';  recommendation = 'use  setloadfields' }
-        (Get-FindingSignature -Finding $a) | Should -Be (Get-FindingSignature -Finding $b)
-    }
-
-    It 'differs when the issue text differs' {
-        $a = [pscustomobject]@{ domain = 'Performance'; issue = 'Avoid N+1'; recommendation = 'Use SetLoadFields' }
-        $b = [pscustomobject]@{ domain = 'Performance'; issue = 'Different'; recommendation = 'Use SetLoadFields' }
-        (Get-FindingSignature -Finding $a) | Should -Not -Be (Get-FindingSignature -Finding $b)
-    }
-}
-
 Describe 'Get-FindingOtherRegions' {
     It 'returns an empty array when the property is absent (StrictMode-safe)' {
         (Get-FindingOtherRegions -Finding ([pscustomobject]@{ filePath = 'x' })).Count | Should -Be 0
@@ -621,8 +607,8 @@ Describe 'Group-RegionalFindings' {
     It 'collapses an identical finding across regions and prefers W1 as primary' {
         $findings = @(
             New-RegionalFinding -Path 'src/Apps/US/Foo.al' -Line 42
-            New-RegionalFinding -Path 'src/Apps/W1/Foo.al' -Line 40
-            New-RegionalFinding -Path 'src/Apps/DE/Foo.al' -Line 44
+            New-RegionalFinding -Path 'src/Apps/W1/Foo.al' -Line 42
+            New-RegionalFinding -Path 'src/Apps/DE/Foo.al' -Line 42
         )
         $result = @(Group-RegionalFindings -Findings $findings)
         $result.Count | Should -Be 1
@@ -630,13 +616,13 @@ Describe 'Group-RegionalFindings' {
         $others = Get-FindingOtherRegions -Finding $result[0]
         $others.Count | Should -Be 2
         ($others | ForEach-Object { $_.region }) | Should -Be @('DE', 'US')
-        $others[0].line | Should -Be 44
+        $others[0].line | Should -Be 42
     }
 
     It 'picks a deterministic primary when no W1 copy is present' {
         $findings = @(
             New-RegionalFinding -Path 'src/Apps/US/Foo.al' -Line 42
-            New-RegionalFinding -Path 'src/Apps/DE/Foo.al' -Line 44
+            New-RegionalFinding -Path 'src/Apps/DE/Foo.al' -Line 42
         )
         $result = @(Group-RegionalFindings -Findings $findings)
         $result.Count | Should -Be 1
@@ -644,10 +630,27 @@ Describe 'Group-RegionalFindings' {
         (Get-FindingOtherRegions -Finding $result[0]).region | Should -Be 'US'
     }
 
-    It 'does not collapse findings with different signatures' {
+    It 'collapses regional copies even when the model wording differs per file' {
+        # The real-world driver for keying on location, not text: for byte-identical
+        # regional copies the model still writes DIFFERENT issue/recommendation prose
+        # per file (it may even cross-reference the other copy). Location must still
+        # collapse them into one comment.
         $findings = @(
-            New-RegionalFinding -Path 'src/Apps/US/Foo.al' -Issue 'Avoid N+1 query'
-            New-RegionalFinding -Path 'src/Apps/W1/Foo.al' -Issue 'Unrelated issue'
+            New-RegionalFinding -Path 'src/Layers/W1/AlCosting/Foo.Codeunit.al' -Line 7 -Issue 'Missing SetLoadFields before Get' -Rec 'Add SetLoadFields'
+            New-RegionalFinding -Path 'src/Layers/BE/AlCosting/Foo.Codeunit.al' -Line 7 -Issue 'Same issue as the W1 copy: no SetLoadFields' -Rec 'Add a SetLoadFields call'
+        )
+        $result = @(Group-RegionalFindings -Findings $findings)
+        $result.Count | Should -Be 1
+        $result[0].filePath | Should -Be 'src/Layers/W1/AlCosting/Foo.Codeunit.al'
+        $others = Get-FindingOtherRegions -Finding $result[0]
+        $others.Count | Should -Be 1
+        $others[0].region | Should -Be 'BE'
+    }
+
+    It 'does not collapse findings at different lines of the same file across regions' {
+        $findings = @(
+            New-RegionalFinding -Path 'src/Apps/US/Foo.al' -Line 10
+            New-RegionalFinding -Path 'src/Apps/W1/Foo.al' -Line 20
         )
         (Group-RegionalFindings -Findings $findings).Count | Should -Be 2
     }

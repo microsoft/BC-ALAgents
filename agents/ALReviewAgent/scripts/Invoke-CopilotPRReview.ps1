@@ -2071,15 +2071,6 @@ function Get-RegionalPathInfo {
     return $null
 }
 
-function Get-FindingSignature {
-    param([object] $Finding)
-
-    $domain = ([string]$Finding.domain).Trim().ToLowerInvariant()
-    $issue  = [regex]::Replace(([string]$Finding.issue), '\s+', ' ').Trim().ToLowerInvariant()
-    $rec    = [regex]::Replace(([string]$Finding.recommendation), '\s+', ' ').Trim().ToLowerInvariant()
-    return "$domain`u{241F}$issue`u{241F}$rec"
-}
-
 function Get-FindingOtherRegions {
     param([object] $Finding)
 
@@ -2110,40 +2101,47 @@ function Group-RegionalFindings {
 
     if (-not $Findings -or $Findings.Count -lt 2) { return @($Findings) }
 
-    $bySignature = [ordered]@{}
+    # A regional duplicate is the SAME defect shipped in several region layers: the
+    # same domain, at the same region-stripped path and line, under >=2 region roots.
+    # Key on that LOCATION (domain + relative path + line), not the model's free-text
+    # issue/recommendation: the model writes per-file prose that varies across the
+    # copies (it may even say "same as the W1 copy"), so a text signature almost never
+    # matches for genuine twins and the collapse would silently never fire.
+    $result     = [System.Collections.Generic.List[object]]::new()
+    $byLocality = [ordered]@{}
+
     foreach ($finding in $Findings) {
-        $signature = Get-FindingSignature -Finding $finding
-        if (-not $bySignature.Contains($signature)) {
-            $bySignature[$signature] = [System.Collections.Generic.List[object]]::new()
+        $info = Get-RegionalPathInfo -FilePath $finding.filePath
+        if ($null -eq $info) {
+            $result.Add($finding) | Out-Null            # non-regional: never collapsed
+            continue
         }
-        $bySignature[$signature].Add($finding) | Out-Null
+        $domain = ([string]$finding.domain).Trim().ToLowerInvariant()
+        $line   = [int]$finding.lineNumber
+        $key    = "$domain`u{241F}$($info.Relative.ToLowerInvariant())`u{241F}$line"
+        if (-not $byLocality.Contains($key)) {
+            $byLocality[$key] = [System.Collections.Generic.List[object]]::new()
+        }
+        $byLocality[$key].Add([pscustomobject]@{ Finding = $finding; Info = $info }) | Out-Null
     }
 
-    $result = [System.Collections.Generic.List[object]]::new()
-    foreach ($signature in $bySignature.Keys) {
-        $group = @($bySignature[$signature])
+    foreach ($key in $byLocality.Keys) {
+        $group = @($byLocality[$key])
+        $distinctRegions = @($group | ForEach-Object { $_.Info.Region } | Select-Object -Unique)
 
-        $regional = @()
-        foreach ($finding in $group) {
-            $info = Get-RegionalPathInfo -FilePath $finding.filePath
-            if ($info) { $regional += [pscustomobject]@{ Finding = $finding; Info = $info } }
-        }
-        $distinctRegions = @($regional | ForEach-Object { $_.Info.Region } | Select-Object -Unique)
-
-        # Only collapse a genuine cross-region cluster: identical signature living
-        # in >=2 distinct regions. Anything else passes through untouched.
-        if ($regional.Count -lt 2 -or $distinctRegions.Count -lt 2) {
-            foreach ($finding in $group) { $result.Add($finding) | Out-Null }
+        # Only collapse a genuine cross-region cluster: same location in >=2 regions.
+        if ($group.Count -lt 2 -or $distinctRegions.Count -lt 2) {
+            foreach ($entry in $group) { $result.Add($entry.Finding) | Out-Null }
             continue
         }
 
-        $primaryEntry = $regional | Where-Object { $_.Info.Region -eq 'w1' } | Select-Object -First 1
+        $primaryEntry = $group | Where-Object { $_.Info.Region -eq 'w1' } | Select-Object -First 1
         if (-not $primaryEntry) {
-            $primaryEntry = $regional | Sort-Object { $_.Info.Region }, { $_.Info.Path } | Select-Object -First 1
+            $primaryEntry = $group | Sort-Object { $_.Info.Region }, { $_.Info.Path } | Select-Object -First 1
         }
 
         $otherRegions = [System.Collections.Generic.List[object]]::new()
-        foreach ($entry in ($regional | Sort-Object { $_.Info.Region }, { $_.Info.Path })) {
+        foreach ($entry in ($group | Sort-Object { $_.Info.Region }, { $_.Info.Path })) {
             if ([object]::ReferenceEquals($entry, $primaryEntry)) { continue }
             $otherRegions.Add([pscustomobject]@{
                 path   = $entry.Info.Path
@@ -2155,14 +2153,6 @@ function Group-RegionalFindings {
         $primaryFinding = $primaryEntry.Finding
         Add-Member -InputObject $primaryFinding -NotePropertyName 'otherRegions' -NotePropertyValue @($otherRegions) -Force
         $result.Add($primaryFinding) | Out-Null
-
-        # Same-signature findings that are not regional-layer files (rare) are
-        # not part of the cross-region cluster; keep them as independent comments.
-        foreach ($finding in $group) {
-            if ($null -eq (Get-RegionalPathInfo -FilePath $finding.filePath)) {
-                $result.Add($finding) | Out-Null
-            }
-        }
     }
 
     return @($result)
