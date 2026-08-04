@@ -2093,7 +2093,7 @@ function Get-FindingOtherRegions {
 function Format-OtherRegionsNotice {
     param([object] $Finding)
 
-    $others = Get-FindingOtherRegions -Finding $Finding
+    $others = @(Get-FindingOtherRegions -Finding $Finding)
     if ($others.Count -eq 0) { return '' }
 
     $lines = [System.Collections.Generic.List[string]]::new()

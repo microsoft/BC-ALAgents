@@ -685,7 +685,15 @@ Describe 'Format-OtherRegionsNotice' {
         $notice | Should -Match '\(US\)'
     }
 
-    It 'returns an empty string when there are no other regions' {
-        Format-OtherRegionsNotice -Finding ([pscustomobject]@{ filePath = 'x' }) | Should -Be ''
+    It 'returns an empty string when there are no other regions (under StrictMode)' {
+        # Regression guard: Get-FindingOtherRegions returns @() when the property is
+        # absent, but a function's empty-array return unrolls to $null on assignment,
+        # so a naive $others.Count throws under Set-StrictMode -Version Latest (the mode
+        # the orchestrator runs under). Pester does not enable StrictMode, so assert it
+        # explicitly here on the common non-collapsed-finding path.
+        & {
+            Set-StrictMode -Version Latest
+            Format-OtherRegionsNotice -Finding ([pscustomobject]@{ filePath = 'x' })
+        } | Should -Be ''
     }
 }
