@@ -90,6 +90,224 @@ Describe 'Resolve-FindingDomain' {
     }
 }
 
+Describe 'Resolve-SuggestionPlacement' {
+    It 'suppresses an edited single-line suggestion from a comment anchor' {
+        $lines = @(
+            'begin',
+            '    // Calculate the quantity to release.',
+            '    ReleaseQtyBase := Abs(QtyBase) - CalcQtyToPickOnLotBase(ItemLedgerEntry);',
+            'end;'
+        )
+        $suggestion = @(
+            '    ReleaseQtyBase := Abs(QtyBase) - this.CalcQtyToPickOnLotBase(ItemLedgerEntry);'
+        )
+
+        $placement = Resolve-SuggestionPlacement -FileLines $lines -AnchorLine 2 -SuggestedLines $suggestion
+
+        $placement | Should -BeNullOrEmpty
+    }
+
+    It 'does not match code suggestions to similar comment text' {
+        $lines = @(
+            '    // ReleaseQtyBase := Abs(QtyBase) - this.CalcQtyToPickOnLotBase(ItemLedgerEntry);',
+            '    ReleaseQtyBase := Abs(QtyBase) - CalcQtyToPickOnLotBase(ItemLedgerEntry);'
+        )
+        $suggestion = @(
+            '    ReleaseQtyBase := Abs(QtyBase) - this.CalcQtyToPickOnLotBase(ItemLedgerEntry);'
+        )
+
+        $placement = Resolve-SuggestionPlacement -FileLines $lines -AnchorLine 1 -SuggestedLines $suggestion
+
+        $placement | Should -BeNullOrEmpty
+    }
+
+    It 'suppresses an unrelated single-line rewrite instead of trusting the anchor' {
+        $placement = Resolve-SuggestionPlacement `
+            -FileLines @('begin', '    DoWork();', 'end;') `
+            -AnchorLine 2 `
+            -SuggestedLines @('    CompletelyDifferentOperation(Value);')
+
+        $placement | Should -BeNullOrEmpty
+    }
+
+    It 'suppresses an ambiguous single-line target' {
+        $lines = @(
+            '    Customer.SetRange(Blocked, Customer.Blocked::All);',
+            '    Vendor.SetRange(Blocked, Vendor.Blocked::All);'
+        )
+
+        $placement = Resolve-SuggestionPlacement `
+            -FileLines $lines `
+            -AnchorLine 1 `
+            -SuggestedLines @('    Record.SetRange(Blocked, Record.Blocked::All);')
+
+        $placement | Should -BeNullOrEmpty
+    }
+
+    It 'does not move from one code line to a more similar unrelated code line' {
+        $lines = @(
+            'OldResult := OldProvider.Calculate(Source);',
+            'OtherResult := NewProvider.Calculate(Target);'
+        )
+
+        $placement = Resolve-SuggestionPlacement `
+            -FileLines $lines `
+            -AnchorLine 1 `
+            -SuggestedLines @('Result := NewProvider.Calculate(Target);')
+
+        $placement | Should -BeNullOrEmpty
+    }
+
+    It 'does not guess between plausible lines from a comment anchor' {
+        $lines = @(
+            '// Update the result.',
+            'Result := Calculate(Source);',
+            'begin',
+            'end;',
+            'Result := this.Provider.Calculate(Target);'
+        )
+
+        $placement = Resolve-SuggestionPlacement `
+            -FileLines $lines `
+            -AnchorLine 1 `
+            -SuggestedLines @('Result := this.Provider.Calculate(Source);')
+
+        $placement | Should -BeNullOrEmpty
+    }
+
+    It 'keeps an exact single-line suggestion on its anchor' {
+        $placement = Resolve-SuggestionPlacement `
+            -FileLines @('begin', '    DoWork();', 'end;') `
+            -AnchorLine 2 `
+            -SuggestedLines @(' DoWork(); ')
+
+        $placement.startLine | Should -Be 2
+        $placement.endLine | Should -Be 2
+    }
+
+    It 'suppresses a changed target when an out-of-range anchor clamps to code' {
+        $placement = Resolve-SuggestionPlacement `
+            -FileLines @('DoWork();', 'exit(Result);') `
+            -AnchorLine 99 `
+            -SuggestedLines @('exit(this.Result);')
+
+        $placement | Should -BeNullOrEmpty
+    }
+
+    It 'suppresses empty input and blank single-line suggestions' {
+        Resolve-SuggestionPlacement -FileLines @() -AnchorLine 1 -SuggestedLines @('x') |
+            Should -BeNullOrEmpty
+        Resolve-SuggestionPlacement -FileLines @('x') -AnchorLine 1 -SuggestedLines @('   ') |
+            Should -BeNullOrEmpty
+    }
+
+    It 'preserves additive multi-line placement' {
+        $lines = @('begin', '    DoFirst();', '    DoLast();', 'end;')
+        $suggestion = @('    DoFirst();', '    DoMiddle();', '    DoLast();')
+
+        $placement = Resolve-SuggestionPlacement -FileLines $lines -AnchorLine 2 -SuggestedLines $suggestion
+
+        $placement.startLine | Should -Be 2
+        $placement.endLine | Should -Be 3
+    }
+
+    It 'places pure reorderings over the complete source span' {
+        $lines = @('using Microsoft.Sales;', 'using Microsoft.Foundation;', 'using System;')
+        $suggestion = @('using System;', 'using Microsoft.Foundation;', 'using Microsoft.Sales;')
+
+        $placement = Resolve-SuggestionPlacement -FileLines $lines -AnchorLine 2 -SuggestedLines $suggestion
+
+        $placement.startLine | Should -Be 1
+        $placement.endLine | Should -Be 3
+    }
+
+    It 'does not let an additive subsequence truncate a reordered source span' {
+        $lines = @('using Microsoft.Sales;', 'using Microsoft.Foundation;', 'using System;')
+        $suggestion = @('using Microsoft.Foundation;', 'using Microsoft.Sales;', 'using System;')
+
+        $placement = Resolve-SuggestionPlacement -FileLines $lines -AnchorLine 1 -SuggestedLines $suggestion
+
+        $placement.startLine | Should -Be 1
+        $placement.endLine | Should -Be 3
+    }
+
+    It 'suppresses a suggestion that both reorders and inserts' {
+        $lines = @('using Microsoft.Sales;', 'using Microsoft.Foundation;', 'using System;')
+        $suggestion = @(
+            'using Microsoft.Foundation;',
+            'using Microsoft.Sales;',
+            'using Microsoft.Inventory;',
+            'using System;'
+        )
+        $placement = Resolve-SuggestionPlacement -FileLines $lines -AnchorLine 1 -SuggestedLines $suggestion
+        $placement = Resolve-SuggestionPlacement -FileLines $lines -AnchorLine 1 -SuggestedLines $suggestion
+
+        $placement | Should -BeNullOrEmpty
+    }
+
+    It 'does not let reorder-plus-insert masquerade as a truncated additive span' {
+        $lines = @('using Microsoft.Sales;', 'using Microsoft.Foundation;', 'using System;')
+        $suggestion = @(
+            'using Microsoft.Foundation;',
+            'using Microsoft.Sales;',
+            'using Microsoft.Inventory;',
+            'using System;'
+        )
+
+        $placement = Resolve-SuggestionPlacement -FileLines $lines -AnchorLine 2 -SuggestedLines $suggestion
+
+        $placement | Should -BeNullOrEmpty
+    }
+
+    It 'prefers the repeated additive block that contains the anchor' {
+        $lines = @('Reset();', 'Run();', 'Reset();', 'Run();')
+        $suggestion = @('Reset();', 'Configure();', 'Run();')
+
+        $placement = Resolve-SuggestionPlacement -FileLines $lines -AnchorLine 3 -SuggestedLines $suggestion
+
+        $placement.startLine | Should -Be 3
+        $placement.endLine | Should -Be 4
+    }
+
+    It 'suppresses equally ranked repeated reorder spans' {
+        $placement = Resolve-SuggestionPlacement `
+            -FileLines @('DoWork();', 'DoWork();', 'DoWork();') `
+            -AnchorLine 2 `
+            -SuggestedLines @('DoWork();', 'DoWork();')
+
+        $placement | Should -BeNullOrEmpty
+    }
+
+    It 'does not treat a changed line set as a pure reordering' {
+        $placement = Resolve-SuggestionPlacement `
+            -FileLines @('using Microsoft.Sales;', 'using Microsoft.Foundation;') `
+            -AnchorLine 1 `
+            -SuggestedLines @('using Microsoft.Foundation;', 'using System;')
+
+        $placement | Should -BeNullOrEmpty
+    }
+
+    It 'does not move a multi-line replacement away from a code anchor' {
+        $placement = Resolve-SuggestionPlacement `
+            -FileLines @('A();', 'B();', 'C();') `
+            -AnchorLine 1 `
+            -SuggestedLines @('B();', 'X();', 'C();')
+
+        $placement | Should -BeNullOrEmpty
+    }
+
+    It 'counts duplicate lines when validating a multiset equality' {
+        Test-LooseMultisetEqual `
+            -A @('DoWork();', 'DoWork();', 'Finish();') `
+            -B @('Finish();', 'DoWork();', 'DoWork();') |
+            Should -BeTrue
+        Test-LooseMultisetEqual `
+            -A @('DoWork();', 'DoWork();', 'Finish();') `
+            -B @('Finish();', 'Finish();', 'DoWork();') |
+            Should -BeFalse
+    }
+}
+
 Describe 'Agent domain normalization' {
     It 'preserves an explicit leaf domain for an agent finding' {
         $json = @{

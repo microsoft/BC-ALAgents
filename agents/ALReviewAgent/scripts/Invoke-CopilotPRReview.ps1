@@ -603,25 +603,90 @@ function ConvertTo-LooseLine {
     return ($Line -replace '\s+', '')
 }
 
-# True when every line of $FileSpan appears, in order, somewhere in
-# $Suggestion (loose comparison). This holds when the suggestion is the file
-# span with extra lines inserted (and/or boundary-preserving edits) — the only
-# shape we can safely apply as an in-place multi-line replacement.
 function Test-OrderedSubsequence {
     param([string[]] $FileSpan, [string[]] $Suggestion)
 
-    $sug = @($Suggestion | ForEach-Object { ConvertTo-LooseLine $_ })
-    $j = 0
-    foreach ($f in $FileSpan) {
-        $fl = ConvertTo-LooseLine $f
+    $suggestionLines = @($Suggestion | ForEach-Object { ConvertTo-LooseLine $_ })
+    $suggestionIndex = 0
+    foreach ($fileLine in $FileSpan) {
+        $fileLoose = ConvertTo-LooseLine $fileLine
         $found = $false
-        while ($j -lt $sug.Count) {
-            $cur = $sug[$j]; $j++
-            if ($cur -eq $fl) { $found = $true; break }
+        while ($suggestionIndex -lt $suggestionLines.Count) {
+            $current = $suggestionLines[$suggestionIndex]
+            $suggestionIndex++
+            if ($current -eq $fileLoose) { $found = $true; break }
         }
         if (-not $found) { return $false }
     }
     return $true
+}
+
+function Test-LooseMultisetEqual {
+    param([string[]] $A, [string[]] $B)
+
+    if ($A.Count -ne $B.Count) { return $false }
+    $bag = @{}
+    foreach ($line in $A) {
+        $key = ConvertTo-LooseLine $line
+        $bag[$key] = [int]$bag[$key] + 1
+    }
+    foreach ($line in $B) {
+        $key = ConvertTo-LooseLine $line
+        if (-not $bag.ContainsKey($key)) { return $false }
+        $bag[$key] = [int]$bag[$key] - 1
+        if ($bag[$key] -lt 0) { return $false }
+    }
+    return $true
+}
+
+function Test-SuggestionReusesOutsideSpan {
+    param(
+        [string[]] $FileLines,
+        [int] $SearchStart,
+        [int] $SearchEnd,
+        [int] $SpanStart,
+        [int] $SpanEnd,
+        [string[]] $Suggestion
+    )
+
+    $remaining = @{}
+    foreach ($line in $Suggestion) {
+        $key = ConvertTo-LooseLine $line
+        $remaining[$key] = [int]$remaining[$key] + 1
+    }
+    for ($line = $SpanStart; $line -le $SpanEnd; $line++) {
+        $key = ConvertTo-LooseLine $FileLines[$line - 1]
+        if ($remaining.ContainsKey($key)) {
+            $remaining[$key] = [int]$remaining[$key] - 1
+        }
+    }
+    for ($line = $SearchStart; $line -le $SearchEnd; $line++) {
+        if ($line -ge $SpanStart -and $line -le $SpanEnd) { continue }
+        $key = ConvertTo-LooseLine $FileLines[$line - 1]
+        if ($remaining.ContainsKey($key) -and $remaining[$key] -gt 0) { return $true }
+    }
+    return $false
+}
+
+function Select-SuggestionSpan {
+    param([object[]] $Candidates)
+
+    if (-not $Candidates -or $Candidates.Count -eq 0) { return $null }
+    $ranked = @($Candidates | Sort-Object `
+        @{ Expression = 'inserted'; Descending = $false },
+        @{ Expression = 'containsAnchor'; Descending = $true },
+        @{ Expression = 'distance'; Descending = $false },
+        @{ Expression = 'startLine'; Descending = $false })
+    $best = $ranked[0]
+    if ($ranked.Count -gt 1) {
+        $runnerUp = $ranked[1]
+        if ($best.inserted -eq $runnerUp.inserted -and
+            $best.containsAnchor -eq $runnerUp.containsAnchor -and
+            $best.distance -eq $runnerUp.distance) {
+            return $null
+        }
+    }
+    return [pscustomobject]@{ startLine = $best.startLine; endLine = $best.endLine }
 }
 
 # Resolve the RIGHT-side file span a suggestion should replace.
@@ -639,51 +704,68 @@ function Resolve-SuggestionPlacement {
 
     $sCount    = $SuggestedLines.Count
     $firstLoose = ConvertTo-LooseLine $SuggestedLines[0]
-    $lastLoose  = ConvertTo-LooseLine $SuggestedLines[$sCount - 1]
+    $lastLoose = ConvertTo-LooseLine $SuggestedLines[$sCount - 1]
+    $suggestionIsComment = $firstLoose -match '^(//|/\*|\*)'
+    $anchorLoose = ConvertTo-LooseLine $FileLines[$AnchorLine - 1]
+    $anchorIsComment = $anchorLoose -match '^(//|/\*|\*)'
+    $anchorCanBeReplaced = $anchorLoose -and ($anchorIsComment -eq $suggestionIsComment)
 
-    # --- Single-line suggestion: snap to the nearest unique content match. ---
+    # A changed single-line suggestion cannot be placed safely without the
+    # original source line. Fail closed instead of guessing from similarity.
     if ($sCount -eq 1) {
-        if ((ConvertTo-LooseLine $FileLines[$AnchorLine - 1]) -eq $firstLoose) {
+        if ($firstLoose -and $anchorLoose -eq $firstLoose) {
             return [pscustomobject]@{ startLine = $AnchorLine; endLine = $AnchorLine }
         }
-        for ($d = 1; $d -le 8; $d++) {
-            $hits = @()
-            foreach ($cand in @(($AnchorLine - $d), ($AnchorLine + $d))) {
-                if ($cand -ge 1 -and $cand -le $fileCount -and
-                    (ConvertTo-LooseLine $FileLines[$cand - 1]) -eq $firstLoose) {
-                    $hits += $cand
-                }
-            }
-            if ($hits.Count -eq 1) { return [pscustomobject]@{ startLine = $hits[0]; endLine = $hits[0] } }
-            if ($hits.Count -gt 1) { break }   # ambiguous at this distance
-        }
-        # No content match found: a one-line replacement of the model's anchor
-        # is still safe (it cannot duplicate context), so trust the anchor.
-        return [pscustomobject]@{ startLine = $AnchorLine; endLine = $AnchorLine }
+        return $null
     }
 
-    # --- Multi-line suggestion: find an additive span [s,e] near the anchor. ---
-    $best = $null
-    $bestInserted = [int]::MaxValue
+    # --- Multi-line suggestion: first cover a complete same-length reorder. ---
+    $reorderCandidates = @()
+    $lo = [math]::Max(1, $AnchorLine - $sCount)
+    $hi = [math]::Min($fileCount - $sCount + 1, $AnchorLine + $sCount)
+    for ($s = $lo; $s -le $hi; $s++) {
+        $e = $s + $sCount - 1
+        if ($AnchorLine -lt ($s - 1) -or $AnchorLine -gt ($e + 1)) { continue }
+        $span = @($FileLines[($s - 1)..($e - 1)])
+        if (Test-LooseMultisetEqual -A $span -B $SuggestedLines) {
+            $containsAnchor = $AnchorLine -ge $s -and $AnchorLine -le $e
+            if (-not $containsAnchor -and $anchorCanBeReplaced) { continue }
+            $distance = if ($AnchorLine -lt $s) { $s - $AnchorLine } elseif ($AnchorLine -gt $e) { $AnchorLine - $e } else { 0 }
+            $reorderCandidates += [pscustomobject]@{
+                startLine = $s; endLine = $e; inserted = 0
+                containsAnchor = $containsAnchor; distance = $distance
+            }
+        }
+    }
+    if ($reorderCandidates.Count -gt 0) {
+        return Select-SuggestionSpan -Candidates $reorderCandidates
+    }
+
+    # Then cover ordinary insertions that preserve source-line order.
+    $additiveCandidates = @()
     $lo = [math]::Max(1, $AnchorLine - $sCount - 4)
     $hi = [math]::Min($fileCount, $AnchorLine + $sCount + 4)
     for ($s = $lo; $s -le $hi; $s++) {
         if ((ConvertTo-LooseLine $FileLines[$s - 1]) -ne $firstLoose) { continue }
-        # An additive replacement never spans more lines than the suggestion.
         $eMax = [math]::Min($fileCount, $s + $sCount - 1)
         for ($e = $s; $e -le $eMax; $e++) {
             if ((ConvertTo-LooseLine $FileLines[$e - 1]) -ne $lastLoose) { continue }
             if ($AnchorLine -lt ($s - 1) -or $AnchorLine -gt ($e + 1)) { continue }
             $span = @($FileLines[($s - 1)..($e - 1)])
             if (-not (Test-OrderedSubsequence -FileSpan $span -Suggestion $SuggestedLines)) { continue }
-            $inserted = $sCount - ($e - $s + 1)
-            if ($inserted -lt $bestInserted) {
-                $bestInserted = $inserted
-                $best = [pscustomobject]@{ startLine = $s; endLine = $e }
+            if (Test-SuggestionReusesOutsideSpan -FileLines $FileLines -SearchStart $lo -SearchEnd $hi `
+                    -SpanStart $s -SpanEnd $e -Suggestion $SuggestedLines) { continue }
+            $containsAnchor = $AnchorLine -ge $s -and $AnchorLine -le $e
+            if (-not $containsAnchor -and $anchorCanBeReplaced) { continue }
+            $distance = if ($AnchorLine -lt $s) { $s - $AnchorLine } elseif ($AnchorLine -gt $e) { $AnchorLine - $e } else { 0 }
+            $additiveCandidates += [pscustomobject]@{
+                startLine = $s; endLine = $e; inserted = $sCount - ($e - $s + 1)
+                containsAnchor = $containsAnchor; distance = $distance
             }
         }
     }
-    return $best
+
+    return Select-SuggestionSpan -Candidates $additiveCandidates
 }
 
 function Test-GlobMatch {
