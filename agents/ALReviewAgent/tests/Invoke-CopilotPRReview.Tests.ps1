@@ -83,6 +83,25 @@ Describe 'Resolve-FindingLocation' {
         $location.side | Should -Be 'RIGHT'
     }
 
+    It 'marks an exact anchor as not inferred and stays StrictMode-safe' {
+        # Regression: the exact-match branch used to return the raw Build-LineMap
+        # entry, which has no 'inferred' key. Post-Findings reads
+        # [bool]($location.inferred ?? $false) with member syntax, and under
+        # Set-StrictMode -Version Latest a missing property throws before ?? runs
+        # (unlike hashtable indexing). Pester does not enable StrictMode, so assert
+        # the exact behaviour of the posting call site explicitly.
+        Set-StrictMode -Version Latest
+        try {
+            $location = Resolve-FindingLocation -LineMap $lineMap -LineNumber 13
+
+            $location.inferred | Should -BeFalse
+            { [bool]($location.inferred ?? $false) } | Should -Not -Throw
+        }
+        finally {
+            Set-StrictMode -Off
+        }
+    }
+
     It 'uses the nearest changed line in the same hunk' {
         $location = Resolve-FindingLocation -LineMap $lineMap -LineNumber 12
 

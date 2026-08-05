@@ -572,7 +572,10 @@ function Resolve-FindingLocation {
     param([hashtable] $LineMap, [int] $LineNumber)
 
     if (-not $LineMap -or $LineMap.Count -eq 0) { return $null }
-    if ($LineMap.ContainsKey($LineNumber)) { return $LineMap[$LineNumber] }
+    if ($LineMap.ContainsKey($LineNumber)) {
+        $exact = $LineMap[$LineNumber]
+        return @{ line = [int]$exact.line; side = $exact.side; inferred = $false }
+    }
 
     $locations = @($LineMap.Values)
     $sameHunkRight = @($locations | Where-Object {
