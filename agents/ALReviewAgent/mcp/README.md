@@ -3,11 +3,14 @@
 Skeleton for **AB#645219** - refactor the PR-review engine into two MCP servers so
 there is a single source of truth for PROD, BC-Bench (offline eval), and customers.
 
-> Status: **draft skeleton**. Folders, tool contracts, and stub handlers only. The
-> stubs throw `NotImplementedException`; nothing here is wired into
-> `.github/workflows/review.yml` or `ci.yml`. The monolithic
-> `scripts/Invoke-CopilotPRReview.ps1` remains the live path and behavior is
-> unchanged. Full implementation follows in subsequent PRs.
+> Status: **behavior-preserving rewire**. The tool contracts are the target
+> schema; the two handlers are per-phase **pass-throughs** that set
+> `REVIEW_PHASE` and delegate to `scripts/Invoke-CopilotPRReview.ps1`, which still
+> owns all logic. `.github/workflows/review.yml` now calls the tools instead of the
+> script directly - the review job (read-only) calls `review`, the publish job
+> (write) calls `publish` - so the tool seam is exercised end-to-end in the live
+> path with **no behavior change**. Moving the logic into the tools (and BC-Bench
+> consuming `review`) follows in subsequent PRs.
 
 ## Why split
 
@@ -30,10 +33,10 @@ so offline eval must see them; placement / iteration / POST live in `publish`.
 | Path | Role |
 | --- | --- |
 | `review/review.tool.json` | `review` tool contract (input + output schema) |
-| `review/Invoke-ReviewTool.ps1` | `review` handler (stub) |
+| `review/Invoke-ReviewTool.ps1` | `review` handler (interim per-phase pass-through) |
 | `publish/publish.tool.json` | `publish` tool contract |
-| `publish/Invoke-PublishTool.ps1` | `publish` handler (stub) |
-| `../scripts/Invoke-PRReviewShell.ps1` | target thin-shell call site: `review(...)` then `publish(...)` |
+| `publish/Invoke-PublishTool.ps1` | `publish` handler (interim per-phase pass-through) |
+| `../scripts/Invoke-PRReviewShell.ps1` | single-process (BC-Bench/local) call site: `review(...)` then `publish(...)` |
 
 ## Target shape
 

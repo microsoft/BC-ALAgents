@@ -1,5 +1,5 @@
 {
-  "$comment": "MCP tool contract for the shared `review` server. Skeleton for AB#645219 - schema is normative, the handler (Invoke-ReviewTool.ps1) is a stub. `review` is consumed identically by PROD and BC-Bench; it is the single source of truth for the generate half of the engine.",
+  "$comment": "MCP tool contract for the shared `review` server (AB#645219). Schema is the TARGET contract. Current handler (Invoke-ReviewTool.ps1) is a behavior-preserving per-phase pass-through wired into review.yml's read-only review job: it sets REVIEW_PHASE=generate and delegates to Invoke-CopilotPRReview.ps1 (inputs via env, output via REVIEW_OUTPUT_DIR). This JSON I/O is honored once the generate logic physically moves into the tool. `review` is consumed identically by PROD and BC-Bench.",
   "name": "review",
   "description": "Filter BCQuality @ ref, run the model with the one shared review prompt/skills wiring, parse findings, then apply content-level dedup + cap. Returns findings plus the resolved provenance (BCQuality SHA, engine/plugin version, model, min severity). Never posts.",
   "inputSchema": {

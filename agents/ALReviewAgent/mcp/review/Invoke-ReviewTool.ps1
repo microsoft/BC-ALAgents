@@ -1,51 +1,54 @@
 <#
 .SYNOPSIS
-    Stub handler for the shared `review` MCP tool. Skeleton for AB#645219.
+    `review` MCP tool - the GENERATE phase entry point. AB#645219.
 
 .DESCRIPTION
     Target contract (see review.tool.json): filter BCQuality @ ref -> run the
-    model with the one shared prompt/skills wiring -> parse findings -> apply
-    content-level dedup + cap. Returns findings[] plus resolved{} provenance.
-    This is the single source of truth for the *generate* half of the engine,
-    consumed identically by PROD and BC-Bench.
+    model with the one shared prompt/skills wiring -> parse findings -> content
+    dedup + cap -> return findings[] + resolved{}. This is the single source of
+    truth for the generate half, consumed identically by PROD and BC-Bench.
 
-    STATUS: stub. The real body will lift the generate path currently inlined in
-    scripts/Invoke-CopilotPRReview.ps1 (BCQuality filter -> Copilot CLI run ->
-    Parse-BCQualityReport -> Get-FindingSignature dedup / MAX_TOTAL_FINDINGS cap)
-    into this handler so the wiring lives in exactly one place. Until then this
-    throws so callers cannot mistake an unimplemented tool for an empty review.
+    CURRENT (interim) implementation: a behavior-preserving per-phase PASS-THROUGH.
+    Until the generate wiring physically moves out of Invoke-CopilotPRReview.ps1
+    (a later, load-bearing PR), this tool sets REVIEW_PHASE=generate and delegates
+    to the existing orchestrator, which reads every other input from the
+    environment - exactly how PROD's review.yml and the local harness already
+    invoke it. The tool is now the seam in the live path (review.yml's read-only
+    review job calls it), so it is exercised end-to-end without any behavior change.
+
+    Optional parameters override the matching environment variable ONLY when
+    explicitly supplied (single-process callers such as BC-Bench); PROD passes
+    none, keeping this a pure pass-through. Source / PR context stay env-driven
+    for now; the repo_ref|local_path contract in review.tool.json is honored once
+    the generate logic moves into this tool.
 
 .OUTPUTS
-    [pscustomobject] @{
-        findings = @( @{ file; line_start; line_end; severity; domain; issue; recommendation; suggested_code } )
-        resolved = @{ bcquality_sha; engine_version; plugin_version; model; min_severity }
-    }
+    Interim: none (the engine writes agent-output.txt to REVIEW_OUTPUT_DIR - the
+    same artifact the publish phase consumes). Target: findings[] + resolved{}.
 #>
-[CmdletBinding(DefaultParameterSetName = 'Repo')]
+[CmdletBinding()]
 param(
-    [Parameter(ParameterSetName = 'Repo', Mandatory)]
-    [string] $RepoRef,
-
-    [Parameter(ParameterSetName = 'Local', Mandatory)]
-    [string] $LocalPath,
-
-    [string] $BaseRef,
-
-    [string] $Diff,
-
     [string] $BcqualityRef,
 
     [string] $Model,
 
     [ValidateSet('Critical', 'High', 'Medium', 'Low')]
-    [string] $MinSeverity = 'Medium'
+    [string] $MinSeverity,
+
+    [string] $OutputDir
 )
 
 Set-StrictMode -Version Latest
 $ErrorActionPreference = 'Stop'
 
-throw [System.NotImplementedException]::new(
-    "review MCP tool is a skeleton stub (AB#645219). The generate wiring in " +
-    "agents/ALReviewAgent/scripts/Invoke-CopilotPRReview.ps1 (BCQuality filter, " +
-    "Copilot CLI run, Parse-BCQualityReport, Get-FindingSignature dedup + cap) " +
-    "will move here in a subsequent PR. Contract: agents/ALReviewAgent/mcp/review/review.tool.json.")
+# This tool owns the generate phase regardless of how it was reached.
+$env:REVIEW_PHASE = 'generate'
+
+if ($PSBoundParameters.ContainsKey('BcqualityRef')) { $env:BCQUALITY_REF = $BcqualityRef }
+if ($PSBoundParameters.ContainsKey('Model'))        { $env:COPILOT_MODEL = $Model }
+if ($PSBoundParameters.ContainsKey('MinSeverity'))  { $env:AGENT_MINIMUM_SEVERITY = $MinSeverity }
+if ($PSBoundParameters.ContainsKey('OutputDir'))    { $env:REVIEW_OUTPUT_DIR = $OutputDir }
+
+# Cross-platform path (PROD runs on ubuntu-latest) - never hard-code separators.
+$engine = Join-Path $PSScriptRoot '..' '..' 'scripts' 'Invoke-CopilotPRReview.ps1'
+& $engine

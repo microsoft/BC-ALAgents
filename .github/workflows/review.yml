@@ -376,7 +376,7 @@ jobs:
           COPILOT_REVIEW_AGENT_RELEASE_VERSION: ${{ inputs.agent_release_version }}
           BASE_BRANCH: ${{ needs.resolve.outputs.base_ref }}
         run: |
-          & "${{ github.workspace }}/engine/agents/ALReviewAgent/scripts/Invoke-CopilotPRReview.ps1"
+          & "${{ github.workspace }}/engine/agents/ALReviewAgent/mcp/review/Invoke-ReviewTool.ps1"
 
       - name: Upload review output
         if: always()
@@ -460,7 +460,7 @@ jobs:
           COPILOT_REVIEW_AGENT_RELEASE_VERSION: ${{ inputs.agent_release_version }}
           BASE_BRANCH: ${{ needs.resolve.outputs.base_ref }}
         run: |
-          & "${{ github.workspace }}/engine/agents/ALReviewAgent/scripts/Invoke-CopilotPRReview.ps1"
+          & "${{ github.workspace }}/engine/agents/ALReviewAgent/mcp/publish/Invoke-PublishTool.ps1"
 
       - name: Upload published review artifacts
         if: always()
