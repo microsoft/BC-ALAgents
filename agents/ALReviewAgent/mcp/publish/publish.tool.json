@@ -1,0 +1,80 @@
+{
+  "$comment": "MCP tool contract for the PROD-only `publish` server. Skeleton for AB#645219 - schema is normative, the handler (Invoke-PublishTool.ps1) is a stub. BC-Bench never loads this server, so eval physically cannot post - no mode flag required.",
+  "name": "publish",
+  "description": "Post review findings as inline PR comments. Suggestion placement (re-derive the RIGHT-side span), location dedup vs existing comments, iteration numbering, comment rendering, POST, and (future) reaction backfill. Consumes the raw findings[] emitted by the review tool.",
+  "inputSchema": {
+    "type": "object",
+    "additionalProperties": false,
+    "required": ["findings", "pr"],
+    "properties": {
+      "findings": {
+        "type": "array",
+        "description": "The raw findings[] from review - a stateless, tokenless handoff.",
+        "items": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["file", "line_start", "line_end", "severity", "domain", "issue", "recommendation"],
+          "properties": {
+            "file": { "type": "string" },
+            "line_start": { "type": "integer", "minimum": 1 },
+            "line_end": { "type": "integer", "minimum": 1 },
+            "severity": { "type": "string", "enum": ["Critical", "High", "Medium", "Low"] },
+            "domain": { "type": "string" },
+            "issue": { "type": "string" },
+            "recommendation": { "type": "string" },
+            "suggested_code": { "type": "string" }
+          }
+        }
+      },
+      "pr": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["repo", "pr_number", "head_sha"],
+        "properties": {
+          "repo": { "type": "string", "description": "owner/repo to post comments to." },
+          "pr_number": { "type": "integer", "minimum": 1 },
+          "head_sha": { "type": "string" }
+        }
+      },
+      "iteration_ctx": {
+        "type": "object",
+        "description": "Reserved for cross-iteration memory (feed prior comments + reactions back in). Opaque for now.",
+        "additionalProperties": true
+      }
+    }
+  },
+  "outputSchema": {
+    "type": "object",
+    "additionalProperties": false,
+    "required": ["posted", "skipped"],
+    "properties": {
+      "posted": {
+        "type": "array",
+        "description": "Findings posted as inline comments.",
+        "items": {
+          "type": "object",
+          "additionalProperties": true,
+          "properties": {
+            "file": { "type": "string" },
+            "line": { "type": "integer" },
+            "comment_id": { "type": "integer" },
+            "url": { "type": "string" }
+          }
+        }
+      },
+      "skipped": {
+        "type": "array",
+        "description": "Findings not posted, each with a reason (location dedup, unsafe suggestion placement, cap, etc.).",
+        "items": {
+          "type": "object",
+          "additionalProperties": true,
+          "properties": {
+            "file": { "type": "string" },
+            "line": { "type": "integer" },
+            "reason": { "type": "string" }
+          }
+        }
+      }
+    }
+  }
+}

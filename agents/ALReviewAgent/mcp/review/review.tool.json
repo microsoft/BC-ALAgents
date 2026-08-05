@@ -1,0 +1,84 @@
+{
+  "$comment": "MCP tool contract for the shared `review` server. Skeleton for AB#645219 - schema is normative, the handler (Invoke-ReviewTool.ps1) is a stub. `review` is consumed identically by PROD and BC-Bench; it is the single source of truth for the generate half of the engine.",
+  "name": "review",
+  "description": "Filter BCQuality @ ref, run the model with the one shared review prompt/skills wiring, parse findings, then apply content-level dedup + cap. Returns findings plus the resolved provenance (BCQuality SHA, engine/plugin version, model, min severity). Never posts.",
+  "inputSchema": {
+    "type": "object",
+    "additionalProperties": false,
+    "properties": {
+      "repo_ref": {
+        "type": "string",
+        "description": "owner/repo@ref of the review target. Mutually exclusive with local_path."
+      },
+      "local_path": {
+        "type": "string",
+        "description": "Filesystem path to a checked-out review target (BC-Bench / local). Mutually exclusive with repo_ref."
+      },
+      "base_ref": {
+        "type": "string",
+        "description": "Base ref of the change. The three-dot merge-base is computed internally. Mutually exclusive with diff."
+      },
+      "diff": {
+        "type": "string",
+        "description": "Pre-computed unified diff to review. Mutually exclusive with base_ref."
+      },
+      "bcquality_ref": {
+        "type": "string",
+        "description": "Which BCQuality to use: branch / SHA / local worktree path / customer custom layer. Omit to use the engine default pinned version (Z). PROD never overrides this."
+      },
+      "model": {
+        "type": "string",
+        "description": "Copilot model the review runs with. BC-Bench varies this as its benchmark independent variable."
+      },
+      "min_severity": {
+        "type": "string",
+        "enum": ["Critical", "High", "Medium", "Low"],
+        "default": "Medium",
+        "description": "Severity floor for returned findings."
+      }
+    },
+    "oneOf": [
+      { "required": ["repo_ref"] },
+      { "required": ["local_path"] }
+    ]
+  },
+  "outputSchema": {
+    "type": "object",
+    "additionalProperties": false,
+    "required": ["findings", "resolved"],
+    "properties": {
+      "findings": {
+        "type": "array",
+        "description": "Content-level deduped and capped findings.",
+        "items": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["file", "line_start", "line_end", "severity", "domain", "issue", "recommendation"],
+          "properties": {
+            "file": { "type": "string" },
+            "line_start": { "type": "integer", "minimum": 1 },
+            "line_end": { "type": "integer", "minimum": 1 },
+            "severity": { "type": "string", "enum": ["Critical", "High", "Medium", "Low"] },
+            "domain": { "type": "string" },
+            "issue": { "type": "string" },
+            "recommendation": { "type": "string" },
+            "suggested_code": { "type": "string" }
+          }
+        }
+      },
+      "resolved": {
+        "type": "object",
+        "additionalProperties": false,
+        "description": "Per-run provenance so every score is attributable and reproducible.",
+        "required": ["bcquality_sha", "engine_version", "plugin_version", "model", "min_severity"],
+        "properties": {
+          "bcquality_sha": { "type": "string", "description": "The BCQuality commit actually resolved to - the ground truth even when bcquality_ref was overridden." },
+          "engine_version": { "type": "string", "description": "Engine X.Y.Z." },
+          "plugin_version": { "type": "string", "description": "Published review-plugin/MCP artifact version." },
+          "model": { "type": "string" },
+          "min_severity": { "type": "string", "enum": ["Critical", "High", "Medium", "Low"] }
+        }
+      }
+    }
+  }
+}
