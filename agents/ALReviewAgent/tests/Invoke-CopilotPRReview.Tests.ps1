@@ -51,6 +51,107 @@ BeforeAll {
     $script:BCQualityWebRepoUrl = 'https://github.com/microsoft/BCQuality'
 }
 
+Describe 'Resolve-FindingLocation' {
+    BeforeAll {
+        $patch = @'
+@@ -10,7 +10,7 @@
+ context
+ context
+ context
+-old line
++new line
+ context
+ context
+ context
+@@ -30,7 +30,7 @@
+ context
+ context
+ context
+-another old line
++another new line
+ context
+ context
+ context
+'@
+        $lineMap = Build-LineMap -Patch $patch
+    }
+
+    It 'preserves an exact changed-line anchor' {
+        $location = Resolve-FindingLocation -LineMap $lineMap -LineNumber 13
+
+        $location.line | Should -Be 13
+        $location.side | Should -Be 'RIGHT'
+    }
+
+    It 'uses the nearest changed line in the same hunk' {
+        $location = Resolve-FindingLocation -LineMap $lineMap -LineNumber 12
+
+        $location.line | Should -Be 13
+        $location.side | Should -Be 'RIGHT'
+        $location.inferred | Should -BeTrue
+    }
+
+    It 'uses the earlier changed line when distances are equal' {
+        $tiePatch = @'
+@@ -10,7 +10,7 @@
+ context
+-old before
++new before
+ context
+-old after
++new after
+ context
+ context
+ context
+'@
+        $tieMap = Build-LineMap -Patch $tiePatch
+
+        (Resolve-FindingLocation -LineMap $tieMap -LineNumber 12).line | Should -Be 11
+    }
+
+    It 'does not cross into an unrelated hunk' {
+        Resolve-FindingLocation -LineMap $lineMap -LineNumber 22 | Should -BeNullOrEmpty
+    }
+
+    It 'does not infer a LEFT anchor from a PR-head line number' {
+        $deletionPatch = @'
+@@ -10,7 +10,6 @@
+ context
+ context
+ context
+-deleted line
+ context
+ context
+ context
+'@
+        $deletionMap = Build-LineMap -Patch $deletionPatch
+
+        Resolve-FindingLocation -LineMap $deletionMap -LineNumber 12 | Should -BeNullOrEmpty
+        (Resolve-FindingLocation -LineMap $deletionMap -LineNumber 13).side | Should -Be 'LEFT'
+    }
+}
+
+Describe 'Inferred location deduplication' {
+    It 'deduplicates by source line without reserving the shared anchor' {
+        $domain = 'Style'
+        $domainKey = ConvertTo-DomainMetadataKey -Domain $domain
+        Mock Get-ReviewComments {
+            @([pscustomobject]@{
+                path = 'src/example.al'
+                line = 13
+                side = 'RIGHT'
+                body = "<!-- agent_domain_key: $domainKey -->`n<!-- agent_source_line: 12 -->"
+            })
+        }
+
+        $existing = Get-ExistingCommentKeys -Domain $domain
+
+        $existing.SourceKeys.Contains('src/example.al:12') | Should -BeTrue
+        $existing.Keys.Count | Should -Be 0
+        $existing.Locations.Count | Should -Be 0
+    }
+}
+
 Describe 'Resolve-FindingDomain' {
     It 'prefers the explicit lowercase domain over the legacy map' {
         $finding = [pscustomobject]@{

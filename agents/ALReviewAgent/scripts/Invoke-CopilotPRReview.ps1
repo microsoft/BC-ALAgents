@@ -531,19 +531,34 @@ function Build-LineMap {
     $map      = @{}   # lineNumber -> @{ line=N; side='RIGHT'|'LEFT' }
     $oldLine  = 0
     $newLine  = 0
+    $newStart = 0
+    $newEnd   = 0
 
     foreach ($raw in ($Patch -split "`n")) {
-        if ($raw -match '^@@\s+-(\d+)(?:,\d+)?\s+\+(\d+)(?:,\d+)?\s+@@') {
+        if ($raw -match '^@@\s+-(\d+)(?:,\d+)?\s+\+(\d+)(?:,(\d+))?\s+@@') {
             $oldLine = [int]$Matches[1]
-            $newLine = [int]$Matches[2]
+            $newStart = [int]$Matches[2]
+            $newLine = $newStart
+            $newCount = if ($Matches[3]) { [int]$Matches[3] } else { 1 }
+            $newEnd = $newStart + $newCount - 1
             continue
         }
         if ($raw.StartsWith('+') -and -not $raw.StartsWith('+++')) {
-            if (-not $map.ContainsKey($newLine)) { $map[$newLine] = @{ line = $newLine; side = 'RIGHT' } }
+            if (-not $map.ContainsKey($newLine) -or $map[$newLine].side -eq 'LEFT') {
+                $map[$newLine] = @{
+                    line = $newLine; side = 'RIGHT'
+                    newStart = $newStart; newEnd = $newEnd
+                }
+            }
             $newLine++; continue
         }
         if ($raw.StartsWith('-') -and -not $raw.StartsWith('---')) {
-            if (-not $map.ContainsKey($oldLine)) { $map[$oldLine] = @{ line = $oldLine; side = 'LEFT' } }
+            if (-not $map.ContainsKey($oldLine)) {
+                $map[$oldLine] = @{
+                    line = $oldLine; side = 'LEFT'
+                    newStart = $newStart; newEnd = $newEnd
+                }
+            }
             $oldLine++; continue
         }
         if ($raw.StartsWith('\')) { continue }
@@ -551,6 +566,26 @@ function Build-LineMap {
     }
 
     return $map
+}
+
+function Resolve-FindingLocation {
+    param([hashtable] $LineMap, [int] $LineNumber)
+
+    if (-not $LineMap -or $LineMap.Count -eq 0) { return $null }
+    if ($LineMap.ContainsKey($LineNumber)) { return $LineMap[$LineNumber] }
+
+    $locations = @($LineMap.Values)
+    $sameHunkRight = @($locations | Where-Object {
+        $_.side -eq 'RIGHT' -and $LineNumber -ge $_.newStart -and $LineNumber -le $_.newEnd
+    })
+    if ($sameHunkRight.Count -gt 0) {
+        $nearest = $sameHunkRight |
+            Sort-Object @{ Expression = { [Math]::Abs([int]$_.line - $LineNumber) } }, line |
+            Select-Object -First 1
+        return @{ line = [int]$nearest.line; side = $nearest.side; inferred = $true }
+    }
+
+    return $null
 }
 
 # ---------------------------------------------------------------------------
@@ -2544,6 +2579,7 @@ function Get-ExistingCommentKeys {
 
     $keys = [System.Collections.Generic.HashSet[string]]::new()
     $locations = [System.Collections.Generic.List[object]]::new()
+    $sourceKeys = [System.Collections.Generic.HashSet[string]]::new()
     $targetExactKey = ConvertTo-DomainMetadataKey -Domain $Domain
     $targetLegacyKey = ConvertTo-LegacyDomainKey -Domain $Domain
 
@@ -2561,6 +2597,10 @@ function Get-ExistingCommentKeys {
         $line = $comment.line ?? $comment.original_line ?? 0
         $side = $comment.side ?? 'RIGHT'
         if ($path -and $line) {
+            if ($body -match '<!-- agent_source_line:\s*(\d+)\s*-->') {
+                $sourceKeys.Add("${path}:$($Matches[1])") | Out-Null
+                continue
+            }
             $keys.Add("${path}:${line}:${side}") | Out-Null
             $locations.Add([pscustomobject]@{
                 path = ($path -replace '\\', '/')
@@ -2570,7 +2610,7 @@ function Get-ExistingCommentKeys {
         }
     }
 
-    return [pscustomobject]@{ Keys = $keys; Locations = $locations }
+    return [pscustomobject]@{ Keys = $keys; Locations = $locations; SourceKeys = $sourceKeys }
 }
 
 function Test-NearDuplicateLocation {
@@ -2603,13 +2643,16 @@ function Post-Findings {
     $existing = Get-ExistingCommentKeys -Domain $Domain
     $existingKeys = $existing.Keys
     $existingLocations = $existing.Locations
+    $existingSourceKeys = $existing.SourceKeys
     if ($null -eq $existingKeys) { $existingKeys = [System.Collections.Generic.HashSet[string]]::new() }
     if ($null -eq $existingLocations) { $existingLocations = [System.Collections.Generic.List[object]]::new() }
+    if ($null -eq $existingSourceKeys) { $existingSourceKeys = [System.Collections.Generic.HashSet[string]]::new() }
 
     foreach ($finding in ($Findings | Sort-Object @{Expression = { $SeverityOrder[$_.severity] }}, filePath, lineNumber)) {
         $filePath   = ($finding.filePath -replace '^/', '') -replace '\\', '/'
         $lineNumber = [int]$finding.lineNumber
         $location   = $null
+        $locationInferred = $false
 
         if (-not $ChangedFileSet.ContainsKey($filePath)) {
             Write-Host "Skipping $Domain finding for non-PR file: $filePath"
@@ -2619,8 +2662,9 @@ function Post-Findings {
             Write-Host "Skipping $Domain finding outside REVIEW_APPLY_TO ($ReviewApplyTo): $filePath"
             continue
         }
-        if ($LineMaps.ContainsKey($filePath) -and $LineMaps[$filePath].ContainsKey($lineNumber)) {
-            $location = $LineMaps[$filePath][$lineNumber]
+        if ($LineMaps.ContainsKey($filePath)) {
+            $location = Resolve-FindingLocation -LineMap $LineMaps[$filePath] -LineNumber $lineNumber
+            if ($location) { $locationInferred = [bool]($location.inferred ?? $false) }
         }
 
         # Validate / re-anchor the ```suggestion``` block against the PR-head
@@ -2650,6 +2694,7 @@ function Post-Findings {
                 }
                 if ($spanOk) {
                     $location = @{ line = [int]$placement.endLine; side = 'RIGHT' }
+                    $locationInferred = $false
                     if ([int]$placement.startLine -lt [int]$placement.endLine) {
                         $commentStartLine = [int]$placement.startLine
                         $commentStartSide = 'RIGHT'
@@ -2664,24 +2709,36 @@ function Post-Findings {
         }
 
         if ($location) {
-            $key = "$($filePath):$($location.line):$($location.side)"
-            if ($existingKeys.Contains($key)) {
-                Write-Host "Skipping duplicate $Domain finding at $($filePath):$lineNumber"; continue
-            }
-            if (Test-NearDuplicateLocation -ExistingLocations $existingLocations -Path $filePath -Line $location.line -Side $location.side) {
-                Write-Host "Skipping near-duplicate $Domain finding at $($filePath):$lineNumber"; continue
+            if ($locationInferred) {
+                $sourceKey = "${filePath}:${lineNumber}"
+                if ($existingSourceKeys.Contains($sourceKey)) {
+                    Write-Host "Skipping duplicate $Domain finding at $($filePath):$lineNumber"; continue
+                }
+            } else {
+                $key = "$($filePath):$($location.line):$($location.side)"
+                if ($existingKeys.Contains($key)) {
+                    Write-Host "Skipping duplicate $Domain finding at $($filePath):$lineNumber"; continue
+                }
+                if (Test-NearDuplicateLocation -ExistingLocations $existingLocations -Path $filePath -Line $location.line -Side $location.side) {
+                    Write-Host "Skipping near-duplicate $Domain finding at $($filePath):$lineNumber"; continue
+                }
             }
         }
 
         $body = Build-CommentBody -Finding $finding -SuppressSuggestion:$suppressSuggestion
+        if ($locationInferred) { $body = Add-CommentNotice -Body $body -Notice "<!-- agent_source_line: $lineNumber -->" }
         $otherRegionsNotice = Format-OtherRegionsNotice -Finding $finding
         if ($otherRegionsNotice) { $body = Add-CommentNotice -Body $body -Notice $otherRegionsNotice }
 
         try {
             if ($location) {
                 $null = New-ReviewComment -Body $body -Path $filePath -Line $location.line -Side $location.side -StartLine $commentStartLine -StartSide $commentStartSide
-                $existingKeys.Add("$($filePath):$($location.line):$($location.side)") | Out-Null
-                $existingLocations.Add([pscustomobject]@{ path = $filePath; line = [int]$location.line; side = $location.side }) | Out-Null
+                if ($locationInferred) {
+                    $existingSourceKeys.Add("${filePath}:${lineNumber}") | Out-Null
+                } else {
+                    $existingKeys.Add("$($filePath):$($location.line):$($location.side)") | Out-Null
+                    $existingLocations.Add([pscustomobject]@{ path = $filePath; line = [int]$location.line; side = $location.side }) | Out-Null
+                }
                 $postedInline++
             } else {
                 $fallbackBody = Add-CommentNotice -Body $body -Notice '_Line mapping was unavailable, so this was posted as an issue comment._'
