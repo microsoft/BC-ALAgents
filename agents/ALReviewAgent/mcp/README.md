@@ -3,14 +3,16 @@
 Skeleton for **AB#645219** - refactor the PR-review engine into two MCP servers so
 there is a single source of truth for PROD, BC-Bench (offline eval), and customers.
 
-> Status: **behavior-preserving rewire**. The tool contracts are the target
-> schema; the two handlers are per-phase **pass-throughs** that set
+> Status: **additive - not wired into the live path**. The tool contracts are the
+> target schema; the two handlers are per-phase **pass-throughs** that set
 > `REVIEW_PHASE` and delegate to `scripts/Invoke-CopilotPRReview.ps1`, which still
-> owns all logic. `.github/workflows/review.yml` now calls the tools instead of the
-> script directly - the review job (read-only) calls `review`, the publish job
-> (write) calls `publish` - so the tool seam is exercised end-to-end in the live
-> path with **no behavior change**. Moving the logic into the tools (and BC-Bench
-> consuming `review`) follows in subsequent PRs.
+> owns all logic. `.github/workflows/review.yml` is intentionally **left unchanged**
+> and keeps calling `scripts/Invoke-CopilotPRReview.ps1` directly - the many
+> pipelines that consume the old path must keep working untouched. These tools are a
+> standalone, opt-in capability (call them directly / over MCP, e.g. via
+> `../scripts/Invoke-PRReviewShell.ps1`); consumers migrate to them **one at a time**.
+> Wiring PROD's `review.yml` to the tools, moving the logic into them, and BC-Bench
+> consuming `review` follow in subsequent PRs, each additive.
 
 ## Why split
 
@@ -47,7 +49,8 @@ publish($r.findings, pr, iteration_ctx)   # PROD only; BC-Bench stops after revi
 
 This mirrors what `review.yml` already does at the **job** level (a read-only
 `review`/generate job and a write `publish`/post job calling the same script) -
-this refactor lifts that boundary down to the tool level so the wiring exists once.
+this refactor will lift that boundary down to the tool level so the wiring exists
+once. Until a pipeline opts in, `review.yml` keeps calling the script directly.
 
 ## Servers are PowerShell
 

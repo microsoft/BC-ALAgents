@@ -13,14 +13,18 @@
     (a later, load-bearing PR), this tool sets REVIEW_PHASE=generate and delegates
     to the existing orchestrator, which reads every other input from the
     environment - exactly how PROD's review.yml and the local harness already
-    invoke it. The tool is now the seam in the live path (review.yml's read-only
-    review job calls it), so it is exercised end-to-end without any behavior change.
+    invoke it. Delegating means the pass-through produces byte-for-byte the same
+    result as calling the script directly.
 
     Optional parameters override the matching environment variable ONLY when
     explicitly supplied (single-process callers such as BC-Bench); PROD passes
     none, keeping this a pure pass-through. Source / PR context stay env-driven
     for now; the repo_ref|local_path contract in review.tool.json is honored once
     the generate logic moves into this tool.
+
+    This tool is ADDITIVE and opt-in: review.yml still calls
+    Invoke-CopilotPRReview.ps1 directly, so the many pipelines on the old path are
+    untouched. Consumers migrate to the tool one at a time.
 
 .OUTPUTS
     Interim: none (the engine writes agent-output.txt to REVIEW_OUTPUT_DIR - the
