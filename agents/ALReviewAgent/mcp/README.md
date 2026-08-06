@@ -10,7 +10,8 @@ there is a single source of truth for PROD, BC-Bench (offline eval), and custome
 > and keeps calling `scripts/Invoke-CopilotPRReview.ps1` directly - the many
 > pipelines that consume the old path must keep working untouched. These tools are a
 > standalone, opt-in capability (call them directly / over MCP, e.g. via
-> `../scripts/Invoke-PRReviewShell.ps1`); consumers migrate to them **one at a time**.
+> `../scripts/Invoke-PRReviewShell.ps1` or the `review` stdio MCP server
+> `review/Start-ReviewMcpServer.ps1`); consumers migrate to them **one at a time**.
 > Wiring PROD's `review.yml` to the tools, moving the logic into them, and BC-Bench
 > consuming `review` follow in subsequent PRs, each additive.
 
@@ -36,9 +37,39 @@ so offline eval must see them; placement / iteration / POST live in `publish`.
 | --- | --- |
 | `review/review.tool.json` | `review` tool contract (input + output schema) |
 | `review/Invoke-ReviewTool.ps1` | `review` handler (interim per-phase pass-through) |
+| `review/Start-ReviewMcpServer.ps1` | `review` **stdio MCP server** - real JSON-RPC front-end over the handler |
 | `publish/publish.tool.json` | `publish` tool contract |
 | `publish/Invoke-PublishTool.ps1` | `publish` handler (interim per-phase pass-through) |
 | `../scripts/Invoke-PRReviewShell.ps1` | single-process (BC-Bench/local) call site: `review(...)` then `publish(...)` |
+
+## Register the `review` server (MCP client / BC-Bench)
+
+`review/Start-ReviewMcpServer.ps1` speaks JSON-RPC 2.0 over stdio (newline-delimited
+messages) - the transport an MCP client such as BC-Bench registers under
+`mcp.servers`. It advertises one tool, `review`, using `review.tool.json` as the
+single source of truth for the input schema, and delegates execution to
+`Invoke-ReviewTool.ps1`. Protocol stdout carries only JSON-RPC; the delegated engine
+run happens in a child `pwsh` whose streams are redirected to a per-call log, and
+diagnostics go to stderr.
+
+BC-Bench (`src/bcbench/agent/shared/config.yaml`) registers it like any stdio server:
+
+```yaml
+mcp:
+  servers:
+    - name: "bc-review"
+      type: "stdio"
+      command: "pwsh"
+      args:
+        ["-NoProfile", "-File", "{{engine_path}}/agents/ALReviewAgent/mcp/review/Start-ReviewMcpServer.ps1"]
+```
+
+`tools/call` argument -> engine mapping (mirrors how PROD's runner sets the
+environment): `local_path` -> `REVIEW_SOURCE=local` + `REVIEW_TARGET_WORKSPACE`,
+`base_ref` -> `BASE_REF`, and `bcquality_ref` / `model` / `min_severity` /
+`output_dir` become handler params. The caller must provide `BCQUALITY_ROOT` (a
+filtered BCQuality clone - the same Fetch BCQuality step PROD's runner performs)
+before the tool runs; interim, the tool returns the raw `agent-output.txt` findings.
 
 ## Target shape
 
