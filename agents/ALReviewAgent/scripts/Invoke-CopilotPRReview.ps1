@@ -3229,6 +3229,13 @@ $bcqRef = if ($BCQualitySha) { $BCQualitySha } else { '(unresolved ref)' }
 Write-LogPhaseDetail "BCQuality: $BCQualityRoot @ $bcqRef"
 Write-Host ''
 
+# Clear stale per-run artifacts from the reused BCQuality checkout BEFORE the
+# Discovery phase writes this run's worklist; the cleanup matches _review-*, so
+# running it after Discovery (as before) deleted the freshly written changed-file
+# manifest and object index, leaving a read-only generate agent with no worklist.
+# Post never writes these artifacts, so guard on phase.
+if ($ReviewPhase -ne 'post') { Clear-BCQualityRunArtifacts }
+
 # --- Phase 1: Discovery -----------------------------------------------------
 Write-LogGroup 'Discovery'
 if ($ReviewSource -eq 'local') {
@@ -3302,7 +3309,6 @@ if ($ReviewPhase -ne 'generate') {
 # in the generate/all phases; skip them entirely in post.
 $taskContext = $null
 if ($ReviewPhase -ne 'post') {
-    Clear-BCQualityRunArtifacts
     $taskContext = Build-TaskContext
     $null = Save-TaskContext -TaskContext $taskContext
 }
