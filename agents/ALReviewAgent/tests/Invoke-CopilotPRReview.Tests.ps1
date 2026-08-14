@@ -132,7 +132,7 @@ Describe 'Resolve-FindingLocation' {
         Resolve-FindingLocation -LineMap $lineMap -LineNumber 22 | Should -BeNullOrEmpty
     }
 
-    It 'does not infer a LEFT anchor from a PR-head line number' {
+    It 'infers the nearest LEFT anchor in a deletion-only hunk' {
         $deletionPatch = @'
 @@ -10,7 +10,6 @@
  context
@@ -145,8 +145,58 @@ Describe 'Resolve-FindingLocation' {
 '@
         $deletionMap = Build-LineMap -Patch $deletionPatch
 
-        Resolve-FindingLocation -LineMap $deletionMap -LineNumber 12 | Should -BeNullOrEmpty
+        $location = Resolve-FindingLocation -LineMap $deletionMap -LineNumber 12
+
+        $location.line | Should -Be 13
+        $location.side | Should -Be 'LEFT'
+        $location.inferred | Should -BeTrue
         (Resolve-FindingLocation -LineMap $deletionMap -LineNumber 13).side | Should -Be 'LEFT'
+    }
+
+    It 'maps nearby PR-head lines to the closest deletion in a deletion-only hunk' {
+        $deletionPatch = @'
+@@ -91,18 +91,14 @@
+ context
+ context
+ context
+-deleted first
+ context
+ context
+ context
+-deleted second
+ context
+ context
+ context
+ context
+ context
+-deleted third
+-deleted fourth
+ context
+ context
+ context
+'@
+        $deletionMap = Build-LineMap -Patch $deletionPatch
+
+        (Resolve-FindingLocation -LineMap $deletionMap -LineNumber 97).line | Should -Be 98
+        (Resolve-FindingLocation -LineMap $deletionMap -LineNumber 103).line | Should -Be 104
+    }
+
+    It 'does not infer a LEFT anchor across hunk boundaries' {
+        $deletionPatch = @'
+@@ -10,4 +10,3 @@
+ context
+-deleted line
+ context
+ context
+@@ -30,4 +29,3 @@
+ context
+-another deleted line
+ context
+ context
+'@
+        $deletionMap = Build-LineMap -Patch $deletionPatch
+
+        Resolve-FindingLocation -LineMap $deletionMap -LineNumber 20 | Should -BeNullOrEmpty
     }
 }
 

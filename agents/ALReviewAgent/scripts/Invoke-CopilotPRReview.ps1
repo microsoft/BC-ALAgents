@@ -556,7 +556,7 @@ function Build-LineMap {
             if (-not $map.ContainsKey($oldLine)) {
                 $map[$oldLine] = @{
                     line = $oldLine; side = 'LEFT'
-                    newStart = $newStart; newEnd = $newEnd
+                    newStart = $newStart; newEnd = $newEnd; deletionPosition = $newLine
                 }
             }
             $oldLine++; continue
@@ -584,6 +584,16 @@ function Resolve-FindingLocation {
     if ($sameHunkRight.Count -gt 0) {
         $nearest = $sameHunkRight |
             Sort-Object @{ Expression = { [Math]::Abs([int]$_.line - $LineNumber) } }, line |
+            Select-Object -First 1
+        return @{ line = [int]$nearest.line; side = $nearest.side; inferred = $true }
+    }
+
+    $sameHunkLeft = @($locations | Where-Object {
+        $_.side -eq 'LEFT' -and $LineNumber -ge $_.newStart -and $LineNumber -le $_.newEnd
+    })
+    if ($sameHunkLeft.Count -gt 0) {
+        $nearest = $sameHunkLeft |
+            Sort-Object @{ Expression = { [Math]::Abs([int]$_.deletionPosition - $LineNumber) } }, line |
             Select-Object -First 1
         return @{ line = [int]$nearest.line; side = $nearest.side; inferred = $true }
     }
