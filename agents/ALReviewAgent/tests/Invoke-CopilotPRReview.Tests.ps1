@@ -913,9 +913,38 @@ Describe 'Local review authentication' {
         $source | Should -Match 'Get-Command copilot\.exe'
     }
 
-    It 'does not forward an inherited GH_TOKEN to the local child process' {
-        $source = Get-Content -LiteralPath $scriptPath -Raw
-        $source | Should -Match "if \(\`$ReviewSource -ne 'local' -and \`$CopilotToken\)"
+    It 'does not forward inherited tokens to a local non-CI child process' {
+        $environment = New-CopilotChildEnvironment `
+            -ReviewSource 'local' `
+            -CopilotToken 'inherited-gh-token' `
+            -CopilotGithubToken 'inherited-copilot-token' `
+            -CiValue $null
+
+        $environment.ContainsKey('GH_TOKEN') | Should -BeFalse
+        $environment.ContainsKey('COPILOT_GITHUB_TOKEN') | Should -BeFalse
+        $environment.ContainsKey('GITHUB_TOKEN') | Should -BeFalse
+    }
+
+    It 'forwards only COPILOT_GITHUB_TOKEN to a local CI child process' {
+        $environment = New-CopilotChildEnvironment `
+            -ReviewSource 'local' `
+            -CopilotToken 'inherited-gh-token' `
+            -CopilotGithubToken 'ci-copilot-token' `
+            -CiValue 'true'
+
+        $environment['COPILOT_GITHUB_TOKEN'] | Should -Be 'ci-copilot-token'
+        $environment.ContainsKey('GH_TOKEN') | Should -BeFalse
+    }
+
+    It 'keeps forwarding GH_TOKEN to a PR child process' {
+        $environment = New-CopilotChildEnvironment `
+            -ReviewSource 'pr' `
+            -CopilotToken 'pr-copilot-token' `
+            -CopilotGithubToken 'inherited-copilot-token' `
+            -CiValue 'true'
+
+        $environment['GH_TOKEN'] | Should -Be 'pr-copilot-token'
+        $environment.ContainsKey('COPILOT_GITHUB_TOKEN') | Should -BeFalse
     }
 }
 

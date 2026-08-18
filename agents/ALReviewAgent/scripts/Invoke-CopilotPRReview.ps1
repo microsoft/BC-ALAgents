@@ -48,8 +48,11 @@
         REVIEW_OUTPUT_DIR                    - artifact output folder
         REVIEW_TARGET_WORKSPACE              - detached PR-head worktree path
         GH_TOKEN                              - Copilot-enabled token for CI/PR
-                                                generation. Local reviews use the
-                                                Copilot CLI credential store.
+                                                generation.
+        COPILOT_GITHUB_TOKEN                  - Copilot-enabled token forwarded only
+                                                for local reviews running in CI.
+                                                Other local reviews use the Copilot
+                                                CLI credential store.
         COPILOT_MODEL                        - explicit model name for Copilot CLI
         COPILOT_REVIEW_LEAF_MODEL            - faster/cheaper model for leaf sub-skill
                                                child agents (triage tier); empty = default
@@ -80,6 +83,7 @@ $ErrorActionPreference = 'Stop'
 # ---------------------------------------------------------------------------
 $GithubToken      = $env:GITHUB_TOKEN
 $CopilotToken     = $env:GH_TOKEN
+$CopilotGithubToken = $env:COPILOT_GITHUB_TOKEN
 $Repository       = $env:GITHUB_REPOSITORY
 $TrustedWorkspace = $env:REVIEW_WORKSPACE ?? $env:GITHUB_WORKSPACE ?? (Get-Location).Path
 $PrNumber         = [int]($env:PR_NUMBER ?? 0)
@@ -432,6 +436,38 @@ function New-IssueComment {
 function Update-IssueComment {
     param([long] $CommentId, [string] $Body)
     Invoke-GitHubApi -Method PATCH -Endpoint "/issues/comments/$CommentId" -Body @{ body = $Body }
+}
+
+function New-CopilotChildEnvironment {
+    param(
+        [string] $ReviewSource,
+        [string] $CopilotToken,
+        [string] $CopilotGithubToken,
+        [string] $CiValue
+    )
+
+    $allowedKeys = @('PATH','HOME','USERPROFILE','TMP','TEMP','TMPDIR','APPDATA','LOCALAPPDATA',
+                     'SystemRoot','ComSpec','CI','TERM','LANG','LC_ALL','npm_config_prefix','NPM_CONFIG_PREFIX')
+    $cleanEnv = @{}
+    foreach ($key in $allowedKeys) {
+        $val = [System.Environment]::GetEnvironmentVariable($key)
+        if ($val) { $cleanEnv[$key] = $val }
+    }
+
+    if ($ReviewSource -eq 'local') {
+        if (-not [string]::IsNullOrWhiteSpace($CiValue) -and $CopilotGithubToken) {
+            $cleanEnv['COPILOT_GITHUB_TOKEN'] = $CopilotGithubToken
+        }
+    }
+    elseif ($CopilotToken) {
+        $cleanEnv['GH_TOKEN'] = $CopilotToken
+    }
+
+    $cleanEnv['CI'] = 'true'
+    $cleanEnv['GIT_PAGER'] = 'cat'
+    $cleanEnv['PAGER'] = 'cat'
+    $cleanEnv['GIT_TERMINAL_PROMPT'] = '0'
+    return $cleanEnv
 }
 
 # ---------------------------------------------------------------------------
@@ -1244,23 +1280,15 @@ function Invoke-CopilotCli {
     }
     if ($CopilotModel) { $copilotArgs += "--model=$CopilotModel" }
 
-    # Pass only a safe allowlist of env vars to the subprocess. CI generation
-    # injects GH_TOKEN; local reviews deliberately omit it so Copilot CLI uses
-    # its existing credential store under the preserved user-profile paths.
-    $allowedKeys = @('PATH','HOME','USERPROFILE','TMP','TEMP','TMPDIR','APPDATA','LOCALAPPDATA',
-                     'SystemRoot','ComSpec','CI','TERM','LANG','LC_ALL','npm_config_prefix','NPM_CONFIG_PREFIX')
-    $cleanEnv = @{}
-    foreach ($key in $allowedKeys) {
-        $val = [System.Environment]::GetEnvironmentVariable($key)
-        if ($val) { $cleanEnv[$key] = $val }
-    }
-    if ($ReviewSource -ne 'local' -and $CopilotToken) {
-        $cleanEnv['GH_TOKEN'] = $CopilotToken
-    }
-    $cleanEnv['CI']       = 'true'
-    $cleanEnv['GIT_PAGER'] = 'cat'
-    $cleanEnv['PAGER'] = 'cat'
-    $cleanEnv['GIT_TERMINAL_PROMPT'] = '0'
+    # Pass only a safe allowlist of env vars to the subprocess. PR generation
+    # keeps its existing GH_TOKEN behavior. Local reviews use the credential
+    # store unless the parent is CI, where the dedicated Copilot token is safe
+    # to forward without exposing unrelated inherited tokens.
+    $cleanEnv = New-CopilotChildEnvironment `
+        -ReviewSource $ReviewSource `
+        -CopilotToken $CopilotToken `
+        -CopilotGithubToken $CopilotGithubToken `
+        -CiValue ([System.Environment]::GetEnvironmentVariable('CI'))
 
     $transcriptBuilder = [System.Text.StringBuilder]::new()
     $process   = $null
