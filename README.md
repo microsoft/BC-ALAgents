@@ -160,6 +160,21 @@ BCQuality checkout via `BCQUALITY_ROOT`, the repo under review via
 `REVIEW_WORKSPACE`, and point `BCQUALITY_CONFIG_PATH` at a policy config; then
 invoke `agents/ALReviewAgent/scripts/Invoke-CopilotPRReview.ps1`.
 
+Each generate/all run also writes `_run-metrics.json` to `REVIEW_OUTPUT_DIR`.
+Schema version `1` is sourced only from the Copilot CLI OpenTelemetry file
+exporter. `prompt_tokens` and `completion_tokens` sum the corresponding
+`gen_ai.usage.*` values on every raw `chat` span, including nested agents and
+retries; `total_tokens` is their sum. `api_calls` counts those spans rather than
+conversation turns, and `wall_time_seconds` covers the full engine phase.
+`cached_tokens`, `cache_creation_tokens`, and
+`reasoning_tokens` are nullable because a model/provider may not expose them;
+the currently verified CLI OTel contract does not expose reasoning tokens.
+`ai_credits` is the exact sum of `github.copilot.nano_aiu` divided by 1 billion;
+it is not estimated. `premium_requests` remains null because the OTel span
+contract does not expose that legacy aggregate. `usage_complete` is false when
+any counted request lacks input/output usage. Malformed OTel records are ignored
+and counted in `malformed_records`; no console or transcript text is parsed.
+
 ## License
 
 This project is licensed under the [MIT License](LICENSE).

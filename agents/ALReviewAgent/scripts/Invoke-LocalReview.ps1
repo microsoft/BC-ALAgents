@@ -327,79 +327,6 @@ function Restore-LocalGitConfig {
     }
 }
 
-function ConvertFrom-CopilotCompactNumber {
-    param([Parameter(Mandatory)][string] $Value)
-
-    $normalized = $Value.Trim().Replace(',', '')
-    if ($normalized -notmatch '^([0-9]+(?:\.[0-9]+)?)([kKmM]?)$') {
-        throw "Unsupported Copilot metric value: '$Value'"
-    }
-
-    $number = [double]::Parse(
-        $Matches[1],
-        [System.Globalization.CultureInfo]::InvariantCulture
-    )
-    $multiplier = switch ($Matches[2].ToLowerInvariant()) {
-        'k' { 1000 }
-        'm' { 1000000 }
-        default { 1 }
-    }
-    return $number * $multiplier
-}
-
-function Get-CopilotSummaryMetrics {
-    param([Parameter(Mandatory)][string] $TranscriptPath)
-
-    if (-not (Test-Path -LiteralPath $TranscriptPath -PathType Leaf)) {
-        return $null
-    }
-
-    $raw = Get-Content -LiteralPath $TranscriptPath -Raw
-    $raw = $raw -replace '\x1B\[[0-?]*[ -/]*[@-~]', ''
-    $metricNumberPattern = '[0-9][0-9,]*(?:\.[0-9]+)?[kKmM]?'
-    $creditMatches = [regex]::Matches(
-        $raw,
-        "(?m)^(?:err:\s*)?AI Credits\s+($metricNumberPattern)"
-    )
-    $tokenMatches = [regex]::Matches(
-        $raw,
-        "(?m)^(?:err:\s*)?Tokens\s+↑\s*($metricNumberPattern)(?:\s+\(($metricNumberPattern)\s+cached(?:,\s*$metricNumberPattern\s+written)?\))?\s+•\s+↓\s*($metricNumberPattern)(?:\s+\(($metricNumberPattern)\s+reasoning\))?"
-    )
-    if ($creditMatches.Count -eq 0 -and $tokenMatches.Count -eq 0) {
-        return $null
-    }
-
-    $credits = 0.0
-    if ($creditMatches.Count -gt 0) {
-        $credits = ConvertFrom-CopilotCompactNumber $creditMatches[-1].Groups[1].Value
-    }
-
-    $inputTokens = 0L
-    $cachedTokens = 0L
-    $outputTokens = 0L
-    $reasoningTokens = 0L
-    if ($tokenMatches.Count -gt 0) {
-        $match = $tokenMatches[-1]
-        $inputTokens = [int64](ConvertFrom-CopilotCompactNumber $match.Groups[1].Value)
-        if ($match.Groups[2].Success) {
-            $cachedTokens = [int64](ConvertFrom-CopilotCompactNumber $match.Groups[2].Value)
-        }
-        $outputTokens = [int64](ConvertFrom-CopilotCompactNumber $match.Groups[3].Value)
-        if ($match.Groups[4].Success) {
-            $reasoningTokens = [int64](ConvertFrom-CopilotCompactNumber $match.Groups[4].Value)
-        }
-    }
-
-    return [pscustomobject]@{
-        input_tokens     = $inputTokens
-        cached_tokens    = $cachedTokens
-        output_tokens    = $outputTokens
-        reasoning_tokens = $reasoningTokens
-        total_tokens     = $inputTokens + $outputTokens
-        credits          = $credits
-    }
-}
-
 function Resolve-BranchBase {
     if ($BaseRef) { return $BaseRef }
     $upstream = & git -C $RepoPath rev-parse --abbrev-ref '@{u}' 2>$null
@@ -543,19 +470,24 @@ try {
 
         $metricsPath = Join-Path $OutputDir '_run-metrics.json'
         [pscustomobject]@{
+            schema_version      = 1
+            metrics_source      = 'not-applicable'
+            cli_version         = $null
             wall_time_seconds   = 0
-            wall_time_display   = '00:00'
-            model               = $null
             prompt_tokens       = 0
             cached_tokens       = 0
+            cache_creation_tokens = 0
             completion_tokens   = 0
             reasoning_tokens    = 0
             total_tokens        = 0
             api_calls           = 0
-            estimated_credits   = 0.0
-            metrics_source      = 'not-applicable'
-            cost_note           = 'No Copilot process was launched because the selected diff contains no AL files.'
-            log_files_scanned   = @()
+            failed_api_calls    = 0
+            usage_api_calls     = 0
+            ai_credits          = 0.0
+            premium_requests    = 0.0
+            models              = @()
+            usage_complete      = $true
+            malformed_records   = 0
         } | ConvertTo-Json -Depth 5 | Set-Content -LiteralPath $metricsPath -Encoding utf8
 
         Write-Host '[local-review] No AL (.al) files found in the selected diff; review skipped.'
@@ -642,8 +574,6 @@ try {
     # Local runs commonly need the agent to touch git.exe / pwsh.exe outside
     # the target folder. Broaden the CLI sandbox for the local path only.
     $env:COPILOT_ALLOW_ALL_PATHS = 'true'
-    # Info-level process logs include usage and token_prices for run metrics.
-    $env:COPILOT_REVIEW_LOG_LEVEL = 'info'
     # Existing mode's base is a parent-less synthesized commit → no merge-base
     # exists, so we must use direct `A..B` diff instead of `A...B`.
     if ($Mode -eq 'Existing') { $env:REVIEW_DIFF_STYLE = 'direct' }
@@ -684,15 +614,7 @@ try {
     $reportPath = Join-Path $OutputDir '_review-report.json'
     Remove-Item -LiteralPath $sourceReportPath -Force -ErrorAction SilentlyContinue
     Remove-Item -LiteralPath $reportPath -Force -ErrorAction SilentlyContinue
-    $copilotLogDir = Join-Path ([Environment]::GetFolderPath('UserProfile')) '.copilot/logs'
-    $preexistingLogs = @{}
-    if (Test-Path $copilotLogDir) {
-        Get-ChildItem $copilotLogDir -File -ErrorAction SilentlyContinue |
-            ForEach-Object { $preexistingLogs[$_.Name] = $true }
-    }
-    $sw = [System.Diagnostics.Stopwatch]::StartNew()
     & $reviewScript
-    $sw.Stop()
     if ($LASTEXITCODE -ne 0) {
         throw "Reviewer script failed (exit $LASTEXITCODE)"
     }
@@ -708,116 +630,13 @@ try {
         Write-Host "[local-review] Findings: $reportPath"
     }
 
-    # -----------------------------------------------------------------------
-    # Metrics: wall time + token usage + estimated credit cost from Copilot
-    # CLI logs. The reviewer subprocess writes JSONL-ish log files into
-    # ~/.copilot/logs; usage blocks and per-model token_prices live there.
-    # -----------------------------------------------------------------------
-    $metrics = [ordered]@{
-        wall_time_seconds  = [math]::Round($sw.Elapsed.TotalSeconds, 2)
-        wall_time_display  = ('{0:mm\:ss}' -f $sw.Elapsed)
-        model              = $env:COPILOT_MODEL
-        prompt_tokens      = 0
-        cached_tokens      = 0
-        completion_tokens  = 0
-        reasoning_tokens   = 0
-        total_tokens       = 0
-        api_calls          = 0
-        estimated_credits  = 0.0
-        metrics_source     = 'unavailable'
-        cost_note          = 'Credits derived from Copilot CLI token_prices (per 1M tokens). These are AI-credit units, not USD.'
-        log_files_scanned  = @()
-    }
-
-    if (Test-Path $copilotLogDir) {
-        $runLogs = @(Get-ChildItem $copilotLogDir -File -Filter 'process-*.log' -ErrorAction SilentlyContinue |
-            Where-Object { -not $preexistingLogs.ContainsKey($_.Name) })
-        $metrics.log_files_scanned = @($runLogs | ForEach-Object { $_.Name })
-
-        # Grab the most recently seen token_prices block for input/output rates.
-        $inputRate  = 0.0
-        $outputRate = 0.0
-        $batchSize  = 1000000
-
-        foreach ($lf in $runLogs) {
-            $raw = Get-Content $lf.FullName -Raw
-            # token_prices is embedded JSON — parse just enough of it.
-            $priceMatch = [regex]::Match($raw, '"token_prices"\s*:\s*\{[^}]*?"batch_size"\s*:\s*(\d+)[^}]*?"default"\s*:\s*\{[^}]*?"input_price"\s*:\s*(\d+)[^}]*?"output_price"\s*:\s*(\d+)', 'Singleline')
-            if ($priceMatch.Success) {
-                $batchSize  = [double]$priceMatch.Groups[1].Value
-                $inputRate  = [double]$priceMatch.Groups[2].Value
-                $outputRate = [double]$priceMatch.Groups[3].Value
-            }
-            # Each API response logs a `"usage": { "prompt_tokens": .., "completion_tokens": .., "total_tokens": .. }` block.
-            foreach ($m in [regex]::Matches($raw, '"usage"\s*:\s*\{\s*"prompt_tokens"\s*:\s*(\d+)\s*,\s*"completion_tokens"\s*:\s*(\d+)\s*,\s*"total_tokens"\s*:\s*(\d+)')) {
-                $metrics.prompt_tokens     += [int64]$m.Groups[1].Value
-                $metrics.completion_tokens += [int64]$m.Groups[2].Value
-                $metrics.total_tokens      += [int64]$m.Groups[3].Value
-                $metrics.api_calls         += 1
-            }
-        }
-
-        if ($batchSize -gt 0 -and ($inputRate + $outputRate) -gt 0) {
-            $credits = ($metrics.prompt_tokens * $inputRate + $metrics.completion_tokens * $outputRate) / $batchSize
-            $metrics.estimated_credits = [math]::Round($credits, 4)
-            $metrics['token_price_input_per_batch']  = $inputRate
-            $metrics['token_price_output_per_batch'] = $outputRate
-            $metrics['token_price_batch_size']       = $batchSize
-        }
-        if ($metrics.total_tokens -gt 0 -or $metrics.estimated_credits -gt 0) {
-            $metrics.metrics_source = 'process-logs'
-        }
-    }
-
-    # Copilot CLI always prints its aggregate token and AI-credit summary at
-    # process exit. Newer CLI log files may omit per-call usage records, so use
-    # the captured transcript as an authoritative aggregate fallback.
-    $transcriptMetrics = Get-CopilotSummaryMetrics -TranscriptPath (Join-Path $OutputDir 'agent-transcript.log')
-    if ($transcriptMetrics) {
-        $usedTranscript = $false
-        if ($metrics.total_tokens -eq 0 -and $transcriptMetrics.total_tokens -gt 0) {
-            $metrics.prompt_tokens = $transcriptMetrics.input_tokens
-            $metrics.cached_tokens = $transcriptMetrics.cached_tokens
-            $metrics.completion_tokens = $transcriptMetrics.output_tokens
-            $metrics.reasoning_tokens = $transcriptMetrics.reasoning_tokens
-            $metrics.total_tokens = $transcriptMetrics.total_tokens
-            $usedTranscript = $true
-        }
-        if ($metrics.estimated_credits -eq 0 -and $transcriptMetrics.credits -gt 0) {
-            $metrics.estimated_credits = $transcriptMetrics.credits
-            $usedTranscript = $true
-        }
-        if ($usedTranscript) {
-            $metrics.metrics_source = if ($metrics.metrics_source -eq 'process-logs') {
-                'process-logs+copilot-cli-summary'
-            }
-            else {
-                'copilot-cli-summary'
-            }
-            $metrics.cost_note = 'Credits and aggregate tokens reported by the Copilot CLI completion summary. Credits are AI-credit units, not USD.'
-        }
-    }
-
-    if ($metrics.metrics_source -eq 'unavailable') {
-        $metrics.prompt_tokens = $null
-        $metrics.cached_tokens = $null
-        $metrics.completion_tokens = $null
-        $metrics.reasoning_tokens = $null
-        $metrics.total_tokens = $null
-        $metrics.estimated_credits = $null
-        $metrics.cost_note = 'Copilot CLI usage metrics were unavailable from both process logs and the completion summary.'
-    }
-
     $metricsPath = Join-Path $OutputDir '_run-metrics.json'
-    $metrics | ConvertTo-Json -Depth 5 | Set-Content -Path $metricsPath -Encoding UTF8
-    Write-Host ''
-    Write-Host "[local-review] === Run metrics ==="
-    Write-Host ("  wall time     : {0}" -f $metrics.wall_time_display)
-    Write-Host ("  api calls     : {0}" -f $metrics.api_calls)
-    Write-Host ("  tokens        : prompt={0}  completion={1}  total={2}" -f $metrics.prompt_tokens, $metrics.completion_tokens, $metrics.total_tokens)
-    Write-Host ("  est. credits  : {0}  (per Copilot CLI token_prices)" -f $metrics.estimated_credits)
-    Write-Host ("  written to    : {0}" -f $metricsPath)
-    Write-Host ''
+    if (Test-Path -LiteralPath $metricsPath -PathType Leaf) {
+        Write-Host "[local-review] Metrics: $metricsPath"
+    }
+    else {
+        Write-Warning "Reviewer produced no structured metrics at $metricsPath."
+    }
 }
 finally {
     if ($tempCommitMade) {

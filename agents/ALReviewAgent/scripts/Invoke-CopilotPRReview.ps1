@@ -168,6 +168,8 @@ $BaseUrl          = "https://api.github.com/repos/$Repository"
 # for local development.
 $ReviewPhase      = (($env:REVIEW_PHASE ?? 'all') + '').Trim().ToLowerInvariant()
 $AgentOutputFile  = 'agent-output.txt'
+$CopilotOtelFileName = '_copilot-otel.jsonl'
+$ReviewStartedAt  = [DateTime]::UtcNow
 
 # Deterministic file the model writes its final JSON findings-report to, inside
 # the Copilot CLI working directory ($BCQualityRoot). The CLI renders tool/shell
@@ -942,6 +944,7 @@ function Clear-BCQualityRunArtifacts {
         '_review-changed-files.txt',
         '_review-object-index.txt',
         '_run-metrics.json',
+        '_copilot-otel.jsonl',
         '_review-*'
     )
 
@@ -959,6 +962,202 @@ function Clear-BCQualityRunArtifacts {
 
     if ($removed -gt 0) {
         Write-Host "Cleared $removed stale review artifact(s) from $AgentWorkDir"
+    }
+}
+
+function Get-ObjectPropertyValue {
+    param(
+        [object] $InputObject,
+        [Parameter(Mandatory)][string] $Name
+    )
+
+    if ($null -eq $InputObject) { return $null }
+    if ($InputObject -is [System.Collections.IDictionary]) {
+        if ($InputObject.Contains($Name)) { return $InputObject[$Name] }
+        return $null
+    }
+    $property = $InputObject.PSObject.Properties[$Name]
+    if ($property) { return $property.Value }
+    return $null
+}
+
+function ConvertFrom-CopilotOtelJsonLines {
+    param([string[]] $Lines = @())
+
+    $records = [System.Collections.Generic.List[object]]::new()
+    $malformedRecords = 0
+    foreach ($line in @($Lines)) {
+        if ([string]::IsNullOrWhiteSpace($line)) { continue }
+        try {
+            $records.Add(($line | ConvertFrom-Json -Depth 100 -ErrorAction Stop)) | Out-Null
+        }
+        catch {
+            $malformedRecords++
+        }
+    }
+
+    return [pscustomobject]@{
+        Records          = @($records)
+        MalformedRecords = $malformedRecords
+    }
+}
+
+function Get-CopilotRunMetrics {
+    param(
+        [object[]] $Records = @(),
+        [object] $WallTimeSeconds = $null,
+        [int] $MalformedRecords = 0
+    )
+
+    $apiCalls = 0
+    $failedApiCalls = 0
+    $usageApiCalls = 0
+    $inputTokens = 0L
+    $outputTokens = 0L
+    $cachedTokens = 0L
+    $cacheCreationTokens = 0L
+    $nanoAiu = [decimal]0
+    $hasCachedTokens = $false
+    $hasCacheCreationTokens = $false
+    $hasNanoAiu = $false
+    $models = [System.Collections.Generic.HashSet[string]]::new([System.StringComparer]::Ordinal)
+    $cliVersions = [System.Collections.Generic.HashSet[string]]::new([System.StringComparer]::Ordinal)
+
+    foreach ($record in @($Records)) {
+        if ((Get-ObjectPropertyValue -InputObject $record -Name 'type') -ne 'span') { continue }
+        $attributes = Get-ObjectPropertyValue -InputObject $record -Name 'attributes'
+        $operation = [string](Get-ObjectPropertyValue -InputObject $attributes -Name 'gen_ai.operation.name')
+
+        if ($operation -eq 'invoke_agent') {
+            $version = [string](Get-ObjectPropertyValue -InputObject $attributes -Name 'gen_ai.agent.version')
+            if ($version) { [void]$cliVersions.Add($version) }
+            continue
+        }
+        if ($operation -ne 'chat') { continue }
+
+        $apiCalls++
+        $status = Get-ObjectPropertyValue -InputObject $record -Name 'status'
+        if ((Get-ObjectPropertyValue -InputObject $status -Name 'code') -eq 2) {
+            $failedApiCalls++
+        }
+
+        $model = [string](Get-ObjectPropertyValue -InputObject $attributes -Name 'gen_ai.response.model')
+        if (-not $model) {
+            $model = [string](Get-ObjectPropertyValue -InputObject $attributes -Name 'gen_ai.request.model')
+        }
+        if ($model) { [void]$models.Add($model) }
+
+        $inputValue = Get-ObjectPropertyValue -InputObject $attributes -Name 'gen_ai.usage.input_tokens'
+        $outputValue = Get-ObjectPropertyValue -InputObject $attributes -Name 'gen_ai.usage.output_tokens'
+        if ($null -ne $inputValue -and $null -ne $outputValue) {
+            $inputTokens += [int64]$inputValue
+            $outputTokens += [int64]$outputValue
+            $usageApiCalls++
+        }
+
+        $cachedValue = Get-ObjectPropertyValue -InputObject $attributes -Name 'gen_ai.usage.cache_read.input_tokens'
+        if ($null -ne $cachedValue) {
+            $cachedTokens += [int64]$cachedValue
+            $hasCachedTokens = $true
+        }
+        $cacheCreationValue = Get-ObjectPropertyValue -InputObject $attributes -Name 'gen_ai.usage.cache_creation.input_tokens'
+        if ($null -ne $cacheCreationValue) {
+            $cacheCreationTokens += [int64]$cacheCreationValue
+            $hasCacheCreationTokens = $true
+        }
+        $nanoAiuValue = Get-ObjectPropertyValue -InputObject $attributes -Name 'github.copilot.nano_aiu'
+        if ($null -ne $nanoAiuValue) {
+            $nanoAiu += [decimal]$nanoAiuValue
+            $hasNanoAiu = $true
+        }
+    }
+
+    $hasApiSpans = $apiCalls -gt 0
+    $usageComplete = $hasApiSpans -and $usageApiCalls -eq $apiCalls
+    $roundedWallTime = if ($null -eq $WallTimeSeconds) { $null } else { [math]::Round([double]$WallTimeSeconds, 3) }
+    return [pscustomobject][ordered]@{
+        schema_version        = 1
+        metrics_source        = 'copilot-cli-otel'
+        cli_version           = if ($cliVersions.Count -eq 1) { [string]@($cliVersions)[0] } else { $null }
+        wall_time_seconds     = $roundedWallTime
+        prompt_tokens         = if ($usageApiCalls -gt 0) { $inputTokens } else { $null }
+        cached_tokens         = if ($hasCachedTokens) { $cachedTokens } else { $null }
+        cache_creation_tokens = if ($hasCacheCreationTokens) { $cacheCreationTokens } else { $null }
+        completion_tokens     = if ($usageApiCalls -gt 0) { $outputTokens } else { $null }
+        reasoning_tokens      = $null
+        total_tokens          = if ($usageApiCalls -gt 0) { $inputTokens + $outputTokens } else { $null }
+        api_calls             = if ($hasApiSpans) { $apiCalls } else { $null }
+        failed_api_calls      = if ($hasApiSpans) { $failedApiCalls } else { $null }
+        usage_api_calls       = if ($hasApiSpans) { $usageApiCalls } else { $null }
+        ai_credits            = if ($hasNanoAiu) { [math]::Round(($nanoAiu / [decimal]1000000000), 9) } else { $null }
+        premium_requests      = $null
+        models                = @($models | Sort-Object)
+        usage_complete        = $usageComplete
+        malformed_records     = $MalformedRecords
+    }
+}
+
+function Save-CopilotRunMetrics {
+    param(
+        [Parameter(Mandatory)][string] $OtelPath,
+        [Parameter(Mandatory)][string] $OutputDir,
+        [object] $WallTimeSeconds = $null
+    )
+
+    $lines = if (Test-Path -LiteralPath $OtelPath -PathType Leaf) {
+        @(Get-Content -LiteralPath $OtelPath -ErrorAction Stop)
+    } else {
+        @()
+    }
+    $parsed = ConvertFrom-CopilotOtelJsonLines -Lines $lines
+    if ($parsed.MalformedRecords -gt 0) {
+        Write-Warning "Ignored $($parsed.MalformedRecords) malformed Copilot OTel record(s) in '$OtelPath'."
+    }
+    $metrics = Get-CopilotRunMetrics `
+        -Records $parsed.Records `
+        -WallTimeSeconds $WallTimeSeconds `
+        -MalformedRecords $parsed.MalformedRecords
+
+    New-Item -ItemType Directory -Path $OutputDir -Force | Out-Null
+    $metricsPath = Join-Path $OutputDir '_run-metrics.json'
+    Set-Content -LiteralPath $metricsPath -Value ($metrics | ConvertTo-Json -Depth 8) -Encoding UTF8
+    return $metrics
+}
+
+function Save-CurrentCopilotRunMetrics {
+    if ($ReviewPhase -eq 'post') { return }
+
+    try {
+        $otelPath = Join-Path $AgentWorkDir '_copilot-otel.jsonl'
+        $elapsedSeconds = ([DateTime]::UtcNow - $ReviewStartedAt).TotalSeconds
+        $null = Save-CopilotRunMetrics `
+            -OtelPath $otelPath `
+            -OutputDir $ReviewOutputDir `
+            -WallTimeSeconds $elapsedSeconds
+    }
+    catch {
+        Write-Warning "Could not save Copilot run metrics: $($_.Exception.Message)"
+    }
+}
+
+function Clear-CopilotMetricsArtifacts {
+    param(
+        [string] $AgentWorkDir,
+        [string] $OutputDir
+    )
+
+    $paths = [System.Collections.Generic.HashSet[string]]::new([System.StringComparer]::OrdinalIgnoreCase)
+    if ($AgentWorkDir) { [void]$paths.Add((Join-Path $AgentWorkDir '_copilot-otel.jsonl')) }
+    if ($OutputDir) { [void]$paths.Add((Join-Path $OutputDir '_run-metrics.json')) }
+    foreach ($path in $paths) {
+        if (Test-Path -LiteralPath $path -PathType Leaf) {
+            try {
+                Remove-Item -LiteralPath $path -Force -ErrorAction Stop
+            }
+            catch {
+                Write-Warning "Could not remove stale metrics artifact '$path': $($_.Exception.Message)"
+            }
+        }
     }
 }
 
@@ -1289,6 +1488,11 @@ function Invoke-CopilotCli {
         -CopilotToken $CopilotToken `
         -CopilotGithubToken $CopilotGithubToken `
         -CiValue ([System.Environment]::GetEnvironmentVariable('CI'))
+    $copilotOtelPath = Join-Path $AgentWorkDir $CopilotOtelFileName
+    $cleanEnv['COPILOT_OTEL_ENABLED'] = 'true'
+    $cleanEnv['COPILOT_OTEL_EXPORTER_TYPE'] = 'file'
+    $cleanEnv['COPILOT_OTEL_FILE_EXPORTER_PATH'] = $copilotOtelPath
+    $cleanEnv['OTEL_INSTRUMENTATION_GENAI_CAPTURE_MESSAGE_CONTENT'] = 'false'
 
     $transcriptBuilder = [System.Text.StringBuilder]::new()
     $process   = $null
@@ -1394,6 +1598,7 @@ function Invoke-CopilotCli {
         return $output
     }
     finally {
+        Save-CurrentCopilotRunMetrics
         if ($process) { $process.Dispose() }
     }
 }
@@ -3217,6 +3422,9 @@ function Save-ReviewArtifacts {
         Set-Content -Path $transcriptPath -Value $Transcript -Encoding UTF8
         $savedFiles.Add('agent-transcript.log') | Out-Null
     }
+    if (Test-Path -LiteralPath (Join-Path $ReviewOutputDir '_run-metrics.json') -PathType Leaf) {
+        $savedFiles.Add('_run-metrics.json') | Out-Null
+    }
 
     Write-Host "Saved review artifacts to $ReviewOutputDir"
     foreach ($f in $savedFiles) { Write-LogPhaseDetail "- $f" }
@@ -3272,7 +3480,10 @@ Write-Host ''
 # running it after Discovery (as before) deleted the freshly written changed-file
 # manifest and object index, leaving a read-only generate agent with no worklist.
 # Post never writes these artifacts, so guard on phase.
-if ($ReviewPhase -ne 'post') { Clear-BCQualityRunArtifacts }
+if ($ReviewPhase -ne 'post') {
+    Clear-CopilotMetricsArtifacts -AgentWorkDir $AgentWorkDir -OutputDir $ReviewOutputDir
+    Clear-BCQualityRunArtifacts
+}
 
 # --- Phase 1: Discovery -----------------------------------------------------
 Write-LogGroup 'Discovery'
@@ -3412,6 +3623,7 @@ if ($ReviewPhase -ne 'post') {
     }
 
     if ($ReviewPhase -eq 'generate') {
+        Save-CurrentCopilotRunMetrics
         Write-LogNotice 'Generate phase complete' "Saved agent output to $AgentOutputFile; posting deferred to the publish phase."
         Write-Host 'Review (generate phase) complete.'
         return
@@ -3511,6 +3723,7 @@ if ($FailOnParseError -and $report.Outcome -eq 'failed' -and $script:LastParsing
 }
 
 if ($ReviewSource -eq 'local') {
+    Save-CurrentCopilotRunMetrics
     Write-Host "Local review complete: findings saved to $ReviewOutputDir; posting skipped (REVIEW_SOURCE=local)."
     return
 }
@@ -3547,6 +3760,7 @@ if ($PostSummaryComment) {
 Pop-LogGroup
 
 # --- Finalize ---------------------------------------------------------------
+Save-CurrentCopilotRunMetrics
 $totalPosted = 0
 foreach ($entry in $domainSummary.Values) { $totalPosted += [int]$entry.inline + [int]$entry.fallback }
 $domainCount = $domainSummary.Count

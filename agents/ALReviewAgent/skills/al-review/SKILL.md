@@ -123,9 +123,11 @@ a 30-minute cap built in. Stream output so the user sees progress.
 After completion, read two files from `<OutputDir>` (default `<RepoPath>/.bc-review/`):
 
 - `_review-report.json` - findings (BCQuality skills contract)
-- `_run-metrics.json` - `wall_time_display`, `prompt_tokens`,
-  `completion_tokens`, `total_tokens`, `estimated_credits`, `model`, and
-  `metrics_source`
+- `_run-metrics.json` - schema-versioned structured usage from the Copilot CLI
+  OTel exporter: `wall_time_seconds`, token totals, actual `api_calls`,
+  exact `ai_credits`, `models`, and source/completeness fields. Nullable
+  metrics such as `reasoning_tokens` and `premium_requests` were not exposed by
+  the verified CLI contract and must not be inferred from transcript text.
 
 Present a clean, scannable report using this exact structure. Lead with a
 one-line verdict so the user gets the headline before any detail.
