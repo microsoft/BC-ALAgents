@@ -16,10 +16,16 @@ BeforeAll {
     $wantedFunctions = @(
         'Get-ObjectPropertyValue',
         'ConvertFrom-CopilotOtelJsonLines',
+        'Test-CopilotNumericValue',
+        'ConvertTo-CopilotNonNegativeInt64',
+        'ConvertTo-CopilotNonNegativeDecimal',
+        'Get-CopilotNumericAttribute',
         'Get-CopilotRunMetrics',
+        'Remove-CopilotOtelFile',
         'Read-CopilotOtelFile',
         'Save-CopilotRunMetrics',
         'Save-CurrentCopilotRunMetrics',
+        'Complete-CopilotProcess',
         'Clear-CopilotMetricsArtifacts'
     )
     $ast.FindAll({
@@ -191,6 +197,43 @@ Describe 'Get-CopilotRunMetrics' {
         $metrics.ai_credits | Should -BeNullOrEmpty
         $metrics.premium_requests | Should -BeNullOrEmpty
     }
+
+    It 'skips malformed structured spans while preserving valid usage' {
+        $invalidAttributes = @(
+            @{ Name = 'gen_ai.usage.input_tokens'; Value = 'invalid' },
+            @{ Name = 'gen_ai.usage.input_tokens'; Value = '10' },
+            @{ Name = 'gen_ai.usage.output_tokens'; Value = -1 },
+            @{ Name = 'gen_ai.usage.cache_read.input_tokens'; Value = 1.5 },
+            @{ Name = 'gen_ai.usage.cache_creation.input_tokens'; Value = 'invalid' },
+            @{ Name = 'gen_ai.usage.reasoning.output_tokens'; Value = 'invalid' },
+            @{ Name = 'github.copilot.nano_aiu'; Value = 'invalid' },
+            @{ Name = 'github.copilot.cost'; Value = -0.5 }
+        )
+        $records = [System.Collections.Generic.List[object]]::new()
+        $records.Add((New-ChatSpan -Model 'gpt-5.6-sol' -InputTokens 25 -OutputTokens 5 `
+            -NanoAiu 100000000 -PremiumRequests 1))
+        foreach ($invalid in $invalidAttributes) {
+            $span = New-ChatSpan -Model 'invalid-model' -InputTokens 10 -OutputTokens 2 `
+                -CachedTokens 5 -CacheCreationTokens 5 -ReasoningTokens 1 `
+                -NanoAiu 100000000 -PremiumRequests 1
+            $span.attributes.PSObject.Properties[$invalid.Name].Value = $invalid.Value
+            $records.Add($span)
+        }
+        $invalidStatus = New-ChatSpan -Model 'invalid-status' -InputTokens 10 -OutputTokens 2 `
+            -NanoAiu 100000000 -PremiumRequests 1
+        $invalidStatus.status.code = 'invalid'
+        $records.Add($invalidStatus)
+
+        $metrics = Get-CopilotRunMetrics -Records @($records) -MalformedRecords 2
+
+        $metrics.api_calls | Should -Be 1
+        $metrics.prompt_tokens | Should -Be 25
+        $metrics.completion_tokens | Should -Be 5
+        $metrics.ai_credits | Should -Be 0.1
+        $metrics.premium_requests | Should -Be 1
+        $metrics.models | Should -Be @('gpt-5.6-sol')
+        $metrics.malformed_records | Should -Be 11
+    }
 }
 
 Describe 'ConvertFrom-CopilotOtelJsonLines' {
@@ -233,6 +276,102 @@ Describe 'Copilot metrics artifact lifecycle' {
         $saved.premium_requests | Should -Be 1
         $otelPath | Should -Not -Exist
         (Join-Path $outputDir '_copilot-otel.jsonl') | Should -Not -Exist
+    }
+
+    It 'retries transient raw OTel deletion failures' {
+        $otelPath = Join-Path $TestDrive 'retry-delete-otel.jsonl'
+        '{}' | Set-Content -LiteralPath $otelPath
+        $script:removeAttempts = 0
+        Mock Remove-Item {
+            param($LiteralPath, $Force, $ErrorAction)
+            $script:removeAttempts++
+            if ($script:removeAttempts -eq 1) { throw 'file is still locked' }
+            [System.IO.File]::Delete($LiteralPath)
+        }
+        Mock Start-Sleep {}
+
+        Remove-CopilotOtelFile -OtelPath $otelPath -RetryDelayMilliseconds 1
+
+        $otelPath | Should -Not -Exist
+        Should -Invoke Remove-Item -Times 2
+        Should -Invoke Start-Sleep -Times 1
+    }
+
+    It 'terminates and disposes the process before harvesting timeout telemetry' {
+        $otelPath = Join-Path $TestDrive 'timeout-otel.jsonl'
+        '{}' | Set-Content -LiteralPath $otelPath
+        $events = [System.Collections.Generic.List[string]]::new()
+        $fakeProcess = [pscustomobject]@{
+            HasExited = $false
+            Events = $events
+        }
+        $fakeProcess | Add-Member -MemberType ScriptMethod -Name Kill -Value {
+            param([bool] $EntireProcessTree)
+            $this.Events.Add('kill')
+        }
+        $fakeProcess | Add-Member -MemberType ScriptMethod -Name WaitForExit -Value {
+            param([int] $Milliseconds)
+            $this.Events.Add("wait:$Milliseconds")
+            $this.HasExited = $true
+            return $true
+        }
+        $fakeProcess | Add-Member -MemberType ScriptMethod -Name Dispose -Value {
+            $this.Events.Add('dispose')
+        }
+
+        Complete-CopilotProcess `
+            -Process $fakeProcess `
+            -ProcessStarted $true `
+            -TerminationWaitMilliseconds 25 `
+            -HarvestAction {
+                $events.Add('harvest')
+                $null = Read-CopilotOtelFile -OtelPath $otelPath
+            }
+
+        $events | Should -Be @('kill', 'wait:25', 'dispose', 'harvest')
+        $otelPath | Should -Not -Exist
+    }
+
+    It 'disposes and harvests when an exception occurs before process start' {
+        $otelPath = Join-Path $TestDrive 'startup-failure-otel.jsonl'
+        '{}' | Set-Content -LiteralPath $otelPath
+        $events = [System.Collections.Generic.List[string]]::new()
+        $fakeProcess = [pscustomobject]@{ Events = $events }
+        $fakeProcess | Add-Member -MemberType ScriptMethod -Name Dispose -Value {
+            $this.Events.Add('dispose')
+        }
+
+        Complete-CopilotProcess `
+            -Process $fakeProcess `
+            -ProcessStarted $false `
+            -HarvestAction {
+                $events.Add('harvest')
+                $null = Read-CopilotOtelFile -OtelPath $otelPath
+            }
+
+        $events | Should -Be @('dispose', 'harvest')
+        $otelPath | Should -Not -Exist
+    }
+
+    It 'does not replace the review failure when telemetry harvest also fails' {
+        $events = [System.Collections.Generic.List[string]]::new()
+        $fakeProcess = [pscustomobject]@{ Events = $events }
+        $fakeProcess | Add-Member -MemberType ScriptMethod -Name Dispose -Value {
+            $this.Events.Add('dispose')
+        }
+        Mock Write-Warning {}
+
+        {
+            Complete-CopilotProcess `
+                -Process $fakeProcess `
+                -ProcessStarted $false `
+                -HarvestAction { throw 'harvest failed' }
+        } | Should -Not -Throw
+
+        $events | Should -Be @('dispose')
+        Should -Invoke Write-Warning -Times 1 -ParameterFilter {
+            $Message -match 'Failed to harvest Copilot CLI telemetry'
+        }
     }
 
     It 'reuses cached records after deleting the raw file and only updates wall time' {

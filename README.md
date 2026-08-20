@@ -177,7 +177,8 @@ the provider does not expose them. `ai_credits` is the exact sum of
 exact sum of the legacy premium-request multiplier in `github.copilot.cost`;
 either total is null unless every counted span exposes its source attribute.
 `usage_complete` is false when any counted request lacks input/output usage.
-Malformed OTel records are ignored and counted in `malformed_records`.
+Invalid JSON lines and `chat` spans with invalid numeric/status attributes are
+ignored independently and counted in `malformed_records`.
 
 The OTel contract and attribute names were validated end to end with an isolated,
 auto-update-disabled Copilot CLI `1.0.79` invocation. The raw JSONL is created

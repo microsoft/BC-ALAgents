@@ -1010,6 +1010,93 @@ function ConvertFrom-CopilotOtelJsonLines {
     }
 }
 
+function Test-CopilotNumericValue {
+    param([Parameter(Mandatory)][object] $Value)
+
+    $numericTypeCodes = @(
+        [System.TypeCode]::Byte,
+        [System.TypeCode]::SByte,
+        [System.TypeCode]::Int16,
+        [System.TypeCode]::UInt16,
+        [System.TypeCode]::Int32,
+        [System.TypeCode]::UInt32,
+        [System.TypeCode]::Int64,
+        [System.TypeCode]::UInt64,
+        [System.TypeCode]::Single,
+        [System.TypeCode]::Double,
+        [System.TypeCode]::Decimal
+    )
+    return [System.Type]::GetTypeCode($Value.GetType()) -in $numericTypeCodes
+}
+
+function ConvertTo-CopilotNonNegativeInt64 {
+    param(
+        [Parameter(Mandatory)][object] $Value,
+        [Parameter(Mandatory)][string] $AttributeName
+    )
+
+    if (-not (Test-CopilotNumericValue -Value $Value)) {
+        throw "Copilot OTel attribute '$AttributeName' must be a numeric JSON value."
+    }
+
+    $parsed = 0L
+    $text = [System.Convert]::ToString($Value, [System.Globalization.CultureInfo]::InvariantCulture)
+    if (
+        -not [int64]::TryParse(
+            $text,
+            [System.Globalization.NumberStyles]::Integer,
+            [System.Globalization.CultureInfo]::InvariantCulture,
+            [ref]$parsed
+        ) -or
+        $parsed -lt 0
+    ) {
+        throw "Copilot OTel attribute '$AttributeName' must be a non-negative integer."
+    }
+    return $parsed
+}
+
+function ConvertTo-CopilotNonNegativeDecimal {
+    param(
+        [Parameter(Mandatory)][object] $Value,
+        [Parameter(Mandatory)][string] $AttributeName
+    )
+
+    if (-not (Test-CopilotNumericValue -Value $Value)) {
+        throw "Copilot OTel attribute '$AttributeName' must be a numeric JSON value."
+    }
+
+    $parsed = [decimal]0
+    $text = [System.Convert]::ToString($Value, [System.Globalization.CultureInfo]::InvariantCulture)
+    if (
+        -not [decimal]::TryParse(
+            $text,
+            [System.Globalization.NumberStyles]::Float,
+            [System.Globalization.CultureInfo]::InvariantCulture,
+            [ref]$parsed
+        ) -or
+        $parsed -lt 0
+    ) {
+        throw "Copilot OTel attribute '$AttributeName' must be a non-negative number."
+    }
+    return $parsed
+}
+
+function Get-CopilotNumericAttribute {
+    param(
+        [object] $InputObject,
+        [Parameter(Mandatory)][string] $Name,
+        [ValidateSet('Integer', 'Decimal')][string] $Kind = 'Integer',
+        [string] $DisplayName = $Name
+    )
+
+    $value = Get-ObjectPropertyValue -InputObject $InputObject -Name $Name
+    if ($null -eq $value) { return $null }
+    if ($Kind -eq 'Decimal') {
+        return ConvertTo-CopilotNonNegativeDecimal -Value $value -AttributeName $DisplayName
+    }
+    return ConvertTo-CopilotNonNegativeInt64 -Value $value -AttributeName $DisplayName
+}
+
 function Get-CopilotRunMetrics {
     param(
         [object[]] $Records = @(),
@@ -1032,6 +1119,7 @@ function Get-CopilotRunMetrics {
     $hasReasoningTokens = $false
     $nanoAiuApiCalls = 0
     $premiumRequestApiCalls = 0
+    $invalidStructuredRecords = 0
     $models = [System.Collections.Generic.HashSet[string]]::new([System.StringComparer]::Ordinal)
     $cliVersions = [System.Collections.Generic.HashSet[string]]::new([System.StringComparer]::Ordinal)
 
@@ -1047,49 +1135,66 @@ function Get-CopilotRunMetrics {
         }
         if ($operation -ne 'chat') { continue }
 
-        $apiCalls++
-        $status = Get-ObjectPropertyValue -InputObject $record -Name 'status'
-        if ((Get-ObjectPropertyValue -InputObject $status -Name 'code') -eq 2) {
-            $failedApiCalls++
+        try {
+            $status = Get-ObjectPropertyValue -InputObject $record -Name 'status'
+            $statusCode = Get-CopilotNumericAttribute `
+                -InputObject $status `
+                -Name 'code' `
+                -DisplayName 'status.code'
+            if ($null -ne $statusCode -and $statusCode -gt 2) {
+                throw "Copilot OTel attribute 'status.code' must be 0, 1, or 2."
+            }
+
+            $parsedInput = Get-CopilotNumericAttribute -InputObject $attributes -Name 'gen_ai.usage.input_tokens'
+            $parsedOutput = Get-CopilotNumericAttribute -InputObject $attributes -Name 'gen_ai.usage.output_tokens'
+            $parsedCached = Get-CopilotNumericAttribute -InputObject $attributes -Name 'gen_ai.usage.cache_read.input_tokens'
+            $parsedCacheCreation = Get-CopilotNumericAttribute -InputObject $attributes -Name 'gen_ai.usage.cache_creation.input_tokens'
+            $parsedReasoning = Get-CopilotNumericAttribute -InputObject $attributes -Name 'gen_ai.usage.reasoning.output_tokens'
+            $parsedNanoAiu = Get-CopilotNumericAttribute `
+                -InputObject $attributes `
+                -Name 'github.copilot.nano_aiu' `
+                -Kind 'Decimal'
+            $parsedPremiumRequests = Get-CopilotNumericAttribute `
+                -InputObject $attributes `
+                -Name 'github.copilot.cost' `
+                -Kind 'Decimal'
+        }
+        catch {
+            $invalidStructuredRecords++
+            continue
         }
 
+        $apiCalls++
+        if ($statusCode -eq 2) { $failedApiCalls++ }
         $model = [string](Get-ObjectPropertyValue -InputObject $attributes -Name 'gen_ai.response.model')
         if (-not $model) {
             $model = [string](Get-ObjectPropertyValue -InputObject $attributes -Name 'gen_ai.request.model')
         }
         if ($model) { [void]$models.Add($model) }
 
-        $inputValue = Get-ObjectPropertyValue -InputObject $attributes -Name 'gen_ai.usage.input_tokens'
-        $outputValue = Get-ObjectPropertyValue -InputObject $attributes -Name 'gen_ai.usage.output_tokens'
-        if ($null -ne $inputValue -and $null -ne $outputValue) {
-            $inputTokens += [int64]$inputValue
-            $outputTokens += [int64]$outputValue
+        if ($null -ne $parsedInput -and $null -ne $parsedOutput) {
+            $inputTokens += $parsedInput
+            $outputTokens += $parsedOutput
             $usageApiCalls++
         }
-
-        $cachedValue = Get-ObjectPropertyValue -InputObject $attributes -Name 'gen_ai.usage.cache_read.input_tokens'
-        if ($null -ne $cachedValue) {
-            $cachedTokens += [int64]$cachedValue
+        if ($null -ne $parsedCached) {
+            $cachedTokens += $parsedCached
             $hasCachedTokens = $true
         }
-        $cacheCreationValue = Get-ObjectPropertyValue -InputObject $attributes -Name 'gen_ai.usage.cache_creation.input_tokens'
-        if ($null -ne $cacheCreationValue) {
-            $cacheCreationTokens += [int64]$cacheCreationValue
+        if ($null -ne $parsedCacheCreation) {
+            $cacheCreationTokens += $parsedCacheCreation
             $hasCacheCreationTokens = $true
         }
-        $reasoningValue = Get-ObjectPropertyValue -InputObject $attributes -Name 'gen_ai.usage.reasoning.output_tokens'
-        if ($null -ne $reasoningValue) {
-            $reasoningTokens += [int64]$reasoningValue
+        if ($null -ne $parsedReasoning) {
+            $reasoningTokens += $parsedReasoning
             $hasReasoningTokens = $true
         }
-        $nanoAiuValue = Get-ObjectPropertyValue -InputObject $attributes -Name 'github.copilot.nano_aiu'
-        if ($null -ne $nanoAiuValue) {
-            $nanoAiu += [decimal]$nanoAiuValue
+        if ($null -ne $parsedNanoAiu) {
+            $nanoAiu += $parsedNanoAiu
             $nanoAiuApiCalls++
         }
-        $premiumRequestValue = Get-ObjectPropertyValue -InputObject $attributes -Name 'github.copilot.cost'
-        if ($null -ne $premiumRequestValue) {
-            $premiumRequests += [decimal]$premiumRequestValue
+        if ($null -ne $parsedPremiumRequests) {
+            $premiumRequests += $parsedPremiumRequests
             $premiumRequestApiCalls++
         }
     }
@@ -1123,7 +1228,27 @@ function Get-CopilotRunMetrics {
         }
         models                = @($models | Sort-Object)
         usage_complete        = $usageComplete
-        malformed_records     = $MalformedRecords
+        malformed_records     = $MalformedRecords + $invalidStructuredRecords
+    }
+}
+
+function Remove-CopilotOtelFile {
+    param(
+        [Parameter(Mandatory)][string] $OtelPath,
+        [int] $MaxAttempts = 5,
+        [int] $RetryDelayMilliseconds = 100
+    )
+
+    for ($attempt = 1; $attempt -le $MaxAttempts; $attempt++) {
+        if (-not (Test-Path -LiteralPath $OtelPath -PathType Leaf)) { return }
+        try {
+            Remove-Item -LiteralPath $OtelPath -Force -ErrorAction Stop
+            return
+        }
+        catch {
+            if ($attempt -eq $MaxAttempts) { throw }
+            Start-Sleep -Milliseconds $RetryDelayMilliseconds
+        }
     }
 }
 
@@ -1139,9 +1264,7 @@ function Read-CopilotOtelFile {
         return ConvertFrom-CopilotOtelJsonLines -Lines $lines
     }
     finally {
-        if (Test-Path -LiteralPath $OtelPath -PathType Leaf) {
-            Remove-Item -LiteralPath $OtelPath -Force -ErrorAction Stop
-        }
+        Remove-CopilotOtelFile -OtelPath $OtelPath
     }
 }
 
@@ -1192,6 +1315,51 @@ function Save-CurrentCopilotRunMetrics {
     }
     catch {
         Write-Warning "Could not save Copilot run metrics: $($_.Exception.Message)"
+    }
+}
+
+function Complete-CopilotProcess {
+    param(
+        [object] $Process,
+        [bool] $ProcessStarted,
+        [Parameter(Mandatory)][scriptblock] $HarvestAction,
+        [int] $TerminationWaitMilliseconds = 10000
+    )
+
+    try {
+        if ($Process -and $ProcessStarted -and -not $Process.HasExited) {
+            try {
+                $Process.Kill($true)
+            }
+            catch {
+                try {
+                    if (-not $Process.HasExited) { $Process.Kill() }
+                }
+                catch {
+                    Write-Warning "Failed to terminate Copilot CLI process: $($_.Exception.Message)"
+                }
+            }
+
+            try {
+                if (-not $Process.WaitForExit($TerminationWaitMilliseconds)) {
+                    Write-Warning "Copilot CLI did not terminate within $TerminationWaitMilliseconds ms after kill."
+                }
+            }
+            catch {
+                Write-Warning "Failed while waiting for Copilot CLI termination: $($_.Exception.Message)"
+            }
+        }
+    }
+    catch {
+        Write-Warning "Failed during Copilot CLI process cleanup: $($_.Exception.Message)"
+    }
+    finally {
+        if ($Process) {
+            try { $Process.Dispose() }
+            catch { Write-Warning "Failed to dispose Copilot CLI process: $($_.Exception.Message)" }
+        }
+        try { & $HarvestAction }
+        catch { Write-Warning "Failed to harvest Copilot CLI telemetry: $($_.Exception.Message)" }
     }
 }
 
@@ -1555,6 +1723,7 @@ function Invoke-CopilotCli {
 
     $transcriptBuilder = [System.Text.StringBuilder]::new()
     $process   = $null
+    $processStarted = $false
     $startedAt = [DateTime]::UtcNow
 
     try {
@@ -1603,6 +1772,7 @@ function Invoke-CopilotCli {
         # is closed (i.e. the child has exited and flushed). Waiting on
         # them after WaitForExit() guarantees we have the full output.
         $null = $process.Start()
+        $processStarted = $true
         $stdoutTask = $process.StandardOutput.ReadToEndAsync()
         $stderrTask = $process.StandardError.ReadToEndAsync()
         if ($CopilotCliTimeoutMinutes -eq 0) {
@@ -1614,7 +1784,6 @@ function Invoke-CopilotCli {
             $completed = $process.WaitForExit($timeoutMs)
         }
         if (-not $completed) {
-            try { $process.Kill($true) } catch { Write-Error "Failed to terminate timed out Copilot CLI process: $($_.Exception.Message)" }
             throw "Copilot CLI timed out after $CopilotCliTimeoutMinutes minutes."
         }
 
@@ -1657,8 +1826,10 @@ function Invoke-CopilotCli {
         return $output
     }
     finally {
-        Save-CurrentCopilotRunMetrics
-        if ($process) { $process.Dispose() }
+        Complete-CopilotProcess `
+            -Process $process `
+            -ProcessStarted $processStarted `
+            -HarvestAction { Save-CurrentCopilotRunMetrics }
     }
 }
 
