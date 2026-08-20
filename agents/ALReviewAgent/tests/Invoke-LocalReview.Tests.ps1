@@ -15,7 +15,8 @@ BeforeAll {
 
     $wantedFunctions = @(
         'Get-AlReviewFilePaths',
-        'ConvertFrom-GitNameStatus'
+        'ConvertFrom-GitNameStatus',
+        'New-NotApplicableRunMetrics'
     )
     $ast.FindAll({
         param($node)
@@ -119,6 +120,42 @@ Describe 'No-AL review preflight' {
         $source | Should -Match "'--name-status', '--find-renames'"
         $source | Should -Match "'--diff-filter=ACMRTD'"
         $source | Should -Match "metrics_source\s+=\s+'not-applicable'"
+    }
+
+    It 'emits the complete schema with exact zero use and unsupported null fields' {
+        $metrics = New-NotApplicableRunMetrics
+
+        $metrics.PSObject.Properties.Name | Should -Be @(
+            'schema_version',
+            'metrics_source',
+            'cli_version',
+            'wall_time_seconds',
+            'prompt_tokens',
+            'cached_tokens',
+            'cache_creation_tokens',
+            'completion_tokens',
+            'reasoning_tokens',
+            'total_tokens',
+            'api_calls',
+            'failed_api_calls',
+            'usage_api_calls',
+            'ai_credits',
+            'premium_requests',
+            'models',
+            'usage_complete',
+            'malformed_records'
+        )
+        $metrics.metrics_source | Should -Be 'not-applicable'
+        $metrics.prompt_tokens | Should -Be 0
+        $metrics.cached_tokens | Should -Be 0
+        $metrics.cache_creation_tokens | Should -Be 0
+        $metrics.completion_tokens | Should -Be 0
+        $metrics.total_tokens | Should -Be 0
+        $metrics.api_calls | Should -Be 0
+        $metrics.ai_credits | Should -Be 0
+        $metrics.reasoning_tokens | Should -BeNullOrEmpty
+        $metrics.premium_requests | Should -BeNullOrEmpty
+        $metrics.usage_complete | Should -BeTrue
     }
 }
 

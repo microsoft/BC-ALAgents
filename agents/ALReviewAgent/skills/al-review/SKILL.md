@@ -125,9 +125,9 @@ After completion, read two files from `<OutputDir>` (default `<RepoPath>/.bc-rev
 - `_review-report.json` - findings (BCQuality skills contract)
 - `_run-metrics.json` - schema-versioned structured usage from the Copilot CLI
   OTel exporter: `wall_time_seconds`, token totals, actual `api_calls`,
-  exact `ai_credits`, `models`, and source/completeness fields. Nullable
-  metrics such as `reasoning_tokens` and `premium_requests` were not exposed by
-  the verified CLI contract and must not be inferred from transcript text.
+  exact `ai_credits` or legacy `premium_requests`, `models`, and
+  source/completeness fields. Nullable metrics were not exposed by every
+  counted request and must not be inferred from transcript text.
 
 Present a clean, scannable report using this exact structure. Lead with a
 one-line verdict so the user gets the headline before any detail.
@@ -188,9 +188,8 @@ and next steps:
 
 Use thousands separators. Credits are AI-credit units, not USD. Omit the model
 row when `model` is empty. Omit cached or reasoning rows when their values are
-zero or unavailable. When `metrics_source` is `unavailable`, show `Unavailable`
-for token and credit values rather than displaying zeros or replacing the table
-with prose.
+zero or unavailable. When `metrics_source` is `not-applicable`, show the exact zero token, request,
+and credit values and omit unsupported nullable rows.
 
 Keep the whole thing compact - tables and one-line bullets, no walls of
 prose. The user can drill into any finding on request.

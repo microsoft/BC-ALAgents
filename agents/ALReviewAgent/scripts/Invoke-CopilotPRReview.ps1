@@ -168,7 +168,13 @@ $BaseUrl          = "https://api.github.com/repos/$Repository"
 # for local development.
 $ReviewPhase      = (($env:REVIEW_PHASE ?? 'all') + '').Trim().ToLowerInvariant()
 $AgentOutputFile  = 'agent-output.txt'
-$CopilotOtelFileName = '_copilot-otel.jsonl'
+$CopilotOtelPath  = if ($ReviewPhase -eq 'post') {
+    $null
+} else {
+    Join-Path ([System.IO.Path]::GetTempPath()) (
+        'bc-al-review-copilot-otel-{0}.jsonl' -f [guid]::NewGuid().ToString('N')
+    )
+}
 $ReviewStartedAt  = [DateTime]::UtcNow
 
 # Deterministic file the model writes its final JSON findings-report to, inside
@@ -215,6 +221,8 @@ $script:LastParsingErrors = [System.Collections.Generic.List[string]]::new()
 $script:FilterReport      = $null   # populated from BCQUALITY_ROOT/_filter-report.json
 $script:BCQualityWebRepoUrl = $null # cached BCQuality web URL for reference links
 $script:AgentTranscript   = ''      # interleaved Copilot CLI transcript (set by Invoke-CopilotCli)
+$script:CopilotOtelRecords = $null  # cached after the raw temporary JSONL is deleted
+$script:CopilotOtelMalformedRecords = 0
 
 # ---------------------------------------------------------------------------
 # Logging helpers
@@ -1016,10 +1024,14 @@ function Get-CopilotRunMetrics {
     $outputTokens = 0L
     $cachedTokens = 0L
     $cacheCreationTokens = 0L
+    $reasoningTokens = 0L
     $nanoAiu = [decimal]0
+    $premiumRequests = [decimal]0
     $hasCachedTokens = $false
     $hasCacheCreationTokens = $false
-    $hasNanoAiu = $false
+    $hasReasoningTokens = $false
+    $nanoAiuApiCalls = 0
+    $premiumRequestApiCalls = 0
     $models = [System.Collections.Generic.HashSet[string]]::new([System.StringComparer]::Ordinal)
     $cliVersions = [System.Collections.Generic.HashSet[string]]::new([System.StringComparer]::Ordinal)
 
@@ -1065,10 +1077,20 @@ function Get-CopilotRunMetrics {
             $cacheCreationTokens += [int64]$cacheCreationValue
             $hasCacheCreationTokens = $true
         }
+        $reasoningValue = Get-ObjectPropertyValue -InputObject $attributes -Name 'gen_ai.usage.reasoning.output_tokens'
+        if ($null -ne $reasoningValue) {
+            $reasoningTokens += [int64]$reasoningValue
+            $hasReasoningTokens = $true
+        }
         $nanoAiuValue = Get-ObjectPropertyValue -InputObject $attributes -Name 'github.copilot.nano_aiu'
         if ($null -ne $nanoAiuValue) {
             $nanoAiu += [decimal]$nanoAiuValue
-            $hasNanoAiu = $true
+            $nanoAiuApiCalls++
+        }
+        $premiumRequestValue = Get-ObjectPropertyValue -InputObject $attributes -Name 'github.copilot.cost'
+        if ($null -ne $premiumRequestValue) {
+            $premiumRequests += [decimal]$premiumRequestValue
+            $premiumRequestApiCalls++
         }
     }
 
@@ -1084,39 +1106,57 @@ function Get-CopilotRunMetrics {
         cached_tokens         = if ($hasCachedTokens) { $cachedTokens } else { $null }
         cache_creation_tokens = if ($hasCacheCreationTokens) { $cacheCreationTokens } else { $null }
         completion_tokens     = if ($usageApiCalls -gt 0) { $outputTokens } else { $null }
-        reasoning_tokens      = $null
+        reasoning_tokens      = if ($hasReasoningTokens) { $reasoningTokens } else { $null }
         total_tokens          = if ($usageApiCalls -gt 0) { $inputTokens + $outputTokens } else { $null }
         api_calls             = if ($hasApiSpans) { $apiCalls } else { $null }
         failed_api_calls      = if ($hasApiSpans) { $failedApiCalls } else { $null }
         usage_api_calls       = if ($hasApiSpans) { $usageApiCalls } else { $null }
-        ai_credits            = if ($hasNanoAiu) { [math]::Round(($nanoAiu / [decimal]1000000000), 9) } else { $null }
-        premium_requests      = $null
+        ai_credits            = if ($hasApiSpans -and $nanoAiuApiCalls -eq $apiCalls) {
+            [math]::Round(($nanoAiu / [decimal]1000000000), 9)
+        } else {
+            $null
+        }
+        premium_requests      = if ($hasApiSpans -and $premiumRequestApiCalls -eq $apiCalls) {
+            [math]::Round($premiumRequests, 9)
+        } else {
+            $null
+        }
         models                = @($models | Sort-Object)
         usage_complete        = $usageComplete
         malformed_records     = $MalformedRecords
     }
 }
 
+function Read-CopilotOtelFile {
+    param([Parameter(Mandatory)][string] $OtelPath)
+
+    try {
+        $lines = if (Test-Path -LiteralPath $OtelPath -PathType Leaf) {
+            @(Get-Content -LiteralPath $OtelPath -ErrorAction Stop)
+        } else {
+            @()
+        }
+        return ConvertFrom-CopilotOtelJsonLines -Lines $lines
+    }
+    finally {
+        if (Test-Path -LiteralPath $OtelPath -PathType Leaf) {
+            Remove-Item -LiteralPath $OtelPath -Force -ErrorAction Stop
+        }
+    }
+}
+
 function Save-CopilotRunMetrics {
     param(
-        [Parameter(Mandatory)][string] $OtelPath,
+        [object[]] $Records = @(),
         [Parameter(Mandatory)][string] $OutputDir,
-        [object] $WallTimeSeconds = $null
+        [object] $WallTimeSeconds = $null,
+        [int] $MalformedRecords = 0
     )
 
-    $lines = if (Test-Path -LiteralPath $OtelPath -PathType Leaf) {
-        @(Get-Content -LiteralPath $OtelPath -ErrorAction Stop)
-    } else {
-        @()
-    }
-    $parsed = ConvertFrom-CopilotOtelJsonLines -Lines $lines
-    if ($parsed.MalformedRecords -gt 0) {
-        Write-Warning "Ignored $($parsed.MalformedRecords) malformed Copilot OTel record(s) in '$OtelPath'."
-    }
     $metrics = Get-CopilotRunMetrics `
-        -Records $parsed.Records `
+        -Records $Records `
         -WallTimeSeconds $WallTimeSeconds `
-        -MalformedRecords $parsed.MalformedRecords
+        -MalformedRecords $MalformedRecords
 
     New-Item -ItemType Directory -Path $OutputDir -Force | Out-Null
     $metricsPath = Join-Path $OutputDir '_run-metrics.json'
@@ -1128,12 +1168,27 @@ function Save-CurrentCopilotRunMetrics {
     if ($ReviewPhase -eq 'post') { return }
 
     try {
-        $otelPath = Join-Path $AgentWorkDir '_copilot-otel.jsonl'
+        if (Test-Path -LiteralPath $CopilotOtelPath -PathType Leaf) {
+            $parsed = Read-CopilotOtelFile -OtelPath $CopilotOtelPath
+            $existingRecords = if ($null -eq $script:CopilotOtelRecords) {
+                @()
+            } else {
+                @($script:CopilotOtelRecords)
+            }
+            $script:CopilotOtelRecords = @($existingRecords) + @($parsed.Records)
+            $script:CopilotOtelMalformedRecords += $parsed.MalformedRecords
+            if ($parsed.MalformedRecords -gt 0) {
+                Write-Warning "Ignored $($parsed.MalformedRecords) malformed Copilot OTel record(s)."
+            }
+        } elseif ($null -eq $script:CopilotOtelRecords) {
+            $script:CopilotOtelRecords = @()
+        }
         $elapsedSeconds = ([DateTime]::UtcNow - $ReviewStartedAt).TotalSeconds
         $null = Save-CopilotRunMetrics `
-            -OtelPath $otelPath `
+            -Records $script:CopilotOtelRecords `
             -OutputDir $ReviewOutputDir `
-            -WallTimeSeconds $elapsedSeconds
+            -WallTimeSeconds $elapsedSeconds `
+            -MalformedRecords $script:CopilotOtelMalformedRecords
     }
     catch {
         Write-Warning "Could not save Copilot run metrics: $($_.Exception.Message)"
@@ -1143,12 +1198,17 @@ function Save-CurrentCopilotRunMetrics {
 function Clear-CopilotMetricsArtifacts {
     param(
         [string] $AgentWorkDir,
-        [string] $OutputDir
+        [string] $OutputDir,
+        [string] $OtelPath
     )
 
     $paths = [System.Collections.Generic.HashSet[string]]::new([System.StringComparer]::OrdinalIgnoreCase)
+    if ($OtelPath) { [void]$paths.Add($OtelPath) }
     if ($AgentWorkDir) { [void]$paths.Add((Join-Path $AgentWorkDir '_copilot-otel.jsonl')) }
-    if ($OutputDir) { [void]$paths.Add((Join-Path $OutputDir '_run-metrics.json')) }
+    if ($OutputDir) {
+        [void]$paths.Add((Join-Path $OutputDir '_run-metrics.json'))
+        [void]$paths.Add((Join-Path $OutputDir '_copilot-otel.jsonl'))
+    }
     foreach ($path in $paths) {
         if (Test-Path -LiteralPath $path -PathType Leaf) {
             try {
@@ -1488,10 +1548,9 @@ function Invoke-CopilotCli {
         -CopilotToken $CopilotToken `
         -CopilotGithubToken $CopilotGithubToken `
         -CiValue ([System.Environment]::GetEnvironmentVariable('CI'))
-    $copilotOtelPath = Join-Path $AgentWorkDir $CopilotOtelFileName
     $cleanEnv['COPILOT_OTEL_ENABLED'] = 'true'
     $cleanEnv['COPILOT_OTEL_EXPORTER_TYPE'] = 'file'
-    $cleanEnv['COPILOT_OTEL_FILE_EXPORTER_PATH'] = $copilotOtelPath
+    $cleanEnv['COPILOT_OTEL_FILE_EXPORTER_PATH'] = $CopilotOtelPath
     $cleanEnv['OTEL_INSTRUMENTATION_GENAI_CAPTURE_MESSAGE_CONTENT'] = 'false'
 
     $transcriptBuilder = [System.Text.StringBuilder]::new()
@@ -3481,7 +3540,10 @@ Write-Host ''
 # manifest and object index, leaving a read-only generate agent with no worklist.
 # Post never writes these artifacts, so guard on phase.
 if ($ReviewPhase -ne 'post') {
-    Clear-CopilotMetricsArtifacts -AgentWorkDir $AgentWorkDir -OutputDir $ReviewOutputDir
+    Clear-CopilotMetricsArtifacts `
+        -AgentWorkDir $AgentWorkDir `
+        -OutputDir $ReviewOutputDir `
+        -OtelPath $CopilotOtelPath
     Clear-BCQualityRunArtifacts
 }
 

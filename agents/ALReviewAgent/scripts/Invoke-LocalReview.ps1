@@ -144,6 +144,29 @@ param(
 Set-StrictMode -Version Latest
 $ErrorActionPreference = 'Stop'
 
+function New-NotApplicableRunMetrics {
+    return [pscustomobject][ordered]@{
+        schema_version        = 1
+        metrics_source        = 'not-applicable'
+        cli_version           = $null
+        wall_time_seconds     = 0
+        prompt_tokens         = 0
+        cached_tokens         = 0
+        cache_creation_tokens = 0
+        completion_tokens     = 0
+        reasoning_tokens      = $null
+        total_tokens          = 0
+        api_calls             = 0
+        failed_api_calls      = 0
+        usage_api_calls       = 0
+        ai_credits            = 0.0
+        premium_requests      = $null
+        models                = @()
+        usage_complete        = $true
+        malformed_records     = 0
+    }
+}
+
 # git's canonical empty-tree SHA: diffing anything against this yields the
 # full tree, so "Existing" mode reviews every tracked file.
 $EmptyTreeSha = '4b825dc642cb6eb9a060e54bf8d69288fbee4904'
@@ -469,26 +492,9 @@ try {
         } | ConvertTo-Json -Depth 8 | Set-Content -LiteralPath $reportPath -Encoding utf8
 
         $metricsPath = Join-Path $OutputDir '_run-metrics.json'
-        [pscustomobject]@{
-            schema_version      = 1
-            metrics_source      = 'not-applicable'
-            cli_version         = $null
-            wall_time_seconds   = 0
-            prompt_tokens       = 0
-            cached_tokens       = 0
-            cache_creation_tokens = 0
-            completion_tokens   = 0
-            reasoning_tokens    = 0
-            total_tokens        = 0
-            api_calls           = 0
-            failed_api_calls    = 0
-            usage_api_calls     = 0
-            ai_credits          = 0.0
-            premium_requests    = 0.0
-            models              = @()
-            usage_complete      = $true
-            malformed_records   = 0
-        } | ConvertTo-Json -Depth 5 | Set-Content -LiteralPath $metricsPath -Encoding utf8
+        New-NotApplicableRunMetrics |
+            ConvertTo-Json -Depth 5 |
+            Set-Content -LiteralPath $metricsPath -Encoding utf8
 
         Write-Host '[local-review] No AL (.al) files found in the selected diff; review skipped.'
         Write-Host "[local-review] Findings: $reportPath"

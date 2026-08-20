@@ -161,19 +161,29 @@ BCQuality checkout via `BCQUALITY_ROOT`, the repo under review via
 invoke `agents/ALReviewAgent/scripts/Invoke-CopilotPRReview.ps1`.
 
 Each generate/all run also writes `_run-metrics.json` to `REVIEW_OUTPUT_DIR`.
-Schema version `1` is sourced only from the Copilot CLI OpenTelemetry file
-exporter. `prompt_tokens` and `completion_tokens` sum the corresponding
-`gen_ai.usage.*` values on every raw `chat` span, including nested agents and
-retries; `total_tokens` is their sum. `api_calls` counts those spans rather than
-conversation turns, and `wall_time_seconds` covers the full engine phase.
-`cached_tokens`, `cache_creation_tokens`, and
-`reasoning_tokens` are nullable because a model/provider may not expose them;
-the currently verified CLI OTel contract does not expose reasoning tokens.
-`ai_credits` is the exact sum of `github.copilot.nano_aiu` divided by 1 billion;
-it is not estimated. `premium_requests` remains null because the OTel span
-contract does not expose that legacy aggregate. `usage_complete` is false when
-any counted request lacks input/output usage. Malformed OTel records are ignored
-and counted in `malformed_records`; no console or transcript text is parsed.
+Schema version `1` has one 18-field shape and two `metrics_source` values:
+`copilot-cli-otel` for executed reviews and `not-applicable` when the local
+preflight skips a diff with no AL files. The latter reports exact zero use;
+provider-dependent `reasoning_tokens` and legacy `premium_requests` remain null.
+
+For executed reviews, `prompt_tokens`, `completion_tokens`, and nullable
+`reasoning_tokens` sum the corresponding `gen_ai.usage.*` values on every raw
+`chat` span, including nested agents, failures, and retries; `total_tokens` is
+input plus output because reasoning is a subtype of output. `api_calls` counts
+those spans rather than conversation turns, and `wall_time_seconds` covers the
+full engine phase. `cached_tokens` and `cache_creation_tokens` are nullable when
+the provider does not expose them. `ai_credits` is the exact sum of
+`github.copilot.nano_aiu` divided by 1 billion, and `premium_requests` is the
+exact sum of the legacy premium-request multiplier in `github.copilot.cost`;
+either total is null unless every counted span exposes its source attribute.
+`usage_complete` is false when any counted request lacks input/output usage.
+Malformed OTel records are ignored and counted in `malformed_records`.
+
+The OTel contract and attribute names were validated end to end with an isolated,
+auto-update-disabled Copilot CLI `1.0.79` invocation. The raw JSONL is created
+under the system temporary directory, message-content capture is disabled, and
+the file is deleted immediately after harvesting; it is never copied to
+`REVIEW_OUTPUT_DIR`. No console or transcript text is parsed.
 
 ## License
 

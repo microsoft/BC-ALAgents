@@ -17,7 +17,9 @@ BeforeAll {
         'Get-ObjectPropertyValue',
         'ConvertFrom-CopilotOtelJsonLines',
         'Get-CopilotRunMetrics',
+        'Read-CopilotOtelFile',
         'Save-CopilotRunMetrics',
+        'Save-CurrentCopilotRunMetrics',
         'Clear-CopilotMetricsArtifacts'
     )
     $ast.FindAll({
@@ -35,7 +37,9 @@ BeforeAll {
             [int64] $OutputTokens,
             [object] $CachedTokens = $null,
             [object] $CacheCreationTokens = $null,
+            [object] $ReasoningTokens = $null,
             [object] $NanoAiu = $null,
+            [object] $PremiumRequests = $null,
             [int] $StatusCode = 0,
             [switch] $WithoutUsage
         )
@@ -55,8 +59,14 @@ BeforeAll {
         if ($null -ne $CacheCreationTokens) {
             $attributes['gen_ai.usage.cache_creation.input_tokens'] = [int64]$CacheCreationTokens
         }
+        if ($null -ne $ReasoningTokens) {
+            $attributes['gen_ai.usage.reasoning.output_tokens'] = [int64]$ReasoningTokens
+        }
         if ($null -ne $NanoAiu) {
             $attributes['github.copilot.nano_aiu'] = [decimal]$NanoAiu
+        }
+        if ($null -ne $PremiumRequests) {
+            $attributes['github.copilot.cost'] = [decimal]$PremiumRequests
         }
         return [pscustomobject]@{
             type       = 'span'
@@ -79,10 +89,11 @@ Describe 'Get-CopilotRunMetrics' {
                 }
             },
             (New-ChatSpan -Model 'gpt-5.6-sol' -InputTokens 100 -OutputTokens 20 `
-                -CachedTokens 40 -CacheCreationTokens 10 -NanoAiu 1500000000),
+                -CachedTokens 40 -CacheCreationTokens 10 -ReasoningTokens 7 `
+                -NanoAiu 1500000000 -PremiumRequests 1.5),
             (New-ChatSpan -Model 'gpt-5.4-mini' -InputTokens 50 -OutputTokens 8 `
                 -CachedTokens 20 -CacheCreationTokens 0 -NanoAiu 250000000 `
-                -StatusCode 2)
+                -PremiumRequests 0.25 -StatusCode 2)
         )
 
         $metrics = Get-CopilotRunMetrics -Records $records -WallTimeSeconds 12.34567
@@ -95,13 +106,13 @@ Describe 'Get-CopilotRunMetrics' {
         $metrics.cached_tokens | Should -Be 60
         $metrics.cache_creation_tokens | Should -Be 10
         $metrics.completion_tokens | Should -Be 28
-        $metrics.reasoning_tokens | Should -BeNullOrEmpty
+        $metrics.reasoning_tokens | Should -Be 7
         $metrics.total_tokens | Should -Be 178
         $metrics.api_calls | Should -Be 2
         $metrics.failed_api_calls | Should -Be 1
         $metrics.usage_api_calls | Should -Be 2
         $metrics.ai_credits | Should -Be 1.75
-        $metrics.premium_requests | Should -BeNullOrEmpty
+        $metrics.premium_requests | Should -Be 1.75
         $metrics.models | Should -Be @('gpt-5.4-mini', 'gpt-5.6-sol')
         $metrics.usage_complete | Should -BeTrue
     }
@@ -133,7 +144,8 @@ Describe 'Get-CopilotRunMetrics' {
 
     It 'ignores cumulative metric snapshots to avoid double counting' {
         $records = @(
-            (New-ChatSpan -Model 'gpt-5.6-sol' -InputTokens 100 -OutputTokens 10 -NanoAiu 100000000),
+            (New-ChatSpan -Model 'gpt-5.6-sol' -InputTokens 100 -OutputTokens 10 `
+                -NanoAiu 100000000 -PremiumRequests 0.1),
             [pscustomobject]@{
                 type = 'metric'
                 name = 'gen_ai.client.token.usage'
@@ -176,6 +188,8 @@ Describe 'Get-CopilotRunMetrics' {
         $metrics.usage_api_calls | Should -Be 1
         $metrics.prompt_tokens | Should -Be 25
         $metrics.usage_complete | Should -BeFalse
+        $metrics.ai_credits | Should -BeNullOrEmpty
+        $metrics.premium_requests | Should -BeNullOrEmpty
     }
 }
 
@@ -197,18 +211,92 @@ Describe 'Copilot metrics artifact lifecycle' {
         $outputDir = Join-Path $TestDrive 'harvest-output'
         @(
             (New-ChatSpan -Model 'gpt-5.6-sol' -InputTokens 80 -OutputTokens 12 `
-                -CachedTokens 30 -NanoAiu 500000000)
+                -CachedTokens 30 -ReasoningTokens 3 -NanoAiu 500000000 `
+                -PremiumRequests 1)
         ) | ForEach-Object { $_ | ConvertTo-Json -Depth 8 -Compress } |
             Set-Content -LiteralPath $otelPath -Encoding UTF8
 
-        $metrics = Save-CopilotRunMetrics -OtelPath $otelPath -OutputDir $outputDir -WallTimeSeconds 4.2
+        $parsed = Read-CopilotOtelFile -OtelPath $otelPath
+        $metrics = Save-CopilotRunMetrics `
+            -Records $parsed.Records `
+            -OutputDir $outputDir `
+            -WallTimeSeconds 4.2 `
+            -MalformedRecords $parsed.MalformedRecords
         $saved = Get-Content -LiteralPath (Join-Path $outputDir '_run-metrics.json') -Raw |
             ConvertFrom-Json
 
         $metrics.api_calls | Should -Be 1
         $saved.schema_version | Should -Be 1
         $saved.prompt_tokens | Should -Be 80
+        $saved.reasoning_tokens | Should -Be 3
         $saved.ai_credits | Should -Be 0.5
+        $saved.premium_requests | Should -Be 1
+        $otelPath | Should -Not -Exist
+        (Join-Path $outputDir '_copilot-otel.jsonl') | Should -Not -Exist
+    }
+
+    It 'reuses cached records after deleting the raw file and only updates wall time' {
+        $script:ReviewPhase = 'all'
+        $script:CopilotOtelPath = Join-Path $TestDrive 'repeated-save-otel.jsonl'
+        $script:ReviewOutputDir = Join-Path $TestDrive 'repeated-save-output'
+        $script:ReviewStartedAt = [DateTime]::UtcNow.AddSeconds(-2)
+        $script:CopilotOtelRecords = $null
+        $script:CopilotOtelMalformedRecords = 0
+        @(
+            (New-ChatSpan -Model 'gpt-5.6-sol' -InputTokens 80 -OutputTokens 12 `
+                -NanoAiu 500000000 -PremiumRequests 1)
+        ) | ForEach-Object { $_ | ConvertTo-Json -Depth 8 -Compress } |
+            Set-Content -LiteralPath $script:CopilotOtelPath -Encoding UTF8
+
+        Save-CurrentCopilotRunMetrics
+        $first = Get-Content -LiteralPath (
+            Join-Path $script:ReviewOutputDir '_run-metrics.json'
+        ) -Raw | ConvertFrom-Json
+        $script:ReviewStartedAt = [DateTime]::UtcNow.AddSeconds(-5)
+        Save-CurrentCopilotRunMetrics
+        $second = Get-Content -LiteralPath (
+            Join-Path $script:ReviewOutputDir '_run-metrics.json'
+        ) -Raw | ConvertFrom-Json
+
+        $script:CopilotOtelPath | Should -Not -Exist
+        $first.prompt_tokens | Should -Be 80
+        $second.prompt_tokens | Should -Be 80
+        $second.ai_credits | Should -Be 0.5
+        $second.wall_time_seconds | Should -BeGreaterThan $first.wall_time_seconds
+    }
+
+    It 'adds later Copilot invocations once without recounting cached records' {
+        $script:ReviewPhase = 'all'
+        $script:CopilotOtelPath = Join-Path $TestDrive 'multiple-invocations-otel.jsonl'
+        $script:ReviewOutputDir = Join-Path $TestDrive 'multiple-invocations-output'
+        $script:ReviewStartedAt = [DateTime]::UtcNow.AddSeconds(-1)
+        $script:CopilotOtelRecords = $null
+        $script:CopilotOtelMalformedRecords = 0
+        @(
+            (New-ChatSpan -Model 'gpt-5.6-sol' -InputTokens 80 -OutputTokens 12 `
+                -NanoAiu 500000000 -PremiumRequests 1)
+        ) | ForEach-Object { $_ | ConvertTo-Json -Depth 8 -Compress } |
+            Set-Content -LiteralPath $script:CopilotOtelPath -Encoding UTF8
+        Save-CurrentCopilotRunMetrics
+
+        @(
+            (New-ChatSpan -Model 'gpt-5.4-mini' -InputTokens 20 -OutputTokens 4 `
+                -NanoAiu 250000000 -PremiumRequests 0.25)
+        ) | ForEach-Object { $_ | ConvertTo-Json -Depth 8 -Compress } |
+            Set-Content -LiteralPath $script:CopilotOtelPath -Encoding UTF8
+        Save-CurrentCopilotRunMetrics
+        Save-CurrentCopilotRunMetrics
+        $saved = Get-Content -LiteralPath (
+            Join-Path $script:ReviewOutputDir '_run-metrics.json'
+        ) -Raw | ConvertFrom-Json
+
+        $saved.api_calls | Should -Be 2
+        $saved.prompt_tokens | Should -Be 100
+        $saved.completion_tokens | Should -Be 16
+        $saved.ai_credits | Should -Be 0.75
+        $saved.premium_requests | Should -Be 1.25
+        $saved.models | Should -Be @('gpt-5.4-mini', 'gpt-5.6-sol')
+        $script:CopilotOtelPath | Should -Not -Exist
     }
 
     It 'clears stale source and output metrics before a new run' {
@@ -224,6 +312,17 @@ Describe 'Copilot metrics artifact lifecycle' {
 
         $otelPath | Should -Not -Exist
         $metricsPath | Should -Not -Exist
+    }
+
+    It 'removes a legacy raw OTel file from the output directory' {
+        $outputDir = Join-Path $TestDrive 'legacy-output'
+        New-Item -ItemType Directory -Path $outputDir | Out-Null
+        $rawPath = Join-Path $outputDir '_copilot-otel.jsonl'
+        '{}' | Set-Content -LiteralPath $rawPath
+
+        Clear-CopilotMetricsArtifacts -OutputDir $outputDir
+
+        $rawPath | Should -Not -Exist
     }
 
     It 'does not abort the review when a stale metrics file is locked' {
@@ -244,6 +343,8 @@ Describe 'Copilot OTel wiring' {
 
         $source | Should -Match "COPILOT_OTEL_EXPORTER_TYPE'\]\s*=\s*'file'"
         $source | Should -Match "COPILOT_OTEL_FILE_EXPORTER_PATH"
+        $source | Should -Match '\[System\.IO\.Path\]::GetTempPath\(\)'
+        $source | Should -Not -Match 'Join-Path\s+\$AgentWorkDir\s+\$CopilotOtelFileName'
         $source | Should -Not -Match 'Get-CopilotSummaryMetrics'
         $source | Should -Not -Match 'token_prices'
     }
