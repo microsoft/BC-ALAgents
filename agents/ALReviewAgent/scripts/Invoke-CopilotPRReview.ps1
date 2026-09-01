@@ -56,7 +56,7 @@
         COPILOT_MODEL                        - explicit model name for Copilot CLI
         COPILOT_REVIEW_LEAF_MODEL            - faster/cheaper model for leaf sub-skill
                                                child agents (triage tier); empty = default
-        COPILOT_REVIEW_PARALLEL_LEAVES       - true|false (default true): dispatch
+        COPILOT_REVIEW_PARALLEL_LEAVES       - true|false (default false): dispatch
                                                super-skill leaves concurrently, not serially
         MINIMUM_SEVERITY                     - Critical | High | Medium | Low (default: Medium)
         AGENT_MINIMUM_SEVERITY               - severity floor applied only to agent findings
@@ -105,10 +105,10 @@ $CopilotModel     = ($env:COPILOT_MODEL ?? '').Trim()
 # Optional faster/cheaper model for leaf sub-skill child agents (triage tier).
 # Empty = leaves inherit the CLI's default child-agent model.
 $LeafModel        = ($env:COPILOT_REVIEW_LEAF_MODEL ?? '').Trim()
-# Dispatch super-skill leaf sub-skills concurrently (isolated child agents)
-# instead of serially. Default on — it is both faster and a stronger guard
-# against the collapsed-scan pathology than serial in-context passes.
-$ParallelLeavesRaw = (($env:COPILOT_REVIEW_PARALLEL_LEAVES ?? 'true') + '').Trim().ToLowerInvariant()
+# Serial calibration control: leave concurrent isolated child-agent dispatch
+# available as an explicit override, but default this experiment branch to the
+# production behavior's serial counterfactual.
+$ParallelLeavesRaw = (($env:COPILOT_REVIEW_PARALLEL_LEAVES ?? 'false') + '').Trim().ToLowerInvariant()
 $ParallelLeaves   = @('1','true','yes','on') -contains $ParallelLeavesRaw
 $MinimumSeverity  = $env:MINIMUM_SEVERITY ?? 'Medium'
 $AgentMinimumSeverity = $env:AGENT_MINIMUM_SEVERITY ?? $MinimumSeverity
