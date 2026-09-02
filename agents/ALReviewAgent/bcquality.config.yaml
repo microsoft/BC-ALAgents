@@ -32,7 +32,7 @@ bcquality:
   # gains authority to reject leaf findings at roll-up time. Everything else in
   # the BCQuality tree is byte-identical to the baseline, so the only variable
   # against the BC-Bench parallel-leaf baseline is the arbitration gate.
-  ref: 3eed0bba3848fbaa8ce89c38cf1975e0c2015e78
+  ref: c2e15986cec35b3d82a2dc3fb8eb0e24ee39d5f6
 
   # BCQuality content version this engine is pinned to, as major.minor. Its
   # MINOR is Z in the engine's X.Y.Z version. BCQuality's minor is a monotonic
