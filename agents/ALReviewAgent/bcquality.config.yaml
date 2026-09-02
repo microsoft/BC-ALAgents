@@ -44,7 +44,13 @@ enabled-layers:
 
 # Repo-relative paths (within BCQuality) of action skills to exclude.
 # Example: 'microsoft/skills/review/al-style-review.md'
-disabled-skills: []
+#
+# EXPERIMENT ARM ONLY - DO NOT MERGE. Ablates the al-appsource-review leaf to
+# measure its precision cost on the BC-Bench code-review set. Baseline run
+# 33517690300 attributed 169 of 623 generated comments (27%) to this leaf across
+# 87 of 145 entries, while the gold set expects zero AppSource findings.
+disabled-skills:
+  - microsoft/skills/review/al-appsource-review.md
 
 # Per-article filtering for knowledge files. Globs are matched against
 # repo-relative paths inside the BCQuality clone (forward slashes).
@@ -57,7 +63,13 @@ disabled-skills: []
 knowledge:
   allow:
     - 'microsoft/knowledge/**'
-  deny: []
+  # EXPERIMENT ARM ONLY - DO NOT MERGE. Paired with the disabled-skills entry
+  # above. Removing the leaf file alone is not a clean ablation: al-code-review
+  # pins its leaves in frontmatter and "does not discover sub-skills
+  # implicitly", so a missing leaf file can be improvised from general model
+  # knowledge. Denying the corpus removes the grounding as well.
+  deny:
+    - 'microsoft/knowledge/appsource/**'
 
 # Dimensions passed verbatim to BCQuality's entry.md as `task-context`.
 # See https://github.com/microsoft/BCQuality/blob/main/skills/entry.md for
