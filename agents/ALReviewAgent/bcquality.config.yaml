@@ -26,7 +26,13 @@ bcquality:
   # Git ref (branch, tag, or SHA) to clone. Pinned to a specific BCQuality
   # main commit for reproducible reviews; bump deliberately as BCQuality
   # advances (or switch to a release tag once BCQuality cuts releases).
-  ref: 712dee9ec1f0b098f859753e083e8c6efa903d01
+  # EXPERIMENT ARM ONLY - DO NOT MERGE. Points at the BCQuality branch
+  # `bcq/super-skill-arbitration`, which is 712dee9 (the baseline pin) plus a
+  # single change to microsoft/skills/review/al-code-review.md: the super-skill
+  # gains authority to reject leaf findings at roll-up time. Everything else in
+  # the BCQuality tree is byte-identical to the baseline, so the only variable
+  # against the BC-Bench parallel-leaf baseline is the arbitration gate.
+  ref: 0e0e2c51d65d7fa33d6ded0e48459e9e21a4f323
 
   # BCQuality content version this engine is pinned to, as major.minor. Its
   # MINOR is Z in the engine's X.Y.Z version. BCQuality's minor is a monotonic
