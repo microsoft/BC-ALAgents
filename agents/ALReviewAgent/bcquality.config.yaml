@@ -24,16 +24,16 @@ bcquality:
   repo: https://github.com/microsoft/BCQuality
 
   # Git ref (branch, tag, or SHA) to clone. Pinned to a specific BCQuality
-  # main commit for reproducible reviews; bump deliberately as BCQuality
-  # advances (or switch to a release tag once BCQuality cuts releases).
-  ref: 712dee9ec1f0b098f859753e083e8c6efa903d01
+  # release commit for reproducible reviews; bump deliberately as BCQuality
+  # advances.
+  ref: ad8ccde5953fd6ce072e3b59049406783066ed60
 
   # BCQuality content version this engine is pinned to, as major.minor. Its
   # MINOR is Z in the engine's X.Y.Z version. BCQuality's minor is a monotonic
   # counter that only ever increments — it never resets, even across a major
   # bump — so Z is always unique. BCQuality bumps its minor ~monthly; set this
   # together with `ref` above when moving to a new release.
-  version: "1.4"
+  version: "1.5"
 
 # Which BCQuality layers an agent may consume during this review.
 # Allowed values: microsoft, community, custom.
