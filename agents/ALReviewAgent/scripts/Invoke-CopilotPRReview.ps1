@@ -456,7 +456,7 @@ function New-CopilotChildEnvironment {
         [string] $CiValue
     )
 
-    $allowedKeys = @('PATH','HOME','USERPROFILE','TMP','TEMP','TMPDIR','APPDATA','LOCALAPPDATA',
+    $allowedKeys = @('PATH','PATHEXT','HOME','USERPROFILE','TMP','TEMP','TMPDIR','APPDATA','LOCALAPPDATA',
                      'SystemRoot','ComSpec','CI','TERM','LANG','LC_ALL','npm_config_prefix','NPM_CONFIG_PREFIX')
     $cleanEnv = @{}
     foreach ($key in $allowedKeys) {
