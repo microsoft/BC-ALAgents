@@ -1117,3 +1117,34 @@ Describe 'Format-OtherRegionsNotice' {
         } | Should -Be ''
     }
 }
+
+Describe 'Save-ReviewArtifacts' {
+    It 'persists sub-results used for knowledge and sub-skill diagnostics' {
+        $ReviewOutputDir = Join-Path $TestDrive 'review-output'
+        $Repository = 'microsoft/BCApps'
+        $PrNumber = 1
+        $BaseBranch = 'main'
+        $PrHeadSha = 'abc123'
+        $report = [pscustomobject]@{
+            Outcome = 'completed'
+            OutcomeReason = ''
+            Findings = @()
+            Suppressed = @()
+            SubResults = @(
+                [pscustomobject]@{
+                    id = 'al-performance-review'
+                    outcome = 'completed'
+                    references = @([pscustomobject]@{ path = 'microsoft/knowledge/performance/article.md' })
+                }
+            )
+            SkippedSubSkills = @()
+        }
+
+        Save-ReviewArtifacts -RawOutput '{}' -Report $report -ParseErrors @() -TaskContext @{} -Transcript ''
+
+        $saved = Get-Content -LiteralPath (Join-Path $ReviewOutputDir 'al-code-review-findings.json') -Raw | ConvertFrom-Json
+        $saved.subResults.Count | Should -Be 1
+        $saved.subResults[0].id | Should -Be 'al-performance-review'
+        $saved.subResults[0].references[0].path | Should -Be 'microsoft/knowledge/performance/article.md'
+    }
+}

@@ -3640,6 +3640,7 @@ function Save-ReviewArtifacts {
         outcomeReason = $Report.OutcomeReason
         findings      = @($Report.Findings)
         suppressed    = $Report.Suppressed
+        subResults    = @($Report.SubResults)
         skippedSubSkills = $Report.SkippedSubSkills
         parseErrors   = @($ParseErrors)
     }
