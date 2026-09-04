@@ -13,6 +13,8 @@
       - Knowledge files matching `knowledge.deny` globs
       - Knowledge files NOT matching `knowledge.allow` globs (when `allow`
         is non-empty)
+      - The `<slug>.good.al` / `<slug>.bad.al` samples belonging to any
+        knowledge file removed above
       - Action skill files inside non-enabled layers
       - Action skill files explicitly listed in `disabled-skills`
 
@@ -145,6 +147,19 @@ foreach ($layerDir in @('microsoft', 'community', 'custom')) {
             if ($reason) {
                 Remove-Item -LiteralPath $_.FullName -Force
                 $removed.Add([pscustomobject]@{ path = $rel; kind = 'knowledge'; reason = $reason }) | Out-Null
+
+                # Code samples live beside the article as `<slug>.good.al` /
+                # `<slug>.bad.al` and are only meaningful through it. Left
+                # behind they are unreferenced disabled-layer content that a
+                # `.bad.al` makes actively misleading, having lost the prose
+                # that marks it as the anti-pattern.
+                $slug = [System.IO.Path]::GetFileNameWithoutExtension($_.Name)
+                Get-ChildItem -LiteralPath $_.DirectoryName -File -Filter "$slug.*.al" -ErrorAction SilentlyContinue |
+                    ForEach-Object {
+                        $sampleRel = Get-RelativePath -Root $BCQualityRoot -Full $_.FullName
+                        Remove-Item -LiteralPath $_.FullName -Force
+                        $removed.Add([pscustomobject]@{ path = $sampleRel; kind = 'knowledge-sample'; reason = $reason }) | Out-Null
+                    }
             }
         }
 }
