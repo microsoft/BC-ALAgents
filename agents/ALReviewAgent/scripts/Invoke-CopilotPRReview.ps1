@@ -85,6 +85,12 @@ $GithubToken      = $env:GITHUB_TOKEN
 $CopilotToken     = $env:GH_TOKEN
 $CopilotGithubToken = $env:COPILOT_GITHUB_TOKEN
 $Repository       = $env:GITHUB_REPOSITORY
+# GitHub host. Actions sets GITHUB_SERVER_URL / GITHUB_API_URL on every runner,
+# including GitHub Enterprise Cloud with data residency (*.ghe.com) and GHES,
+# so honouring them keeps the review host-neutral. Defaults keep local runs on
+# github.com.
+$GitHubServerUrl  = (($env:GITHUB_SERVER_URL ?? 'https://github.com') + '').Trim().TrimEnd('/')
+$GitHubApiUrl     = (($env:GITHUB_API_URL ?? 'https://api.github.com') + '').Trim().TrimEnd('/')
 $TrustedWorkspace = $env:REVIEW_WORKSPACE ?? $env:GITHUB_WORKSPACE ?? (Get-Location).Path
 $PrNumber         = [int]($env:PR_NUMBER ?? 0)
 $PrHeadSha        = $env:PR_HEAD_SHA
@@ -159,7 +165,7 @@ $DiffBaseRef = if ($ReviewSource -eq 'local') { $BaseRef } else { "origin/$BaseB
 # and would make three-dot fail with "no merge base".
 $DiffRange = if ((($env:REVIEW_DIFF_STYLE ?? '') + '').Trim().ToLowerInvariant() -eq 'direct') { "$DiffBaseRef..HEAD" } else { "$DiffBaseRef...HEAD" }
 $SummaryMarker    = '<!-- copilot-pr-review-summary -->'
-$BaseUrl          = "https://api.github.com/repos/$Repository"
+$BaseUrl          = "$GitHubApiUrl/repos/$Repository"
 
 # Review phase. Splits the privileged single-job runner into a minimal-
 # permission "generate" phase (runs the tool-enabled Copilot CLI with a
@@ -448,12 +454,19 @@ function Update-IssueComment {
     Invoke-GitHubApi -Method PATCH -Endpoint "/issues/comments/$CommentId" -Body @{ body = $Body }
 }
 
+function Test-GitHubEnterpriseHost {
+    param([string] $ServerUrl)
+    $normalized = (($ServerUrl ?? '') + '').Trim().TrimEnd('/')
+    return $normalized -ne '' -and $normalized -ne 'https://github.com'
+}
+
 function New-CopilotChildEnvironment {
     param(
         [string] $ReviewSource,
         [string] $CopilotToken,
         [string] $CopilotGithubToken,
-        [string] $CiValue
+        [string] $CiValue,
+        [string] $GitHubServerUrl = 'https://github.com'
     )
 
     $allowedKeys = @('PATH','PATHEXT','HOME','USERPROFILE','TMP','TEMP','TMPDIR','APPDATA','LOCALAPPDATA',
@@ -471,6 +484,12 @@ function New-CopilotChildEnvironment {
     }
     elseif ($CopilotToken) {
         $cleanEnv['GH_TOKEN'] = $CopilotToken
+    }
+
+    # Copilot CLI authenticates against github.com unless told otherwise. On a
+    # GitHub Enterprise host it needs the host to validate the forwarded token.
+    if (Test-GitHubEnterpriseHost -ServerUrl $GitHubServerUrl) {
+        $cleanEnv['COPILOT_GH_HOST'] = $GitHubServerUrl
     }
 
     $cleanEnv['CI'] = 'true'
@@ -513,7 +532,7 @@ function Invoke-GitCommandAuthenticated {
 
     $basic = [Convert]::ToBase64String([Text.Encoding]::ASCII.GetBytes("x-access-token:$token"))
     $env:GIT_CONFIG_COUNT = '1'
-    $env:GIT_CONFIG_KEY_0 = 'http.https://github.com/.extraheader'
+    $env:GIT_CONFIG_KEY_0 = "http.$GitHubServerUrl/.extraheader"
     $env:GIT_CONFIG_VALUE_0 = "AUTHORIZATION: basic $basic"
     try {
         return Invoke-GitCommand -Arguments $Arguments
@@ -1682,6 +1701,11 @@ function Invoke-CopilotCli {
         '--add-dir', $AnalysisWorkspace,
         '-p', $Prompt
     )
+    # On GitHub Enterprise the CLI must be pointed at the host that issued the
+    # token; github.com stays the CLI default and gets no flag.
+    if (Test-GitHubEnterpriseHost -ServerUrl $GitHubServerUrl) {
+        $copilotArgs = @('--host', $GitHubServerUrl) + $copilotArgs
+    }
     # In 'plugin' mode, mount the BCQuality clone as a Copilot CLI plugin (exposing
     # the bcquality-al-review skill) and grant read access to its tree via
     # --add-dir, because the clone is no longer the CLI working directory. In 'cwd'
@@ -1715,7 +1739,8 @@ function Invoke-CopilotCli {
         -ReviewSource $ReviewSource `
         -CopilotToken $CopilotToken `
         -CopilotGithubToken $CopilotGithubToken `
-        -CiValue ([System.Environment]::GetEnvironmentVariable('CI'))
+        -CiValue ([System.Environment]::GetEnvironmentVariable('CI')) `
+        -GitHubServerUrl $GitHubServerUrl
     $cleanEnv['COPILOT_OTEL_ENABLED'] = 'true'
     $cleanEnv['COPILOT_OTEL_EXPORTER_TYPE'] = 'file'
     $cleanEnv['COPILOT_OTEL_FILE_EXPORTER_PATH'] = $CopilotOtelPath

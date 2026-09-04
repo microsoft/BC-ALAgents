@@ -946,6 +946,51 @@ Describe 'Local review authentication' {
         $environment['GH_TOKEN'] | Should -Be 'pr-copilot-token'
         $environment.ContainsKey('COPILOT_GITHUB_TOKEN') | Should -BeFalse
     }
+
+    It 'does not set COPILOT_GH_HOST for github.com' {
+        $environment = New-CopilotChildEnvironment `
+            -ReviewSource 'pr' `
+            -CopilotToken 'pr-copilot-token' `
+            -CopilotGithubToken $null `
+            -CiValue 'true' `
+            -GitHubServerUrl 'https://github.com'
+
+        $environment.ContainsKey('COPILOT_GH_HOST') | Should -BeFalse
+    }
+
+    It 'sets COPILOT_GH_HOST for a GitHub Enterprise host' {
+        $environment = New-CopilotChildEnvironment `
+            -ReviewSource 'pr' `
+            -CopilotToken 'pr-copilot-token' `
+            -CopilotGithubToken $null `
+            -CiValue 'true' `
+            -GitHubServerUrl 'https://contoso.ghe.com'
+
+        $environment['COPILOT_GH_HOST'] | Should -Be 'https://contoso.ghe.com'
+        $environment['GH_TOKEN'] | Should -Be 'pr-copilot-token'
+    }
+}
+
+Describe 'Test-GitHubEnterpriseHost' {
+    It 'treats github.com as the default host' {
+        Test-GitHubEnterpriseHost -ServerUrl 'https://github.com' | Should -BeFalse
+        Test-GitHubEnterpriseHost -ServerUrl 'https://github.com/' | Should -BeFalse
+        Test-GitHubEnterpriseHost -ServerUrl '' | Should -BeFalse
+        Test-GitHubEnterpriseHost -ServerUrl $null | Should -BeFalse
+    }
+
+    It 'recognises GitHub Enterprise Cloud and Server hosts' {
+        Test-GitHubEnterpriseHost -ServerUrl 'https://contoso.ghe.com' | Should -BeTrue
+        Test-GitHubEnterpriseHost -ServerUrl 'https://github.contoso.local/' | Should -BeTrue
+    }
+
+    It 'derives the API base and git credential host from the Actions server variables' {
+        $source = Get-Content -LiteralPath $scriptPath -Raw
+        $source | Should -Not -Match 'https://api\.github\.com/repos'
+        $source | Should -Not -Match "http\.https://github\.com/\.extraheader"
+        $source | Should -Match '\$BaseUrl\s*=\s*"\$GitHubApiUrl/repos/\$Repository"'
+        $source | Should -Match '\$env:GIT_CONFIG_KEY_0 = "http\.\$GitHubServerUrl/\.extraheader"'
+    }
 }
 
 Describe 'Repair-ShellEscapedQuotes' {
