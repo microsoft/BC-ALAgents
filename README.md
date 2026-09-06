@@ -153,6 +153,40 @@ Do not pin the engine to an unmerged BCQuality pull-request commit.
 
 ## Running locally / in a benchmark
 
+### New-machine setup
+
+After cloning this repository on Windows, run the root setup script from
+PowerShell. Its default mode is a read-only dependency check:
+
+```powershell
+.\Setup-LocalReview.ps1
+```
+
+To install missing prerequisites and authenticate GitHub:
+
+```powershell
+powershell -ExecutionPolicy Bypass -File .\Setup-LocalReview.ps1 -Install
+```
+
+The installer uses WinGet for Git, PowerShell 7, Node.js, and GitHub CLI; npm
+for GitHub Copilot CLI; and PowerShell Gallery for `powershell-yaml`. It accepts
+an existing `GH_TOKEN` instead of an interactive GitHub CLI login. Pass
+`-SkipAuthentication` when provisioning non-interactively and provide
+`GH_TOKEN` at runtime.
+
+Once setup succeeds, review a branch:
+
+```powershell
+pwsh -NoProfile -File .\agents\ALReviewAgent\scripts\Invoke-LocalReview.ps1 `
+    -RepoPath C:\repo\MyBCApp `
+    -Mode Branch
+```
+
+Use `-Mode Existing` to review the complete tracked codebase at `HEAD`. The
+first review automatically downloads BCQuality into the user's Copilot cache.
+
+### Direct orchestrator invocation
+
 The orchestrator is entirely environment-variable driven and supports a
 single-process mode (`REVIEW_PHASE=all`) that generates and posts in one pass —
 used for local development and offline evaluation (e.g. BC-Bench). Provide a

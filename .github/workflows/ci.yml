@@ -24,7 +24,11 @@ jobs:
         shell: pwsh
         run: |
           $failed = $false
-          Get-ChildItem agents/ALReviewAgent/scripts -Filter *.ps1 -Recurse | ForEach-Object {
+          $scripts = @(
+              Get-ChildItem agents/ALReviewAgent/scripts -Filter *.ps1 -Recurse
+              Get-Item Setup-LocalReview.ps1
+          )
+          $scripts | ForEach-Object {
               $errors = $null
               [System.Management.Automation.Language.Parser]::ParseFile($_.FullName, [ref]$null, [ref]$errors) | Out-Null
               if ($errors) {
@@ -44,7 +48,10 @@ jobs:
       - name: Lint (fail on Error severity)
         shell: pwsh
         run: |
-          $results = @(Invoke-ScriptAnalyzer -Path agents/ALReviewAgent/scripts -Recurse -Settings ./PSScriptAnalyzerSettings.psd1)
+          $results = @(
+              Invoke-ScriptAnalyzer -Path agents/ALReviewAgent/scripts -Recurse -Settings ./PSScriptAnalyzerSettings.psd1
+              Invoke-ScriptAnalyzer -Path Setup-LocalReview.ps1 -Settings ./PSScriptAnalyzerSettings.psd1
+          )
           $errors   = @($results | Where-Object Severity -eq 'Error')
           $warnings = @($results | Where-Object Severity -eq 'Warning')
           foreach ($e in $errors)   { Write-Host "::error file=$($e.ScriptPath),line=$($e.Line)::[$($e.RuleName)] $($e.Message)" }
