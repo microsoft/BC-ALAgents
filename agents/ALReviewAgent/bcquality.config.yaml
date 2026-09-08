@@ -26,7 +26,7 @@ bcquality:
   # Git ref (branch, tag, or SHA) to clone. Pinned to a specific BCQuality
   # main commit for reproducible reviews; bump deliberately as BCQuality
   # advances (or switch to a release tag once BCQuality cuts releases).
-  ref: 1a5afdc0ebb6eb3fde1c3c69a13f235275cf4549
+  ref: e74e2a6601ec87a1ffec6e3d7eb074aa67437ef2
 
   # BCQuality content version this engine is pinned to, as major.minor. Its
   # MINOR is Z in the engine's X.Y.Z version. BCQuality's minor is a monotonic
