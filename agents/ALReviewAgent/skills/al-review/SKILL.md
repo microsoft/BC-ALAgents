@@ -94,19 +94,22 @@ invent flags - the wrapper's full parameter set is exactly:
 `-ConfigPath <path>` (optional; defaults to the engine's `agents/ALReviewAgent/bcquality.config.yaml`)
 `-OutputDir <path>` (optional; default `<repo>/.bc-review`)
 `-MinimumSeverity Critical|High|Medium|Low` (default Medium)
-`-Model <name>` (optional)
-`-LeafModel <name>` (optional; lighter model for leaf sub-agents)
+`-Model <name>` (required; root self-review and consolidation model)
+`-LeafModel <name>` (required; model pinned to every isolated leaf process)
+`-LeafExecution Serial|Parallel` (default Serial)
+`-MaxLeafConcurrency <int>` (default 4; used only in Parallel mode)
 `-Path <folder-or-glob>` (optional; scope findings to a subtree)
 `-Fix` (switch)
 `-SkipBCQualityFilter` (switch)
 `-NoPruneDomains` (switch; run every review domain unconditionally)
-`-NoParallelLeaves` (switch; disable concurrent leaf dispatch)
 
 ```powershell
 $reviewScript = "<resolved-skill-dir>/../../scripts/Invoke-LocalReview.ps1"
 $reviewParameters = @{
     RepoPath = <repo>
     Mode = 'Branch'
+    Model = <root-model>
+    LeafModel = <leaf-model>
 }
 & $reviewScript @reviewParameters
 ```

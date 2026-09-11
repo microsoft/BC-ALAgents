@@ -247,7 +247,7 @@ Describe 'Assert-RequestedLeafModelObserved' {
     BeforeEach {
         $ReviewOutputDir = Join-Path $TestDrive 'leaf-model-output'
         New-Item -ItemType Directory -Path $ReviewOutputDir -Force | Out-Null
-        $Model = 'claude-sonnet-5'
+        $CopilotModel = 'claude-sonnet-5'
         $LeafModel = 'gpt-5.6-luna'
         $RequireLeafModel = $true
     }

@@ -36,6 +36,14 @@ param(
 
     [string] $Model,
 
+    [string] $LeafModel,
+
+    [ValidateSet('serial', 'parallel')]
+    [string] $LeafExecution,
+
+    [ValidateRange(1, 64)]
+    [int] $MaxLeafConcurrency,
+
     [ValidateSet('Critical', 'High', 'Medium', 'Low')]
     [string] $MinSeverity,
 
@@ -50,6 +58,13 @@ $env:REVIEW_PHASE = 'generate'
 
 if ($PSBoundParameters.ContainsKey('BcqualityRef')) { $env:BCQUALITY_REF = $BcqualityRef }
 if ($PSBoundParameters.ContainsKey('Model'))        { $env:COPILOT_MODEL = $Model }
+if ($PSBoundParameters.ContainsKey('LeafModel'))    { $env:COPILOT_REVIEW_LEAF_MODEL = $LeafModel }
+if ($PSBoundParameters.ContainsKey('LeafExecution')) {
+    $env:COPILOT_REVIEW_LEAF_EXECUTION = $LeafExecution
+}
+if ($PSBoundParameters.ContainsKey('MaxLeafConcurrency')) {
+    $env:COPILOT_REVIEW_MAX_LEAF_CONCURRENCY = [string]$MaxLeafConcurrency
+}
 if ($PSBoundParameters.ContainsKey('MinSeverity'))  { $env:AGENT_MINIMUM_SEVERITY = $MinSeverity }
 if ($PSBoundParameters.ContainsKey('OutputDir'))    { $env:REVIEW_OUTPUT_DIR = $OutputDir }
 
