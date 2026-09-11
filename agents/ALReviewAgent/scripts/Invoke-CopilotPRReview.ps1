@@ -1470,7 +1470,6 @@ function Build-BootstrapPrompt {
 
 - Run each leaf child agent on the model '$LeafModel' (a faster triage tier); reserve the heavier default model for the super-skill self-review pass.
 - Every leaf Task tool call MUST set its model argument explicitly to '$LeafModel'. Never omit the model argument, inherit a default child model, or substitute another model.
-- Do not invoke any model other than the root model and '$LeafModel'.
 "@
     }
     if ($ParallelLeaves) {
