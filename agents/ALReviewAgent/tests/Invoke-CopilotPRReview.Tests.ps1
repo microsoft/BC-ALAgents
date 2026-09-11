@@ -868,6 +868,7 @@ Describe 'Build-BootstrapPrompt' {
     It 'requires every leaf task call to set the requested model explicitly' {
         $script:BootstrapPrompt | Should -Match "Every leaf Task tool call MUST set its model argument explicitly to 'gpt-5\.6-luna'"
         $script:BootstrapPrompt | Should -Match 'Never omit the model argument'
+        $script:BootstrapPrompt | Should -Match "Do not invoke any model other than the root model and 'gpt-5\.6-luna'"
     }
 }
 

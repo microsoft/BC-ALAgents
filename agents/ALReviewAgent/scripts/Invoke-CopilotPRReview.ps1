@@ -1332,6 +1332,11 @@ function Assert-RequestedLeafModelObserved {
         throw "Required leaf model '$LeafModel' was not observed in Copilot telemetry. Observed models: $observed."
     }
 
+    $unexpectedModels = @($observedModels | Where-Object { $_ -notin @($Model, $LeafModel) })
+    if ($unexpectedModels.Count -gt 0) {
+        throw "Unexpected model substitution was observed in Copilot telemetry. Expected only '$Model' and '$LeafModel'; observed: $($observedModels -join ', ')."
+    }
+
     Write-LogPhaseDetail "Verified required leaf model '$LeafModel' in Copilot telemetry."
 }
 
@@ -1465,6 +1470,7 @@ function Build-BootstrapPrompt {
 
 - Run each leaf child agent on the model '$LeafModel' (a faster triage tier); reserve the heavier default model for the super-skill self-review pass.
 - Every leaf Task tool call MUST set its model argument explicitly to '$LeafModel'. Never omit the model argument, inherit a default child model, or substitute another model.
+- Do not invoke any model other than the root model and '$LeafModel'.
 "@
     }
     if ($ParallelLeaves) {

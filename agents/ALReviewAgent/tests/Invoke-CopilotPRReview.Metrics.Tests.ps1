@@ -247,6 +247,7 @@ Describe 'Assert-RequestedLeafModelObserved' {
     BeforeEach {
         $ReviewOutputDir = Join-Path $TestDrive 'leaf-model-output'
         New-Item -ItemType Directory -Path $ReviewOutputDir -Force | Out-Null
+        $Model = 'claude-sonnet-5'
         $LeafModel = 'gpt-5.6-luna'
         $RequireLeafModel = $true
     }
@@ -266,6 +267,15 @@ Describe 'Assert-RequestedLeafModelObserved' {
 
         { Assert-RequestedLeafModelObserved } |
             Should -Throw "*Required leaf model 'gpt-5.6-luna' was not observed*gemini-3.6-flash*"
+    }
+
+    It 'fails when an additional model was substituted alongside the requested model' {
+        @{ models = @('claude-sonnet-5', 'gemini-3.6-flash', 'gpt-5.6-luna') } |
+            ConvertTo-Json |
+            Set-Content -LiteralPath (Join-Path $ReviewOutputDir '_run-metrics.json')
+
+        { Assert-RequestedLeafModelObserved } |
+            Should -Throw "*Expected only 'claude-sonnet-5' and 'gpt-5.6-luna'*gemini-3.6-flash*"
     }
 
     It 'does not enforce the model unless explicitly requested' {
