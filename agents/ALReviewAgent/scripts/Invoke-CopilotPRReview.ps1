@@ -111,6 +111,11 @@ $CopilotModel     = ($env:COPILOT_MODEL ?? '').Trim()
 # Optional faster/cheaper model for leaf sub-skill child agents (triage tier).
 # Empty = leaves inherit the CLI's default child-agent model.
 $LeafModel        = ($env:COPILOT_REVIEW_LEAF_MODEL ?? '').Trim()
+$RequireLeafModelRaw = (($env:COPILOT_REVIEW_REQUIRE_LEAF_MODEL ?? 'false') + '').Trim().ToLowerInvariant()
+$RequireLeafModel = @('1','true','yes','on') -contains $RequireLeafModelRaw
+if ($RequireLeafModel -and -not $LeafModel) {
+    throw 'COPILOT_REVIEW_REQUIRE_LEAF_MODEL requires COPILOT_REVIEW_LEAF_MODEL.'
+}
 # Dispatch super-skill leaf sub-skills concurrently (isolated child agents)
 # instead of serially. Default on — it is both faster and a stronger guard
 # against the collapsed-scan pathology than serial in-context passes.
@@ -1306,6 +1311,30 @@ function Save-CopilotRunMetrics {
     return $metrics
 }
 
+function Assert-RequestedLeafModelObserved {
+    if (-not $RequireLeafModel) { return }
+
+    $metricsPath = Join-Path $ReviewOutputDir '_run-metrics.json'
+    if (-not (Test-Path -LiteralPath $metricsPath -PathType Leaf)) {
+        throw "Required leaf model '$LeafModel' could not be verified because '$metricsPath' was not produced."
+    }
+
+    try {
+        $metrics = Get-Content -LiteralPath $metricsPath -Raw -ErrorAction Stop | ConvertFrom-Json -ErrorAction Stop
+    }
+    catch {
+        throw "Required leaf model '$LeafModel' could not be verified because '$metricsPath' is unreadable: $($_.Exception.Message)"
+    }
+
+    $observedModels = @($metrics.models | ForEach-Object { ([string]$_).Trim() } | Where-Object { $_ })
+    if ($LeafModel -notin $observedModels) {
+        $observed = if ($observedModels.Count -gt 0) { $observedModels -join ', ' } else { '(none)' }
+        throw "Required leaf model '$LeafModel' was not observed in Copilot telemetry. Observed models: $observed."
+    }
+
+    Write-LogPhaseDetail "Verified required leaf model '$LeafModel' in Copilot telemetry."
+}
+
 function Save-CurrentCopilotRunMetrics {
     if ($ReviewPhase -eq 'post') { return }
 
@@ -1432,7 +1461,11 @@ function Build-BootstrapPrompt {
     # --- Execution strategy for super-skills (parallel vs serial leaves) ----
     $leafModelLine = ''
     if ($LeafModel) {
-        $leafModelLine = "`n- Run each leaf child agent on the model '$LeafModel' (a faster triage tier); reserve the heavier default model for the super-skill self-review pass."
+        $leafModelLine = @"
+
+- Run each leaf child agent on the model '$LeafModel' (a faster triage tier); reserve the heavier default model for the super-skill self-review pass.
+- Every leaf Task tool call MUST set its model argument explicitly to '$LeafModel'. Never omit the model argument, inherit a default child model, or substitute another model.
+"@
     }
     if ($ParallelLeaves) {
         $executionSection = @"
@@ -3833,6 +3866,7 @@ if ($ReviewPhase -ne 'post') {
     Write-LogPhaseDetail 'Copilot CLI stdout/stderr will be dumped below once it exits (stderr lines prefixed [copilot-err]).'
     $prompt = Build-BootstrapPrompt -TaskContextPath '_task-context.json'
     $output = Invoke-CopilotCli -Prompt $prompt
+    Assert-RequestedLeafModelObserved
     Pop-LogGroup
 
     # Prefer the structured report file the model wrote to its working directory.

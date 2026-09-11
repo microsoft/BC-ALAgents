@@ -847,6 +847,8 @@ Describe 'Build-BootstrapPrompt' {
         $DiffRange = 'origin/main...HEAD'
         $ReportFileName = 'findings-report.json'
         $MinimumSeverity = 'Low'
+        $LeafModel = 'gpt-5.6-luna'
+        $ParallelLeaves = $false
 
         $script:BootstrapPrompt = Build-BootstrapPrompt -TaskContextPath '/home/runner/bcquality/_task-context.json'
     }
@@ -861,6 +863,11 @@ Describe 'Build-BootstrapPrompt' {
         $script:BootstrapPrompt | Should -Not -Match 'diff origin/main to see all changes'
         $script:BootstrapPrompt | Should -Not -Match 'diff origin/main -- <file>'
         $script:BootstrapPrompt | Should -Not -Match 'diff --name-only origin/main to list changed files'
+    }
+
+    It 'requires every leaf task call to set the requested model explicitly' {
+        $script:BootstrapPrompt | Should -Match "Every leaf Task tool call MUST set its model argument explicitly to 'gpt-5\.6-luna'"
+        $script:BootstrapPrompt | Should -Match 'Never omit the model argument'
     }
 }
 

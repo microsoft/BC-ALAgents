@@ -1,3 +1,8 @@
+[Diagnostics.CodeAnalysis.SuppressMessageAttribute(
+    'PSUseDeclaredVarsMoreThanAssignments',
+    '',
+    Justification = 'The imported functions resolve these test fixtures through PowerShell dynamic scope.'
+)]
 param()
 
 BeforeAll {
@@ -21,9 +26,11 @@ BeforeAll {
         'ConvertTo-CopilotNonNegativeDecimal',
         'Get-CopilotNumericAttribute',
         'Get-CopilotRunMetrics',
+        'Write-LogPhaseDetail',
         'Remove-CopilotOtelFile',
         'Read-CopilotOtelFile',
         'Save-CopilotRunMetrics',
+        'Assert-RequestedLeafModelObserved',
         'Save-CurrentCopilotRunMetrics',
         'Complete-CopilotProcess',
         'Clear-CopilotMetricsArtifacts'
@@ -233,6 +240,38 @@ Describe 'Get-CopilotRunMetrics' {
         $metrics.premium_requests | Should -Be 1
         $metrics.models | Should -Be @('gpt-5.6-sol')
         $metrics.malformed_records | Should -Be 11
+    }
+}
+
+Describe 'Assert-RequestedLeafModelObserved' {
+    BeforeEach {
+        $ReviewOutputDir = Join-Path $TestDrive 'leaf-model-output'
+        New-Item -ItemType Directory -Path $ReviewOutputDir -Force | Out-Null
+        $LeafModel = 'gpt-5.6-luna'
+        $RequireLeafModel = $true
+    }
+
+    It 'accepts the explicitly requested model when telemetry observed it' {
+        @{ models = @('claude-sonnet-5', 'gpt-5.6-luna') } |
+            ConvertTo-Json |
+            Set-Content -LiteralPath (Join-Path $ReviewOutputDir '_run-metrics.json')
+
+        { Assert-RequestedLeafModelObserved } | Should -Not -Throw
+    }
+
+    It 'fails when the requested model was substituted' {
+        @{ models = @('claude-sonnet-5', 'gemini-3.6-flash') } |
+            ConvertTo-Json |
+            Set-Content -LiteralPath (Join-Path $ReviewOutputDir '_run-metrics.json')
+
+        { Assert-RequestedLeafModelObserved } |
+            Should -Throw "*Required leaf model 'gpt-5.6-luna' was not observed*gemini-3.6-flash*"
+    }
+
+    It 'does not enforce the model unless explicitly requested' {
+        $RequireLeafModel = $false
+
+        { Assert-RequestedLeafModelObserved } | Should -Not -Throw
     }
 }
 
