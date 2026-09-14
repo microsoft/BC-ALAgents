@@ -585,6 +585,11 @@ try {
     if ($Mode -eq 'Existing') { $env:REVIEW_DIFF_STYLE = 'direct' }
     else { Remove-Item Env:REVIEW_DIFF_STYLE -ErrorAction SilentlyContinue }
     if ($Model) { $env:COPILOT_MODEL = $Model }
+    $copilotVersionText = (& copilot --version 2>&1 | Out-String).Trim()
+    if ($copilotVersionText -notmatch '\b(\d+\.\d+\.\d+(?:-\d+)?)\b') {
+        throw "Could not resolve Copilot CLI version from: $copilotVersionText"
+    }
+    $env:COPILOT_REVIEW_CLI_VERSION = $Matches[1]
     if ($LeafModel) { $env:COPILOT_REVIEW_LEAF_MODEL = $LeafModel }
     else { Remove-Item Env:COPILOT_REVIEW_LEAF_MODEL -ErrorAction SilentlyContinue }
     $env:COPILOT_REVIEW_LEAF_EXECUTION = $LeafExecution.ToLowerInvariant()

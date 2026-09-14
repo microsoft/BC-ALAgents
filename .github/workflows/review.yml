@@ -306,7 +306,9 @@ jobs:
           node-version: 24
 
       - name: Install Copilot CLI
-        run: npm install --global @github/copilot
+        run: |
+          npm install --global @github/copilot@1.0.83
+          copilot --version
 
       - name: Install powershell-yaml
         run: |
@@ -378,6 +380,7 @@ jobs:
           BCQUALITY_APPLICATION_AREA: ${{ inputs.application_area }}
           BCQUALITY_BC_VERSION: ${{ inputs.bc_version }}
           COPILOT_MODEL: ${{ inputs.copilot_model }}
+          COPILOT_REVIEW_CLI_VERSION: 1.0.83
           COPILOT_REVIEW_LEAF_MODEL: ${{ inputs.copilot_leaf_model }}
           COPILOT_REVIEW_LEAF_EXECUTION: ${{ inputs.leaf_execution }}
           COPILOT_REVIEW_MAX_LEAF_CONCURRENCY: ${{ inputs.max_leaf_concurrency }}

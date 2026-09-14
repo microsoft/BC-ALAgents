@@ -123,7 +123,7 @@ a 30-minute cap built in. Stream output so the user sees progress.
 
 ### 3. Summarize findings + run metrics
 
-After completion, read two files from `<OutputDir>` (default `<RepoPath>/.bc-review/`):
+After completion, read three files from `<OutputDir>` (default `<RepoPath>/.bc-review/`):
 
 - `_review-report.json` - findings (BCQuality skills contract)
 - `_run-metrics.json` - schema-versioned structured usage from the Copilot CLI
@@ -131,6 +131,8 @@ After completion, read two files from `<OutputDir>` (default `<RepoPath>/.bc-rev
   exact `ai_credits` or legacy `premium_requests`, `models`, and
   source/completeness fields. Nullable metrics were not exposed by every
   counted request and must not be inferred from transcript text.
+- `_run-manifest.json` - resolved engine, BCQuality, CLI, model, scheduling,
+  ordered leaf plan, and per-process status/usage telemetry.
 
 Present a clean, scannable report using this exact structure. Lead with a
 one-line verdict so the user gets the headline before any detail.

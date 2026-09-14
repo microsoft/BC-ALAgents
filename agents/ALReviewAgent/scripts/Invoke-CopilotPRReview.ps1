@@ -54,6 +54,7 @@
                                                 Other local reviews use the Copilot
                                                 CLI credential store.
         COPILOT_MODEL                        - explicit model name for Copilot CLI
+        COPILOT_REVIEW_CLI_VERSION           - pinned Copilot CLI version
         COPILOT_REVIEW_LEAF_MODEL            - required explicit model for leaf processes
         COPILOT_REVIEW_LEAF_EXECUTION        - serial|parallel (default serial)
         COPILOT_REVIEW_MAX_LEAF_CONCURRENCY  - positive concurrency bound for parallel mode
@@ -84,6 +85,7 @@ $GithubToken      = $env:GITHUB_TOKEN
 $CopilotToken     = $env:GH_TOKEN
 $CopilotGithubToken = $env:COPILOT_GITHUB_TOKEN
 $Repository       = $env:GITHUB_REPOSITORY
+$EngineRoot       = Split-Path -Parent (Split-Path -Parent (Split-Path -Parent $PSScriptRoot))
 # GitHub host. Actions sets GITHUB_SERVER_URL / GITHUB_API_URL on every runner,
 # including GitHub Enterprise Cloud with data residency (*.ghe.com) and GHES,
 # so honouring them keeps the review host-neutral. Defaults keep local runs on
@@ -107,6 +109,7 @@ if ($BCQualityConsume -notin @('cwd', 'plugin')) {
     throw "BCQUALITY_CONSUME must be 'cwd' or 'plugin' (got '$BCQualityConsume')"
 }
 $CopilotModel     = ($env:COPILOT_MODEL ?? '').Trim()
+$CopilotCliVersion = ($env:COPILOT_REVIEW_CLI_VERSION ?? '').Trim()
 $LeafModel        = ($env:COPILOT_REVIEW_LEAF_MODEL ?? '').Trim()
 $LeafExecution = (($env:COPILOT_REVIEW_LEAF_EXECUTION ?? 'serial') + '').Trim().ToLowerInvariant()
 if ($LeafExecution -notin @('serial', 'parallel')) {
@@ -230,6 +233,12 @@ $script:BCQualityWebRepoUrl = $null # cached BCQuality web URL for reference lin
 $script:AgentTranscript   = ''      # interleaved Copilot CLI transcript (set by Invoke-CopilotCli)
 $script:CopilotOtelRecords = $null  # cached after the raw temporary JSONL is deleted
 $script:CopilotOtelMalformedRecords = 0
+$script:LastCopilotInvocationMetrics = $null
+$script:CurrentCopilotInvocationStartedAt = $null
+$script:ReviewProcessTelemetry = [System.Collections.Generic.List[object]]::new()
+$script:ReviewPlanIds = @()
+$script:ReviewPlanSourceSnapshot = ''
+$script:ReviewRunCompletedAt = $null
 
 # ---------------------------------------------------------------------------
 # Logging helpers
@@ -346,6 +355,9 @@ function Assert-Config {
         }
         if (-not $CopilotModel) {
             throw 'COPILOT_MODEL is required for deterministic root consolidation.'
+        }
+        if ($CopilotCliVersion -notmatch '^\d+\.\d+\.\d+(?:-\d+)?$') {
+            throw 'COPILOT_REVIEW_CLI_VERSION must contain the pinned Copilot CLI version.'
         }
         if (-not $LeafModel) {
             throw 'COPILOT_REVIEW_LEAF_MODEL is required for deterministic leaf execution.'
@@ -1362,6 +1374,15 @@ function Save-CurrentCopilotRunMetrics {
             }
             $script:CopilotOtelRecords = @($existingRecords) + @($parsed.Records)
             $script:CopilotOtelMalformedRecords += $parsed.MalformedRecords
+            $invocationElapsed = if ($null -ne $script:CurrentCopilotInvocationStartedAt) {
+                ([DateTime]::UtcNow - $script:CurrentCopilotInvocationStartedAt).TotalSeconds
+            } else {
+                $null
+            }
+            $script:LastCopilotInvocationMetrics = Get-CopilotRunMetrics `
+                -Records $parsed.Records `
+                -WallTimeSeconds $invocationElapsed `
+                -MalformedRecords $parsed.MalformedRecords
             if ($parsed.MalformedRecords -gt 0) {
                 Write-Warning "Ignored $($parsed.MalformedRecords) malformed Copilot OTel record(s)."
             }
@@ -1437,6 +1458,7 @@ function Clear-CopilotMetricsArtifacts {
     if ($AgentWorkDir) { [void]$paths.Add((Join-Path $AgentWorkDir '_copilot-otel.jsonl')) }
     if ($OutputDir) {
         [void]$paths.Add((Join-Path $OutputDir '_run-metrics.json'))
+        [void]$paths.Add((Join-Path $OutputDir '_run-manifest.json'))
         [void]$paths.Add((Join-Path $OutputDir '_copilot-otel.jsonl'))
     }
     foreach ($path in $paths) {
@@ -1454,6 +1476,129 @@ function Clear-CopilotMetricsArtifacts {
 # ---------------------------------------------------------------------------
 # Deterministic leaf orchestration
 # ---------------------------------------------------------------------------
+function Get-ReviewRelativeArtifactPath {
+    param([string] $Path)
+    if (-not $Path) { return $null }
+    return ([System.IO.Path]::GetRelativePath($ReviewOutputDir, $Path) -replace '\\', '/')
+}
+
+function Add-ReviewProcessTelemetry {
+    param(
+        [Parameter(Mandatory)][ValidateSet('leaf', 'root')][string] $Role,
+        [Parameter(Mandatory)][int] $Ordinal,
+        [Parameter(Mandatory)][string] $SkillId,
+        [Parameter(Mandatory)][string] $RequestedModel,
+        [Parameter(Mandatory)][ValidateSet('completed', 'failed')][string] $Status,
+        [Parameter(Mandatory)][DateTime] $StartedAt,
+        [Parameter(Mandatory)][DateTime] $CompletedAt,
+        [object] $Metrics,
+        [object] $ExitCode,
+        [string] $ReportPath,
+        [string] $FailureReason
+    )
+
+    $observedModels = [string[]]@()
+    if ($null -ne $Metrics) {
+        $observedModels = [string[]]@($Metrics.models)
+    }
+    $script:ReviewProcessTelemetry.Add([pscustomobject][ordered]@{
+        role = $Role
+        ordinal = $Ordinal
+        skill_id = $SkillId
+        requested_model = $RequestedModel
+        observed_models = $observedModels
+        status = $Status
+        started_at = $StartedAt.ToString('o')
+        completed_at = $CompletedAt.ToString('o')
+        duration_seconds = [Math]::Round(($CompletedAt - $StartedAt).TotalSeconds, 3)
+        exit_code = $ExitCode
+        report_path = Get-ReviewRelativeArtifactPath -Path $ReportPath
+        failure_reason = if ($FailureReason) { $FailureReason } else { $null }
+        metrics = $Metrics
+    }) | Out-Null
+}
+
+function Assert-CopilotInvocationMetrics {
+    param(
+        [Parameter(Mandatory)][object] $Metrics,
+        [Parameter(Mandatory)][string] $RequestedModel,
+        [Parameter(Mandatory)][string] $InvocationLabel
+    )
+
+    $observedModels = @($Metrics.models | ForEach-Object { ([string]$_).Trim() } | Where-Object { $_ })
+    if ($observedModels.Count -ne 1 -or $observedModels[0] -ne $RequestedModel) {
+        $observed = if ($observedModels.Count -gt 0) { $observedModels -join ', ' } else { '(none)' }
+        throw "$InvocationLabel required model '$RequestedModel'; observed: $observed."
+    }
+    if (-not [bool]$Metrics.usage_complete) {
+        throw "$InvocationLabel produced incomplete Copilot usage telemetry."
+    }
+    if ([int]$Metrics.malformed_records -ne 0) {
+        throw "$InvocationLabel produced $($Metrics.malformed_records) malformed Copilot telemetry record(s)."
+    }
+    if (([string]$Metrics.cli_version).Trim() -ne $CopilotCliVersion) {
+        $observedVersion = if ($Metrics.cli_version) { $Metrics.cli_version } else { '(none)' }
+        throw "$InvocationLabel expected Copilot CLI '$CopilotCliVersion'; telemetry reported '$observedVersion'."
+    }
+}
+
+function Save-ReviewRunManifest {
+    param(
+        [Parameter(Mandatory)][ValidateSet('running', 'completed', 'failed')][string] $Status,
+        [string] $FailureReason
+    )
+
+    if ($Status -ne 'running') {
+        $script:ReviewRunCompletedAt = [DateTime]::UtcNow
+    }
+    $engineSha = (& git -C $EngineRoot rev-parse HEAD 2>$null | Select-Object -First 1)
+    if ($engineSha) { $engineSha = $engineSha.Trim() }
+    $orderedProcesses = @($script:ReviewProcessTelemetry | Sort-Object ordinal, role)
+    $manifest = [pscustomobject][ordered]@{
+        schema_version = 1
+        status = $Status
+        started_at = $ReviewStartedAt.ToString('o')
+        completed_at = if ($null -ne $script:ReviewRunCompletedAt) { $script:ReviewRunCompletedAt.ToString('o') } else { $null }
+        failure_reason = if ($FailureReason) { $FailureReason } else { $null }
+        engine = [pscustomobject][ordered]@{
+            repository = 'microsoft/BC-ALAgents'
+            commit = $engineSha
+            agent_version = $AgentVersion
+        }
+        bcquality = [pscustomobject][ordered]@{
+            commit = if ($BCQualitySha) { $BCQualitySha } else { $null }
+            source_snapshot = if ($script:ReviewPlanSourceSnapshot) { $script:ReviewPlanSourceSnapshot } else { $null }
+        }
+        configuration = [pscustomobject][ordered]@{
+            copilot_cli_version = $CopilotCliVersion
+            root_model = $CopilotModel
+            leaf_model = $LeafModel
+            leaf_execution = $LeafExecution
+            max_leaf_concurrency = $MaxLeafConcurrency
+            cli_timeout_minutes = $CopilotCliTimeoutMinutes
+            minimum_severity = $MinimumSeverity
+            agent_minimum_severity = $AgentMinimumSeverity
+            review_source = $ReviewSource
+        }
+        plan = [pscustomobject][ordered]@{
+            skill_id = 'al-code-review'
+            leaf_count = @($script:ReviewPlanIds).Count
+            leaf_ids = @($script:ReviewPlanIds)
+        }
+        processes = $orderedProcesses
+    }
+
+    $manifestJson = $manifest | ConvertTo-Json -Depth 20
+    $manifestSchemaPath = Join-Path $EngineRoot 'agents/ALReviewAgent/schemas/run-manifest.schema.json'
+    if (-not ($manifestJson | Test-Json -SchemaFile $manifestSchemaPath -ErrorAction Stop)) {
+        throw 'Generated review run manifest does not conform to its schema.'
+    }
+    New-Item -ItemType Directory -Path $ReviewOutputDir -Force | Out-Null
+    Set-Content -LiteralPath (Join-Path $ReviewOutputDir '_run-manifest.json') `
+        -Value $manifestJson `
+        -Encoding UTF8
+}
+
 function Get-ReviewLeafPlan {
     param([string] $SkillId = 'al-code-review')
 
@@ -1477,6 +1622,7 @@ function Get-ReviewLeafPlan {
     if ([int]$index.version -ne 1) {
         throw "Unsupported BCQuality skill-index version '$($index.version)'. Expected version 1."
     }
+    $script:ReviewPlanSourceSnapshot = ([string]$index.sourceSnapshot).Trim()
 
     $skillsByPath = @{}
     foreach ($skill in @($index.skills)) {
@@ -1526,6 +1672,7 @@ function Get-ReviewLeafPlan {
     if ($plan.Count -eq 0) {
         throw "BCQuality '$SkillId' resolved to no enabled leaves."
     }
+    $script:ReviewPlanIds = @($plan | ForEach-Object { [string]$_.id })
     return @($plan)
 }
 
@@ -1676,6 +1823,8 @@ function Receive-LeafCopilotProcess {
     param([Parameter(Mandatory)][object] $State)
 
     $process = $State.Process
+    $leafMetrics = $null
+    $reportPath = Join-Path $State.WorkDir $ReportFileName
     $elapsed = [DateTime]::UtcNow - $State.StartedAt
     $timedOut = $CopilotCliTimeoutMinutes -gt 0 -and $elapsed.TotalMinutes -ge $CopilotCliTimeoutMinutes
     if ($timedOut -and -not $process.HasExited) {
@@ -1716,13 +1865,11 @@ function Receive-LeafCopilotProcess {
         $script:CopilotOtelRecords = @($existingRecords) + @($parsedTelemetry.Records)
         $script:CopilotOtelMalformedRecords += $parsedTelemetry.MalformedRecords
 
-        $observedModels = @($leafMetrics.models | ForEach-Object { ([string]$_).Trim() } | Where-Object { $_ })
-        if ($observedModels.Count -eq 0 -or @($observedModels | Where-Object { $_ -ne $LeafModel }).Count -gt 0) {
-            $observed = if ($observedModels.Count -gt 0) { $observedModels -join ', ' } else { '(none)' }
-            throw "Leaf '$($State.Leaf.id)' required model '$LeafModel'; observed: $observed."
-        }
+        Assert-CopilotInvocationMetrics `
+            -Metrics $leafMetrics `
+            -RequestedModel $LeafModel `
+            -InvocationLabel "Leaf '$($State.Leaf.id)'"
 
-        $reportPath = Join-Path $State.WorkDir $ReportFileName
         if (-not (Test-Path -LiteralPath $reportPath -PathType Leaf)) {
             throw "Leaf '$($State.Leaf.id)' did not produce '$reportPath'."
         }
@@ -1743,12 +1890,44 @@ function Receive-LeafCopilotProcess {
         }
 
         Write-LogPhaseDetail "Leaf $($State.Leaf.ordinal)/$($State.Leaf.id) completed: $(@($reportObject.findings).Count) finding(s), $($leafMetrics.total_tokens) token(s)."
+        $completedAt = [DateTime]::UtcNow
+        Add-ReviewProcessTelemetry `
+            -Role leaf `
+            -Ordinal $State.Leaf.ordinal `
+            -SkillId $State.Leaf.id `
+            -RequestedModel $LeafModel `
+            -Status completed `
+            -StartedAt $State.StartedAt `
+            -CompletedAt $completedAt `
+            -Metrics $leafMetrics `
+            -ExitCode $process.ExitCode `
+            -ReportPath $reportPath
+        Save-ReviewRunManifest -Status running
         return [pscustomobject]@{
             Leaf = $State.Leaf
             ReportPath = $reportPath
             Report = $reportObject
             Metrics = $leafMetrics
         }
+    }
+    catch {
+        $failure = $_
+        $completedAt = [DateTime]::UtcNow
+        $exitCode = try { if ($process.HasExited) { $process.ExitCode } else { $null } } catch { $null }
+        Add-ReviewProcessTelemetry `
+            -Role leaf `
+            -Ordinal $State.Leaf.ordinal `
+            -SkillId $State.Leaf.id `
+            -RequestedModel $LeafModel `
+            -Status failed `
+            -StartedAt $State.StartedAt `
+            -CompletedAt $completedAt `
+            -Metrics $leafMetrics `
+            -ExitCode $exitCode `
+            -ReportPath $(if (Test-Path -LiteralPath $reportPath -PathType Leaf) { $reportPath } else { $null }) `
+            -FailureReason $failure.Exception.Message
+        Save-ReviewRunManifest -Status failed -FailureReason $failure.Exception.Message
+        throw $failure
     }
     finally {
         $process.Dispose()
@@ -1773,7 +1952,24 @@ function Invoke-DeterministicLeafReviews {
                 $workDir = Join-Path $leafRoot ('{0:D2}-{1}' -f $leaf.ordinal, $leaf.id)
                 $prompt = New-LeafReviewPrompt -Leaf $leaf -WorkDir $workDir
                 Write-LogPhaseDetail "Starting leaf $($leaf.ordinal)/$($Plan.Count): $($leaf.id) on $LeafModel."
-                $active.Add((Start-LeafCopilotProcess -Leaf $leaf -WorkDir $workDir -Prompt $prompt)) | Out-Null
+                $leafStart = [DateTime]::UtcNow
+                try {
+                    $active.Add((Start-LeafCopilotProcess -Leaf $leaf -WorkDir $workDir -Prompt $prompt)) | Out-Null
+                }
+                catch {
+                    Add-ReviewProcessTelemetry `
+                        -Role leaf `
+                        -Ordinal $leaf.ordinal `
+                        -SkillId $leaf.id `
+                        -RequestedModel $LeafModel `
+                        -Status failed `
+                        -StartedAt $leafStart `
+                        -CompletedAt ([DateTime]::UtcNow) `
+                        -ExitCode $null `
+                        -FailureReason $_.Exception.Message
+                    Save-ReviewRunManifest -Status failed -FailureReason $_.Exception.Message
+                    throw
+                }
             }
 
             $completed = @($active | Where-Object {
@@ -1954,6 +2150,7 @@ function Invoke-CopilotCli {
     $process   = $null
     $processStarted = $false
     $startedAt = [DateTime]::UtcNow
+    $script:CurrentCopilotInvocationStartedAt = $startedAt
 
     try {
         $copilotCommand = Get-Command copilot.exe -CommandType Application -ErrorAction SilentlyContinue |
@@ -3885,6 +4082,9 @@ function Save-ReviewArtifacts {
     if (Test-Path -LiteralPath (Join-Path $ReviewOutputDir '_run-metrics.json') -PathType Leaf) {
         $savedFiles.Add('_run-metrics.json') | Out-Null
     }
+    if (Test-Path -LiteralPath (Join-Path $ReviewOutputDir '_run-manifest.json') -PathType Leaf) {
+        $savedFiles.Add('_run-manifest.json') | Out-Null
+    }
 
     Write-Host "Saved review artifacts to $ReviewOutputDir"
     foreach ($f in $savedFiles) { Write-LogPhaseDetail "- $f" }
@@ -4041,11 +4241,35 @@ if ($ReviewPhase -ne 'post') {
     if ($disabledSkills.Count -gt 0) { Write-LogPhaseDetail "Disabled skills: $($disabledSkills -join ', ')" }
     $leafPlan = @(Get-ReviewLeafPlan)
     Write-LogPhaseDetail "Resolved $($leafPlan.Count) ordered review leaves from BCQuality's generated skill index."
+    Save-ReviewRunManifest -Status running
     $leafResults = @(Invoke-DeterministicLeafReviews -Plan $leafPlan)
     Write-LogPhaseDetail "All $($leafResults.Count) leaf processes completed; starting root consolidation on $CopilotModel."
     $prompt = Build-ConsolidationPrompt -LeafResults $leafResults
-    $output = Invoke-CopilotCli -Prompt $prompt
-    Assert-RequestedLeafModelObserved
+    $rootStartedAt = [DateTime]::UtcNow
+    try {
+        $output = Invoke-CopilotCli -Prompt $prompt
+        Assert-CopilotInvocationMetrics `
+            -Metrics $script:LastCopilotInvocationMetrics `
+            -RequestedModel $CopilotModel `
+            -InvocationLabel 'Root consolidation'
+        Assert-RequestedLeafModelObserved
+    }
+    catch {
+        $rootFailure = $_
+        Add-ReviewProcessTelemetry `
+            -Role root `
+            -Ordinal ($leafPlan.Count + 1) `
+            -SkillId 'al-code-review' `
+            -RequestedModel $CopilotModel `
+            -Status failed `
+            -StartedAt $rootStartedAt `
+            -CompletedAt ([DateTime]::UtcNow) `
+            -Metrics $script:LastCopilotInvocationMetrics `
+            -ExitCode $null `
+            -FailureReason $rootFailure.Exception.Message
+        Save-ReviewRunManifest -Status failed -FailureReason $rootFailure.Exception.Message
+        throw $rootFailure
+    }
     Pop-LogGroup
 
     # Prefer the structured report file the model wrote to its working directory.
@@ -4079,7 +4303,38 @@ if ($ReviewPhase -ne 'post') {
         Write-LogNotice 'No report file' "Model did not write '$reportFilePath'; falling back to scraped stdout parsing."
     }
 
-    Assert-ConsolidatedReport -ReportText $output -Plan $leafPlan
+    try {
+        Assert-ConsolidatedReport -ReportText $output -Plan $leafPlan
+    }
+    catch {
+        $rootFailure = $_
+        Add-ReviewProcessTelemetry `
+            -Role root `
+            -Ordinal ($leafPlan.Count + 1) `
+            -SkillId 'al-code-review' `
+            -RequestedModel $CopilotModel `
+            -Status failed `
+            -StartedAt $rootStartedAt `
+            -CompletedAt ([DateTime]::UtcNow) `
+            -Metrics $script:LastCopilotInvocationMetrics `
+            -ExitCode 0 `
+            -ReportPath $(if (Test-Path -LiteralPath $reportFilePath -PathType Leaf) { $reportFilePath } else { $null }) `
+            -FailureReason $rootFailure.Exception.Message
+        Save-ReviewRunManifest -Status failed -FailureReason $rootFailure.Exception.Message
+        throw $rootFailure
+    }
+    Add-ReviewProcessTelemetry `
+        -Role root `
+        -Ordinal ($leafPlan.Count + 1) `
+        -SkillId 'al-code-review' `
+        -RequestedModel $CopilotModel `
+        -Status completed `
+        -StartedAt $rootStartedAt `
+        -CompletedAt ([DateTime]::UtcNow) `
+        -Metrics $script:LastCopilotInvocationMetrics `
+        -ExitCode 0 `
+        -ReportPath $reportFilePath
+    Save-ReviewRunManifest -Status completed
 
     # Persist the raw agent output (plus transcript and filter report) so the
     # separate, write-capable publish phase can post findings without the

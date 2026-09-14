@@ -12,6 +12,7 @@ param()
 
 BeforeAll {
     $scriptPath = Join-Path (Join-Path (Split-Path -Parent $PSScriptRoot) 'scripts') 'Invoke-CopilotPRReview.ps1'
+    $EngineRoot = Split-Path -Parent (Split-Path -Parent (Split-Path -Parent (Split-Path -Parent $scriptPath)))
     $tokens = $null
     $parseErrors = $null
     $ast = [System.Management.Automation.Language.Parser]::ParseFile(
@@ -839,6 +840,21 @@ Describe 'Domain rendering safety' {
 Describe 'Deterministic leaf orchestration contract' {
     BeforeEach {
         $BCQualityRoot = Join-Path $TestDrive 'deterministic-bcquality'
+        $ReviewOutputDir = Join-Path $TestDrive 'review-output'
+        $ReviewStartedAt = [DateTime]::UtcNow.AddSeconds(-5)
+        $CopilotCliVersion = '1.0.83'
+        $CopilotModel = 'claude-sonnet-5'
+        $LeafModel = 'gpt-5.4'
+        $LeafExecution = 'serial'
+        $MaxLeafConcurrency = 4
+        $CopilotCliTimeoutMinutes = 30
+        $MinimumSeverity = 'Low'
+        $AgentMinimumSeverity = 'Low'
+        $ReviewSource = 'local'
+        $BCQualitySha = '25accf021ed2e5d9c1f776c4dc13580bf072b678'
+        $AgentVersion = '1.0.0'
+        $script:ReviewProcessTelemetry = [System.Collections.Generic.List[object]]::new()
+        $script:ReviewRunCompletedAt = $null
         New-Item -ItemType Directory -Path (Join-Path $BCQualityRoot 'microsoft/skills/review') -Force | Out-Null
         New-Item -ItemType Directory -Path (Join-Path $BCQualityRoot 'skills') -Force | Out-Null
         New-Item -ItemType Directory -Path (Join-Path $BCQualityRoot 'schemas') -Force | Out-Null
@@ -952,6 +968,68 @@ Describe 'Deterministic leaf orchestration contract' {
         { Assert-ConsolidatedReport -ReportText $report -Plan $plan } |
             Should -Throw "*was 'al-style-review'; expected 'al-security-review'*"
     }
+
+    It 'fails closed on model, usage, malformed-record, and CLI-version telemetry mismatches' {
+        $valid = [pscustomobject]@{
+            models = @('gpt-5.4')
+            usage_complete = $true
+            malformed_records = 0
+            cli_version = '1.0.83'
+        }
+        { Assert-CopilotInvocationMetrics -Metrics $valid -RequestedModel 'gpt-5.4' -InvocationLabel 'leaf' } |
+            Should -Not -Throw
+
+        $wrongModel = $valid.PSObject.Copy()
+        $wrongModel.models = @('gemini-3.6-flash')
+        { Assert-CopilotInvocationMetrics -Metrics $wrongModel -RequestedModel 'gpt-5.4' -InvocationLabel 'leaf' } |
+            Should -Throw "*required model 'gpt-5.4'*"
+
+        $incomplete = $valid.PSObject.Copy()
+        $incomplete.usage_complete = $false
+        { Assert-CopilotInvocationMetrics -Metrics $incomplete -RequestedModel 'gpt-5.4' -InvocationLabel 'leaf' } |
+            Should -Throw '*incomplete Copilot usage telemetry*'
+
+        $malformed = $valid.PSObject.Copy()
+        $malformed.malformed_records = 1
+        { Assert-CopilotInvocationMetrics -Metrics $malformed -RequestedModel 'gpt-5.4' -InvocationLabel 'leaf' } |
+            Should -Throw '*1 malformed Copilot telemetry record*'
+
+        $wrongCli = $valid.PSObject.Copy()
+        $wrongCli.cli_version = '1.0.82'
+        { Assert-CopilotInvocationMetrics -Metrics $wrongCli -RequestedModel 'gpt-5.4' -InvocationLabel 'leaf' } |
+            Should -Throw "*expected Copilot CLI '1.0.83'*"
+    }
+
+    It 'writes a resolved run manifest with ordered per-process telemetry' {
+        $script:ReviewPlanIds = @('al-security-review')
+        $script:ReviewPlanSourceSnapshot = 'aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa'
+        $metrics = [pscustomobject]@{
+            models = @('gpt-5.4')
+            usage_complete = $true
+            malformed_records = 0
+            cli_version = '1.0.83'
+            total_tokens = 12
+        }
+        $started = [DateTime]::UtcNow.AddSeconds(-2)
+        Add-ReviewProcessTelemetry -Role leaf -Ordinal 1 -SkillId 'al-security-review' `
+            -RequestedModel 'gpt-5.4' -Status completed -StartedAt $started `
+            -CompletedAt ([DateTime]::UtcNow) -Metrics $metrics -ExitCode 0 `
+            -ReportPath (Join-Path $ReviewOutputDir 'leaf-results/01-security/_review-report.json')
+
+        Save-ReviewRunManifest -Status completed
+
+        $manifest = Get-Content -LiteralPath (Join-Path $ReviewOutputDir '_run-manifest.json') -Raw |
+            ConvertFrom-Json
+        $manifest.schema_version | Should -Be 1
+        $manifest.status | Should -Be 'completed'
+        $manifest.configuration.copilot_cli_version | Should -Be '1.0.83'
+        $manifest.configuration.root_model | Should -Be 'claude-sonnet-5'
+        $manifest.configuration.leaf_execution | Should -Be 'serial'
+        $manifest.bcquality.commit | Should -Be $BCQualitySha
+        $manifest.plan.leaf_ids | Should -Be @('al-security-review')
+        $manifest.processes[0].requested_model | Should -Be 'gpt-5.4'
+        $manifest.processes[0].report_path | Should -Be 'leaf-results/01-security/_review-report.json'
+    }
 }
 
 Describe 'Local review authentication' {
@@ -982,6 +1060,7 @@ Describe 'Local review authentication' {
         $AgentMinimumSeverity = 'Low'
         $CopilotCliTimeoutMinutes = 30
         $CopilotModel = 'claude-sonnet-5'
+        $CopilotCliVersion = '1.0.83'
         $LeafModel = 'gpt-5.4'
 
         Mock Get-Command {
