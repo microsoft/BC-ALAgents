@@ -43,7 +43,7 @@
         BCQUALITY_ROOT     - path to the filtered BCQuality clone
 
     Optional environment variables:
-        BCQUALITY_SHA                        - resolved BCQuality commit SHA (for refs URLs)
+        BCQUALITY_SHA                        - optional expected BCQuality SHA; the checkout remains authoritative
         REVIEW_WORKSPACE                     - trusted base checkout path (default: GITHUB_WORKSPACE)
         REVIEW_OUTPUT_DIR                    - artifact output folder
         REVIEW_TARGET_WORKSPACE              - detached PR-head worktree path
@@ -96,7 +96,23 @@ $TrustedWorkspace = $env:REVIEW_WORKSPACE ?? $env:GITHUB_WORKSPACE ?? (Get-Locat
 $PrNumber         = [int]($env:PR_NUMBER ?? 0)
 $PrHeadSha        = $env:PR_HEAD_SHA
 $BCQualityRoot    = $env:BCQUALITY_ROOT
-$BCQualitySha     = ($env:BCQUALITY_SHA ?? '').Trim()
+function Resolve-BCQualityCommit {
+    param(
+        [Parameter(Mandatory)][string] $Root,
+        [string] $ExpectedCommit
+    )
+
+    $resolvedCommit = (& git -C $Root rev-parse HEAD 2>$null | Select-Object -First 1)
+    if ($resolvedCommit) { $resolvedCommit = $resolvedCommit.Trim() }
+    if ($resolvedCommit -notmatch '\A[0-9a-f]{40}\z') {
+        throw "Could not resolve the BCQuality commit from checkout '$Root'."
+    }
+    if ($ExpectedCommit -and $ExpectedCommit -ne $resolvedCommit) {
+        throw "BCQuality checkout commit '$resolvedCommit' does not match expected commit '$ExpectedCommit'."
+    }
+    return $resolvedCommit
+}
+$BCQualitySha = Resolve-BCQualityCommit -Root $BCQualityRoot -ExpectedCommit (($env:BCQUALITY_SHA ?? '').Trim())
 # BCQuality consumption mode. 'cwd' (default, legacy) runs the Copilot CLI with
 # its working directory set to the BCQuality clone, so the agent reads
 # ./skills/entry.md directly and writes per-run artifacts into the clone. 'plugin'

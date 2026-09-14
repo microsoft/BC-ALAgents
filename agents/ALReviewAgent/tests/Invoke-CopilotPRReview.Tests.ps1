@@ -1032,6 +1032,25 @@ Describe 'Deterministic leaf orchestration contract' {
     }
 }
 
+Describe 'BCQuality revision ownership' {
+    It 'derives the commit from the checkout and only treats an input SHA as an assertion' {
+        $root = Join-Path $TestDrive 'bcquality-revision'
+        New-Item -ItemType Directory -Path $root -Force | Out-Null
+        & git -C $root init -q
+        & git -C $root config user.email 'test@example.com'
+        & git -C $root config user.name 'Test'
+        Set-Content -LiteralPath (Join-Path $root 'entry.md') -Value '# test'
+        & git -C $root add entry.md
+        & git -C $root commit -q -m 'test'
+        $expected = (& git -C $root rev-parse HEAD).Trim()
+
+        Resolve-BCQualityCommit -Root $root | Should -Be $expected
+        Resolve-BCQualityCommit -Root $root -ExpectedCommit $expected | Should -Be $expected
+        { Resolve-BCQualityCommit -Root $root -ExpectedCommit ('f' * 40) } |
+            Should -Throw "*does not match expected commit*"
+    }
+}
+
 Describe 'Local review authentication' {
     BeforeAll {
         $script:AuthWorkspace = Join-Path $TestDrive 'workspace'
