@@ -851,7 +851,7 @@ Describe 'Deterministic leaf orchestration contract' {
         $MinimumSeverity = 'Low'
         $AgentMinimumSeverity = 'Low'
         $ReviewSource = 'local'
-        $BCQualitySha = '25accf021ed2e5d9c1f776c4dc13580bf072b678'
+        $BCQualitySha = 'b74967bc5b7a454eae19d6a1250199afd869f064'
         $AgentVersion = '1.0.0'
         $script:ReviewProcessTelemetry = [System.Collections.Generic.List[object]]::new()
         $script:ReviewRunCompletedAt = $null
