@@ -60,6 +60,19 @@ if (-not $ReportPath) {
     $ReportPath = Join-Path $BCQualityRoot '_filter-report.json'
 }
 
+# Capture the complete action-skill contract before pruning disabled layers or
+# skills. The review orchestrator consumes this immutable plan and then applies
+# the resolved configuration to it; generating after pruning would make valid
+# disabled leaves look like broken references.
+$skillIndexScript = Join-Path $BCQualityRoot 'tools/Build-SkillIndex.ps1'
+$skillIndexPath = Join-Path $BCQualityRoot '_skill-index.json'
+if (Test-Path -LiteralPath $skillIndexScript -PathType Leaf) {
+    & $skillIndexScript -BCQualityRoot $BCQualityRoot -IndexPath $skillIndexPath | Out-Null
+}
+else {
+    Write-Warning "BCQuality checkout has no skill-index generator; deterministic review execution will reject this checkout."
+}
+
 $layers = @($Config['enabled-layers'])
 $disabledSkills = @($Config['disabled-skills'])
 $allow = @($Config['knowledge']['allow'])

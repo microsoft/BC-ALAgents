@@ -94,19 +94,22 @@ invent flags - the wrapper's full parameter set is exactly:
 `-ConfigPath <path>` (optional; defaults to the engine's `agents/ALReviewAgent/bcquality.config.yaml`)
 `-OutputDir <path>` (optional; default `<repo>/.bc-review`)
 `-MinimumSeverity Critical|High|Medium|Low` (default Medium)
-`-Model <name>` (optional)
-`-LeafModel <name>` (optional; lighter model for leaf sub-agents)
+`-Model <name>` (required; root self-review and consolidation model)
+`-LeafModel <name>` (required; model pinned to every isolated leaf process)
+`-LeafExecution Serial|Parallel` (default Serial)
+`-MaxLeafConcurrency <int>` (default 4; used only in Parallel mode)
 `-Path <folder-or-glob>` (optional; scope findings to a subtree)
 `-Fix` (switch)
 `-SkipBCQualityFilter` (switch)
 `-NoPruneDomains` (switch; run every review domain unconditionally)
-`-NoParallelLeaves` (switch; disable concurrent leaf dispatch)
 
 ```powershell
 $reviewScript = "<resolved-skill-dir>/../../scripts/Invoke-LocalReview.ps1"
 $reviewParameters = @{
     RepoPath = <repo>
     Mode = 'Branch'
+    Model = <root-model>
+    LeafModel = <leaf-model>
 }
 & $reviewScript @reviewParameters
 ```
@@ -120,7 +123,7 @@ a 30-minute cap built in. Stream output so the user sees progress.
 
 ### 3. Summarize findings + run metrics
 
-After completion, read two files from `<OutputDir>` (default `<RepoPath>/.bc-review/`):
+After completion, read three files from `<OutputDir>` (default `<RepoPath>/.bc-review/`):
 
 - `_review-report.json` - findings (BCQuality skills contract)
 - `_run-metrics.json` - schema-versioned structured usage from the Copilot CLI
@@ -128,6 +131,8 @@ After completion, read two files from `<OutputDir>` (default `<RepoPath>/.bc-rev
   exact `ai_credits` or legacy `premium_requests`, `models`, and
   source/completeness fields. Nullable metrics were not exposed by every
   counted request and must not be inferred from transcript text.
+- `_run-manifest.json` - resolved engine, BCQuality, CLI, model, scheduling,
+  ordered leaf plan, and per-process status/usage telemetry.
 
 Present a clean, scannable report using this exact structure. Lead with a
 one-line verdict so the user gets the headline before any detail.

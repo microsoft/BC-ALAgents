@@ -12,6 +12,7 @@ param()
 
 BeforeAll {
     $scriptPath = Join-Path (Join-Path (Split-Path -Parent $PSScriptRoot) 'scripts') 'Invoke-CopilotPRReview.ps1'
+    $EngineRoot = Split-Path -Parent (Split-Path -Parent (Split-Path -Parent (Split-Path -Parent $scriptPath)))
     $tokens = $null
     $parseErrors = $null
     $ast = [System.Management.Automation.Language.Parser]::ParseFile(
@@ -22,7 +23,6 @@ BeforeAll {
     if ($parseErrors.Count -gt 0) {
         throw ($parseErrors | ForEach-Object Message | Out-String)
     }
-
     $ast.FindAll({
         param($node)
         $node -is [System.Management.Automation.Language.FunctionDefinitionAst]
@@ -837,30 +837,217 @@ Describe 'Domain rendering safety' {
     }
 }
 
-Describe 'Build-BootstrapPrompt' {
-    BeforeAll {
-        $AnalysisWorkspace = '/home/runner/review-target'
-        $ReviewSource = 'pr'
-        $Repository = 'microsoft/BCApps'
-        $PrNumber = 9479
-        $DiffBaseRef = 'origin/main'
-        $DiffRange = 'origin/main...HEAD'
-        $ReportFileName = 'findings-report.json'
+Describe 'Deterministic leaf orchestration contract' {
+    BeforeEach {
+        $BCQualityRoot = Join-Path $TestDrive 'deterministic-bcquality'
+        $ReviewOutputDir = Join-Path $TestDrive 'review-output'
+        $ReviewStartedAt = [DateTime]::UtcNow.AddSeconds(-5)
+        $CopilotCliVersion = '1.0.83'
+        $CopilotModel = 'claude-sonnet-5'
+        $LeafModel = 'gpt-5.4'
+        $LeafExecution = 'serial'
+        $MaxLeafConcurrency = 4
+        $CopilotCliTimeoutMinutes = 30
         $MinimumSeverity = 'Low'
+        $AgentMinimumSeverity = 'Low'
+        $ReviewSource = 'local'
+        $BCQualitySha = 'b74967bc5b7a454eae19d6a1250199afd869f064'
+        $AgentVersion = '1.0.0'
+        $script:ReviewProcessTelemetry = [System.Collections.Generic.List[object]]::new()
+        $script:ReviewRunCompletedAt = $null
+        New-Item -ItemType Directory -Path (Join-Path $BCQualityRoot 'microsoft/skills/review') -Force | Out-Null
+        New-Item -ItemType Directory -Path (Join-Path $BCQualityRoot 'skills') -Force | Out-Null
+        New-Item -ItemType Directory -Path (Join-Path $BCQualityRoot 'schemas') -Force | Out-Null
+        '{}' | Set-Content -LiteralPath (Join-Path $BCQualityRoot 'schemas/findings-report.schema.json')
+        Set-Content -LiteralPath (Join-Path $BCQualityRoot 'microsoft/skills/review/al-security-review.md') -Value '# security'
+        Set-Content -LiteralPath (Join-Path $BCQualityRoot 'microsoft/skills/review/al-style-review.md') -Value '# style'
 
-        $script:BootstrapPrompt = Build-BootstrapPrompt -TaskContextPath '/home/runner/bcquality/_task-context.json'
+        @{
+            version = 1
+            skills = @(
+                @{
+                    id = 'al-code-review'
+                    path = 'microsoft/skills/review/al-code-review.md'
+                    version = 1
+                    outputs = @('findings-report')
+                    subSkills = @(
+                        'microsoft/skills/review/al-security-review.md',
+                        'microsoft/skills/review/al-style-review.md'
+                    )
+                },
+                @{
+                    id = 'al-security-review'
+                    path = 'microsoft/skills/review/al-security-review.md'
+                    version = 1
+                    outputs = @('findings-report')
+                    subSkills = @()
+                },
+                @{
+                    id = 'al-style-review'
+                    path = 'microsoft/skills/review/al-style-review.md'
+                    version = 1
+                    outputs = @('findings-report')
+                    subSkills = @()
+                }
+            )
+        } | ConvertTo-Json -Depth 10 |
+            Set-Content -LiteralPath (Join-Path $BCQualityRoot '_skill-index.json')
+
+        $script:BCQualityConfigCache = @{
+            'enabled-layers' = @('microsoft')
+            'disabled-skills' = @()
+        }
     }
 
-    It 'instructs the agent to diff against the merge-base (three-dot) so only PR changes are reviewed' {
-        $script:BootstrapPrompt | Should -Match 'diff origin/main\.\.\.HEAD to see all changes'
-        $script:BootstrapPrompt | Should -Match 'diff origin/main\.\.\.HEAD -- <file>'
-        $script:BootstrapPrompt | Should -Match 'diff --name-only origin/main\.\.\.HEAD to list changed files'
+    It 'resolves leaves in the exact order declared by BCQuality' {
+        $plan = @(Get-ReviewLeafPlan)
+
+        $plan.id | Should -Be @('al-security-review', 'al-style-review')
+        $plan.ordinal | Should -Be @(1, 2)
     }
 
-    It 'never instructs a two-dot diff, which would pull in files changed on the base since the branch point' {
-        $script:BootstrapPrompt | Should -Not -Match 'diff origin/main to see all changes'
-        $script:BootstrapPrompt | Should -Not -Match 'diff origin/main -- <file>'
-        $script:BootstrapPrompt | Should -Not -Match 'diff --name-only origin/main to list changed files'
+    It 'removes configured disabled leaves without reordering the remainder' {
+        $script:BCQualityConfigCache['disabled-skills'] = @(
+            'microsoft/skills/review/al-security-review.md'
+        )
+
+        $plan = @(Get-ReviewLeafPlan)
+
+        $plan.id | Should -Be @('al-style-review')
+        $plan.ordinal | Should -Be 2
+    }
+
+    It 'pins a leaf process to one skill and forbids child-agent delegation' {
+        $AnalysisWorkspace = 'C:\review-target'
+        $DiffRange = 'origin/main...HEAD'
+        $ReviewPathSpec = ''
+        $LeafModel = 'gpt-5.6-luna'
+        $ReportFileName = '_review-report.json'
+        $leaf = (Get-ReviewLeafPlan)[0]
+
+        $prompt = New-LeafReviewPrompt -Leaf $leaf -WorkDir $TestDrive
+
+        $prompt | Should -Match "Review only the domain defined by BCQuality leaf skill 'al-security-review'"
+        $prompt | Should -Match "pinned mechanically to model 'gpt-5\.6-luna'"
+        $prompt | Should -Match 'Do not invoke child agents or other review skills'
+    }
+
+    It 'consolidates only after ordered leaf reports exist and forbids leaf retries' {
+        $AnalysisWorkspace = 'C:\review-target'
+        $DiffRange = 'origin/main...HEAD'
+        $ReportFileName = '_review-report.json'
+        $AgentWorkDir = $TestDrive
+        $leafResults = @(
+            [pscustomobject]@{ ReportPath = 'C:\out\01-security\_review-report.json' },
+            [pscustomobject]@{ ReportPath = 'C:\out\02-style\_review-report.json' }
+        )
+
+        $prompt = Build-ConsolidationPrompt -LeafResults $leafResults
+
+        $prompt.IndexOf('01-security') | Should -BeLessThan $prompt.IndexOf('02-style')
+        $prompt | Should -Match 'Do not invoke child agents, Task tools, or leaf skills'
+        $prompt | Should -Match 'Do not omit, retry, or replace any leaf report'
+    }
+
+    It 'rejects a consolidated report that changes the declared leaf order' {
+        $plan = @(Get-ReviewLeafPlan)
+        $report = @{
+            skill = @{ id = 'al-code-review'; version = 1 }
+            outcome = 'completed'
+            summary = @{ knowledge = 0; agent = 0; suppressed = 0; total = 0 }
+            findings = @()
+            references = @()
+            suppressed = @()
+            'sub-results' = @(
+                @{ skill = @{ id = 'al-style-review'; version = 1 }; outcome = 'completed'; summary = @{}; findings = @(); suppressed = @() },
+                @{ skill = @{ id = 'al-security-review'; version = 1 }; outcome = 'completed'; summary = @{}; findings = @(); suppressed = @() }
+            )
+            'skipped-sub-skills' = @()
+        } | ConvertTo-Json -Depth 10
+
+        { Assert-ConsolidatedReport -ReportText $report -Plan $plan } |
+            Should -Throw "*was 'al-style-review'; expected 'al-security-review'*"
+    }
+
+    It 'fails closed on model, usage, malformed-record, and CLI-version telemetry mismatches' {
+        $valid = [pscustomobject]@{
+            models = @('gpt-5.4')
+            usage_complete = $true
+            malformed_records = 0
+            cli_version = '1.0.83'
+        }
+        { Assert-CopilotInvocationMetrics -Metrics $valid -RequestedModel 'gpt-5.4' -InvocationLabel 'leaf' } |
+            Should -Not -Throw
+
+        $wrongModel = $valid.PSObject.Copy()
+        $wrongModel.models = @('gemini-3.6-flash')
+        { Assert-CopilotInvocationMetrics -Metrics $wrongModel -RequestedModel 'gpt-5.4' -InvocationLabel 'leaf' } |
+            Should -Throw "*required model 'gpt-5.4'*"
+
+        $incomplete = $valid.PSObject.Copy()
+        $incomplete.usage_complete = $false
+        { Assert-CopilotInvocationMetrics -Metrics $incomplete -RequestedModel 'gpt-5.4' -InvocationLabel 'leaf' } |
+            Should -Throw '*incomplete Copilot usage telemetry*'
+
+        $malformed = $valid.PSObject.Copy()
+        $malformed.malformed_records = 1
+        { Assert-CopilotInvocationMetrics -Metrics $malformed -RequestedModel 'gpt-5.4' -InvocationLabel 'leaf' } |
+            Should -Throw '*1 malformed Copilot telemetry record*'
+
+        $wrongCli = $valid.PSObject.Copy()
+        $wrongCli.cli_version = '1.0.82'
+        { Assert-CopilotInvocationMetrics -Metrics $wrongCli -RequestedModel 'gpt-5.4' -InvocationLabel 'leaf' } |
+            Should -Throw "*expected Copilot CLI '1.0.83'*"
+    }
+
+    It 'writes a resolved run manifest with ordered per-process telemetry' {
+        $script:ReviewPlanIds = @('al-security-review')
+        $script:ReviewPlanSourceSnapshot = 'aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa'
+        $metrics = [pscustomobject]@{
+            models = @('gpt-5.4')
+            usage_complete = $true
+            malformed_records = 0
+            cli_version = '1.0.83'
+            total_tokens = 12
+        }
+        $started = [DateTime]::UtcNow.AddSeconds(-2)
+        Add-ReviewProcessTelemetry -Role leaf -Ordinal 1 -SkillId 'al-security-review' `
+            -RequestedModel 'gpt-5.4' -Status completed -StartedAt $started `
+            -CompletedAt ([DateTime]::UtcNow) -Metrics $metrics -ExitCode 0 `
+            -ReportPath (Join-Path $ReviewOutputDir 'leaf-results/01-security/_review-report.json')
+
+        Save-ReviewRunManifest -Status completed
+
+        $manifest = Get-Content -LiteralPath (Join-Path $ReviewOutputDir '_run-manifest.json') -Raw |
+            ConvertFrom-Json
+        $manifest.schema_version | Should -Be 1
+        $manifest.status | Should -Be 'completed'
+        $manifest.configuration.copilot_cli_version | Should -Be '1.0.83'
+        $manifest.configuration.root_model | Should -Be 'claude-sonnet-5'
+        $manifest.configuration.leaf_execution | Should -Be 'serial'
+        $manifest.bcquality.commit | Should -Be $BCQualitySha
+        $manifest.plan.leaf_ids | Should -Be @('al-security-review')
+        $manifest.processes[0].requested_model | Should -Be 'gpt-5.4'
+        $manifest.processes[0].report_path | Should -Be 'leaf-results/01-security/_review-report.json'
+    }
+}
+
+Describe 'BCQuality revision ownership' {
+    It 'derives the commit from the checkout and only treats an input SHA as an assertion' {
+        $root = Join-Path $TestDrive 'bcquality-revision'
+        New-Item -ItemType Directory -Path $root -Force | Out-Null
+        & git -C $root init -q
+        & git -C $root config user.email 'test@example.com'
+        & git -C $root config user.name 'Test'
+        Set-Content -LiteralPath (Join-Path $root 'entry.md') -Value '# test'
+        & git -C $root add entry.md
+        & git -C $root commit -q -m 'test'
+        $expected = (& git -C $root rev-parse HEAD).Trim()
+
+        Resolve-BCQualityCommit -Root $root | Should -Be $expected
+        Resolve-BCQualityCommit -Root $root -ExpectedCommit $expected | Should -Be $expected
+        { Resolve-BCQualityCommit -Root $root -ExpectedCommit ('f' * 40) } |
+            Should -Throw "*does not match expected commit*"
     }
 }
 
@@ -870,7 +1057,9 @@ Describe 'Local review authentication' {
         $script:AuthBCQuality = Join-Path $TestDrive 'bcquality'
         New-Item -ItemType Directory -Path $script:AuthWorkspace -Force | Out-Null
         New-Item -ItemType Directory -Path (Join-Path $script:AuthBCQuality 'skills') -Force | Out-Null
+        New-Item -ItemType Directory -Path (Join-Path $script:AuthBCQuality 'schemas') -Force | Out-Null
         Set-Content -Path (Join-Path $script:AuthBCQuality 'skills/entry.md') -Value '# entry'
+        Set-Content -Path (Join-Path $script:AuthBCQuality 'schemas/findings-report.schema.json') -Value '{}'
         & git -C $script:AuthWorkspace init -q
     }
 
@@ -889,10 +1078,16 @@ Describe 'Local review authentication' {
         $MinimumSeverity = 'Low'
         $AgentMinimumSeverity = 'Low'
         $CopilotCliTimeoutMinutes = 30
+        $CopilotModel = 'claude-sonnet-5'
+        $CopilotCliVersion = '1.0.83'
+        $LeafModel = 'gpt-5.4'
 
         Mock Get-Command {
             [pscustomobject]@{ Source = 'copilot' }
         } -ParameterFilter { $Name -eq 'copilot' }
+        Mock Get-Command {
+            [pscustomobject]@{ Name = 'Test-Json' }
+        } -ParameterFilter { $Name -eq 'Test-Json' }
     }
 
     It 'allows local generation without GH_TOKEN' {

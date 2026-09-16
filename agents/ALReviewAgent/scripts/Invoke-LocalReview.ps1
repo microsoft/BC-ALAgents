@@ -62,13 +62,10 @@
     Critical | High | Medium | Low. Default Medium.
 
 .PARAMETER Model
-    Optional Copilot model override (COPILOT_MODEL).
+    Explicit root model for self-review and final consolidation (COPILOT_MODEL).
 
 .PARAMETER LeafModel
-    Optional faster/cheaper model for the super-skill's leaf sub-skill child
-    agents (COPILOT_REVIEW_LEAF_MODEL). Leaves do the bulk of the work, so a
-    lighter triage model here is the biggest per-leaf speedup. Empty = leaves
-    use the CLI's default child-agent model.
+    Explicit model for every isolated leaf process (COPILOT_REVIEW_LEAF_MODEL).
 
 .PARAMETER NoPruneDomains
     Disable the relevance pre-pass. By default, feature-gated review domains
@@ -78,11 +75,11 @@
     applicable domains (style, performance, privacy, security, etc.) are never
     pruned. Pass this switch to run every domain unconditionally.
 
-.PARAMETER NoParallelLeaves
-    Disable concurrent leaf dispatch (COPILOT_REVIEW_PARALLEL_LEAVES=false).
-    By default leaves run as isolated parallel child agents, which is both
-    faster and a stronger guard against the collapsed-scan pathology than
-    serial in-context passes.
+.PARAMETER LeafExecution
+    Deterministic leaf scheduling mode: Serial (default) or Parallel.
+
+.PARAMETER MaxLeafConcurrency
+    Maximum simultaneous leaf processes in Parallel mode. Default 4.
 
 .PARAMETER Path
     Optional folder (or glob) to scope the reviewed diff and findings, relative
@@ -132,13 +129,16 @@ param(
     [string] $ConfigPath,
     [string] $OutputDir,
     [ValidateSet('Critical', 'High', 'Medium', 'Low')][string] $MinimumSeverity = 'Medium',
-    [string] $Model,
-    [string] $LeafModel,
+    [Parameter(Mandatory)][string] $Model,
+    [Parameter(Mandatory)][string] $LeafModel,
+    [ValidateSet('Serial', 'Parallel')]
+    [string] $LeafExecution = 'Serial',
+    [ValidateRange(1, 64)]
+    [int] $MaxLeafConcurrency = 4,
     [string] $Path,
     [switch] $Fix,
     [switch] $SkipBCQualityFilter,
-    [switch] $NoPruneDomains,
-    [switch] $NoParallelLeaves
+    [switch] $NoPruneDomains
 )
 
 Set-StrictMode -Version Latest
@@ -585,10 +585,15 @@ try {
     if ($Mode -eq 'Existing') { $env:REVIEW_DIFF_STYLE = 'direct' }
     else { Remove-Item Env:REVIEW_DIFF_STYLE -ErrorAction SilentlyContinue }
     if ($Model) { $env:COPILOT_MODEL = $Model }
-    # Leaf sub-skill child-agent model (triage tier) + concurrent leaf dispatch.
+    $copilotVersionText = (& copilot --version 2>&1 | Out-String).Trim()
+    if ($copilotVersionText -notmatch '\b(\d+\.\d+\.\d+(?:-\d+)?)\b') {
+        throw "Could not resolve Copilot CLI version from: $copilotVersionText"
+    }
+    $env:COPILOT_REVIEW_CLI_VERSION = $Matches[1]
     if ($LeafModel) { $env:COPILOT_REVIEW_LEAF_MODEL = $LeafModel }
     else { Remove-Item Env:COPILOT_REVIEW_LEAF_MODEL -ErrorAction SilentlyContinue }
-    $env:COPILOT_REVIEW_PARALLEL_LEAVES = if ($NoParallelLeaves) { 'false' } else { 'true' }
+    $env:COPILOT_REVIEW_LEAF_EXECUTION = $LeafExecution.ToLowerInvariant()
+    $env:COPILOT_REVIEW_MAX_LEAF_CONCURRENCY = [string]$MaxLeafConcurrency
 
     if ($effectivePath) {
         # Prefer the engine's diff-scoping (REVIEW_PATH_SPEC) — narrows what
