@@ -55,7 +55,7 @@
                                                 CLI credential store.
         COPILOT_MODEL                        - explicit model name for Copilot CLI
         COPILOT_REVIEW_CLI_VERSION           - pinned Copilot CLI version
-        COPILOT_REVIEW_LEAF_MODEL            - required explicit model for leaf processes
+        COPILOT_REVIEW_LEAF_MODEL            - model for leaf processes (defaults in review.yml)
         COPILOT_REVIEW_LEAF_EXECUTION        - serial|parallel (default serial)
         COPILOT_REVIEW_MAX_LEAF_CONCURRENCY  - positive concurrency bound for parallel mode
         MINIMUM_SEVERITY                     - Critical | High | Medium | Low (default: Medium)
@@ -383,7 +383,7 @@ function Assert-Config {
         }
         $findingsSchema = Join-Path $BCQualityRoot 'schemas/findings-report.schema.json'
         if (-not (Test-Path -LiteralPath $findingsSchema -PathType Leaf)) {
-            throw "Pinned BCQuality checkout is missing the findings-report schema: $findingsSchema"
+            throw "Pinned BCQuality checkout is missing the findings-report schema: $findingsSchema. BCQuality commit b74967bc5b7a454eae19d6a1250199afd869f064 or a newer ref is required (introduced by microsoft/BCQuality#182)."
         }
         if (-not (Get-Command copilot -ErrorAction SilentlyContinue)) {
             throw 'Copilot CLI not found in PATH. Install @github/copilot before running this script.'
@@ -1835,6 +1835,16 @@ function Start-LeafCopilotProcess {
     }
 }
 
+function Repair-MissingSuppressedProperty {
+    param([Parameter(Mandatory)][object] $ReportObject)
+
+    if ($ReportObject.PSObject.Properties.Match('suppressed').Count -eq 0) {
+        $ReportObject | Add-Member -NotePropertyName suppressed -NotePropertyValue @()
+        return $true
+    }
+    return $false
+}
+
 function Receive-LeafCopilotProcess {
     param([Parameter(Mandatory)][object] $State)
 
@@ -1851,6 +1861,7 @@ function Receive-LeafCopilotProcess {
         throw "Leaf '$($State.Leaf.id)' was received before completion."
     }
 
+    $integrityFailure = $false
     try {
         $stdout = $State.StdoutTask.GetAwaiter().GetResult()
         $stderr = $State.StderrTask.GetAwaiter().GetResult()
@@ -1881,10 +1892,16 @@ function Receive-LeafCopilotProcess {
         $script:CopilotOtelRecords = @($existingRecords) + @($parsedTelemetry.Records)
         $script:CopilotOtelMalformedRecords += $parsedTelemetry.MalformedRecords
 
-        Assert-CopilotInvocationMetrics `
-            -Metrics $leafMetrics `
-            -RequestedModel $LeafModel `
-            -InvocationLabel "Leaf '$($State.Leaf.id)'"
+        try {
+            Assert-CopilotInvocationMetrics `
+                -Metrics $leafMetrics `
+                -RequestedModel $LeafModel `
+                -InvocationLabel "Leaf '$($State.Leaf.id)'"
+        }
+        catch {
+            $integrityFailure = $true
+            throw
+        }
 
         if (-not (Test-Path -LiteralPath $reportPath -PathType Leaf)) {
             throw "Leaf '$($State.Leaf.id)' did not produce '$reportPath'."
@@ -1900,6 +1917,10 @@ function Receive-LeafCopilotProcess {
             throw "Leaf '$($State.Leaf.id)' returned report for '$($reportObject.skill.id)'."
         }
 
+        if (Repair-MissingSuppressedProperty -ReportObject $reportObject) {
+            $reportText = $reportObject | ConvertTo-Json -Depth 40
+            Set-Content -LiteralPath $reportPath -Value $reportText -Encoding UTF8
+        }
         $schemaPath = Join-Path $BCQualityRoot 'schemas/findings-report.schema.json'
         if (-not ($reportText | Test-Json -SchemaFile $schemaPath -ErrorAction Stop)) {
             throw "Leaf '$($State.Leaf.id)' report does not conform to the findings-report schema."
@@ -1942,8 +1963,13 @@ function Receive-LeafCopilotProcess {
             -ExitCode $exitCode `
             -ReportPath $(if (Test-Path -LiteralPath $reportPath -PathType Leaf) { $reportPath } else { $null }) `
             -FailureReason $failure.Exception.Message
-        Save-ReviewRunManifest -Status failed -FailureReason $failure.Exception.Message
-        throw $failure
+        if ($integrityFailure) {
+            Save-ReviewRunManifest -Status failed -FailureReason $failure.Exception.Message
+            throw $failure
+        }
+        Save-ReviewRunManifest -Status running
+        Write-LogNotice 'Leaf failed; continuing review' "Leaf '$($State.Leaf.id)' was marked failed and will be surfaced to root consolidation: $($failure.Exception.Message)"
+        return $null
     }
     finally {
         $process.Dispose()
@@ -1960,6 +1986,8 @@ function Invoke-DeterministicLeafReviews {
     foreach ($leaf in $Plan) { $pending.Enqueue($leaf) }
     $active = [System.Collections.Generic.List[object]]::new()
     $results = @{}
+    $failedLeaves = [System.Collections.Generic.List[object]]::new()
+    $script:FailedLeafReviews = @()
 
     try {
         while ($pending.Count -gt 0 -or $active.Count -gt 0) {
@@ -1983,8 +2011,11 @@ function Invoke-DeterministicLeafReviews {
                         -CompletedAt ([DateTime]::UtcNow) `
                         -ExitCode $null `
                         -FailureReason $_.Exception.Message
-                    Save-ReviewRunManifest -Status failed -FailureReason $_.Exception.Message
-                    throw
+                    Save-ReviewRunManifest -Status running
+                    $failedLeaves.Add([pscustomobject]@{
+                        Leaf = $leaf
+                        Reason = $_.Exception.Message
+                    }) | Out-Null
                 }
             }
 
@@ -2001,7 +2032,17 @@ function Invoke-DeterministicLeafReviews {
             foreach ($state in $completed) {
                 [void]$active.Remove($state)
                 $result = Receive-LeafCopilotProcess -State $state
-                $results[$result.Leaf.path] = $result
+                if ($null -ne $result) {
+                    $results[$result.Leaf.path] = $result
+                }
+                else {
+                    $failedLeaves.Add([pscustomobject]@{
+                        Leaf = $state.Leaf
+                        Reason = ($script:ReviewProcessTelemetry |
+                            Where-Object { $_.role -eq 'leaf' -and $_.skill_id -eq $state.Leaf.id } |
+                            Select-Object -Last 1).failure_reason
+                    }) | Out-Null
+                }
             }
         }
     }
@@ -2015,17 +2056,28 @@ function Invoke-DeterministicLeafReviews {
         throw
     }
 
-    return @($Plan | ForEach-Object { $results[$_.path] })
+    $script:FailedLeafReviews = @($failedLeaves)
+    return @($Plan | Where-Object { $results.ContainsKey($_.path) } | ForEach-Object { $results[$_.path] })
 }
 
 function Build-ConsolidationPrompt {
-    param([Parameter(Mandatory)][object[]] $LeafResults)
+    param(
+        [Parameter(Mandatory)][object[]] $LeafResults,
+        [object[]] $FailedLeaves = @()
+    )
 
     $reviewRoot = ($AnalysisWorkspace -replace '\\', '/')
     $bcqualityRootFwd = ($BCQualityRoot -replace '\\', '/')
     $taskContextPath = ((Join-Path $AgentWorkDir '_task-context.json') -replace '\\', '/')
     $orderedReports = @($LeafResults | ForEach-Object { ($_.ReportPath -replace '\\', '/') })
     $reportList = ($orderedReports | ForEach-Object { "- $_" }) -join "`n"
+    $failedList = if (@($FailedLeaves).Count -gt 0) {
+        (@($FailedLeaves) | ForEach-Object {
+            "- $($_.Leaf.id): failed before a usable findings-report was available; reason: $($_.Reason)"
+        }) -join "`n"
+    } else {
+        '- none'
+    }
 
     return @"
 Consolidate a deterministic Business Central review after all leaf processes
@@ -2039,6 +2091,9 @@ Authoritative contracts:
 Leaf findings-reports, already ordered by the super-skill contract:
 $reportList
 
+Leaf processes that failed without a usable report:
+$failedList
+
 Target repository worktree: $reviewRoot
 Diff range: $DiffRange
 
@@ -2047,9 +2102,12 @@ Aggregate their findings according to the super-skill contract, then perform
 the super-skill's root self-review pass against the complete diff. Root
 self-review may add only genuine cross-domain or otherwise missed findings and
 must use from-sub-skill "agent" with references [] when no BCQuality article
-backs a finding. Record configured omissions from the task context in
-skipped-sub-skills rather than inventing sub-results for leaves that were not
-executed.
+backs a finding. Record configured omissions from the task context in skipped-sub-skills rather
+than inventing sub-results for leaves that were not executed. For every failed
+leaf listed above, include a sub-result in the declared plan order with that
+skill, outcome 'failed', zero findings, and the failure reason. Do not invent
+findings or references for a failed leaf. Failed leaves are distinct from
+skipped-sub-skills.
 
 Do not invoke child agents, Task tools, or leaf skills; those executions are
 complete. Do not omit, retry, or replace any leaf report.
@@ -4260,7 +4318,9 @@ if ($ReviewPhase -ne 'post') {
     Save-ReviewRunManifest -Status running
     $leafResults = @(Invoke-DeterministicLeafReviews -Plan $leafPlan)
     Write-LogPhaseDetail "All $($leafResults.Count) leaf processes completed; starting root consolidation on $CopilotModel."
-    $prompt = Build-ConsolidationPrompt -LeafResults $leafResults
+    $prompt = Build-ConsolidationPrompt `
+        -LeafResults $leafResults `
+        -FailedLeaves $script:FailedLeafReviews
     $rootStartedAt = [DateTime]::UtcNow
     try {
         $output = Invoke-CopilotCli -Prompt $prompt

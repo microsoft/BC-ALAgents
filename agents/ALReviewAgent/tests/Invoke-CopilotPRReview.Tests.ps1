@@ -932,6 +932,24 @@ Describe 'Deterministic leaf orchestration contract' {
         $prompt | Should -Match 'Do not invoke child agents or other review skills'
     }
 
+    It 'repairs an omitted suppressed array without inventing suppressed items' {
+        $report = [pscustomobject]@{
+            skill = [pscustomobject]@{ id = 'al-security-review' }
+            findings = @()
+        }
+
+        Repair-MissingSuppressedProperty -ReportObject $report | Should -BeTrue
+        $report.PSObject.Properties.Match('suppressed').Count | Should -Be 1
+        @($report.suppressed).Count | Should -Be 0
+
+        $malformedSuppressed = [pscustomobject]@{
+            skill = [pscustomobject]@{ id = 'al-security-review' }
+            suppressed = @([pscustomobject]@{})
+        }
+        Repair-MissingSuppressedProperty -ReportObject $malformedSuppressed | Should -BeFalse
+        $malformedSuppressed.suppressed[0].PSObject.Properties.Match('reference').Count | Should -Be 0
+    }
+
     It 'consolidates only after ordered leaf reports exist and forbids leaf retries' {
         $AnalysisWorkspace = 'C:\review-target'
         $DiffRange = 'origin/main...HEAD'
@@ -947,6 +965,28 @@ Describe 'Deterministic leaf orchestration contract' {
         $prompt.IndexOf('01-security') | Should -BeLessThan $prompt.IndexOf('02-style')
         $prompt | Should -Match 'Do not invoke child agents, Task tools, or leaf skills'
         $prompt | Should -Match 'Do not omit, retry, or replace any leaf report'
+    }
+
+    It 'surfaces failed leaves to root consolidation as failed rather than skipped' {
+        $AnalysisWorkspace = 'C:\review-target'
+        $DiffRange = 'origin/main...HEAD'
+        $ReportFileName = '_review-report.json'
+        $AgentWorkDir = $TestDrive
+        $leafResults = @(
+            [pscustomobject]@{ ReportPath = 'C:\out\01-security\_review-report.json' }
+        )
+        $failedLeaves = @(
+            [pscustomobject]@{
+                Leaf = [pscustomobject]@{ id = 'al-style-review' }
+                Reason = 'report does not conform to the findings-report schema'
+            }
+        )
+
+        $prompt = Build-ConsolidationPrompt -LeafResults $leafResults -FailedLeaves $failedLeaves
+
+        $prompt | Should -Match 'al-style-review: failed before a usable findings-report was available'
+        $prompt | Should -Match "outcome 'failed'"
+        $prompt | Should -Match 'Failed leaves are distinct from\s+skipped'
     }
 
     It 'rejects a consolidated report that changes the declared leaf order' {
