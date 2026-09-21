@@ -1864,6 +1864,18 @@ function Repair-MissingSuppressedProperty {
     return $false
 }
 
+function Assert-LeafReportRole {
+    param([Parameter(Mandatory)][object] $ReportObject)
+
+    $superSkillFields = @('sub-results', 'skipped-sub-skills')
+    $present = @($superSkillFields | Where-Object {
+        $ReportObject.PSObject.Properties.Match($_).Count -gt 0
+    })
+    if ($present.Count -gt 0) {
+        throw "Leaf report contains super-skill-only field(s): $($present -join ', ')."
+    }
+}
+
 function Receive-LeafCopilotProcess {
     param([Parameter(Mandatory)][object] $State)
 
@@ -1876,10 +1888,6 @@ function Receive-LeafCopilotProcess {
         try { $process.Kill($true) } catch { if (-not $process.HasExited) { $process.Kill() } }
         $null = $process.WaitForExit(10000)
     }
-    if (-not $process.HasExited) {
-        throw "Leaf '$($State.Leaf.id)' was received before completion."
-    }
-
     $integrityFailure = $false
     try {
         $stdout = $State.StdoutTask.GetAwaiter().GetResult()
@@ -1890,11 +1898,13 @@ function Receive-LeafCopilotProcess {
         if ($stdout) { $script:AgentTranscript += "out: $stdout`n" }
         if ($stderr) { $script:AgentTranscript += "err: $stderr`n" }
 
+        $terminationFailure = $null
         if ($timedOut) {
-            throw "Copilot CLI leaf '$($State.Leaf.id)' timed out after $CopilotCliTimeoutMinutes minutes."
-        }
-        if ($process.ExitCode -ne 0) {
-            throw "Copilot CLI leaf '$($State.Leaf.id)' exited with code $($process.ExitCode)."
+            $terminationFailure = "Copilot CLI leaf '$($State.Leaf.id)' timed out after $CopilotCliTimeoutMinutes minutes."
+        } elseif (-not $process.HasExited) {
+            $terminationFailure = "Leaf '$($State.Leaf.id)' was received before completion."
+        } elseif ($process.ExitCode -ne 0) {
+            $terminationFailure = "Copilot CLI leaf '$($State.Leaf.id)' exited with code $($process.ExitCode)."
         }
 
         $parsedTelemetry = if (Test-Path -LiteralPath $State.OtelPath -PathType Leaf) {
@@ -1922,6 +1932,10 @@ function Receive-LeafCopilotProcess {
             throw
         }
 
+        if ($terminationFailure) {
+            throw $terminationFailure
+        }
+
         if (-not (Test-Path -LiteralPath $reportPath -PathType Leaf)) {
             throw "Leaf '$($State.Leaf.id)' did not produce '$reportPath'."
         }
@@ -1944,6 +1958,7 @@ function Receive-LeafCopilotProcess {
         if (-not ($reportText | Test-Json -SchemaFile $schemaPath -ErrorAction Stop)) {
             throw "Leaf '$($State.Leaf.id)' report does not conform to the findings-report schema."
         }
+        Assert-LeafReportRole -ReportObject $reportObject
 
         Write-LogPhaseDetail "Leaf $($State.Leaf.ordinal)/$($State.Leaf.id) completed: $(@($reportObject.findings).Count) finding(s), $($leafMetrics.total_tokens) token(s)."
         $completedAt = [DateTime]::UtcNow
@@ -2167,6 +2182,30 @@ function Assert-ConsolidatedReport {
             throw "Root consolidation sub-result $($i + 1) was '$($actualIds[$i])'; expected '$($expectedIds[$i])'."
         }
     }
+    return $report
+}
+
+function Get-ConsolidatedReviewStatus {
+    param(
+        [Parameter(Mandatory)][object[]] $Plan,
+        [Parameter(Mandatory)][AllowEmptyCollection()][object[]] $LeafResults,
+        [Parameter(Mandatory)][object] $Report
+    )
+
+    if ([string]$Report.outcome -eq 'failed') {
+        return 'failed'
+    }
+
+    $hasFailedOrPartialSubResult = @($Report.'sub-results' | Where-Object {
+        [string]$_.outcome -in @('failed', 'partial')
+    }).Count -gt 0
+    if ($LeafResults.Count -lt $Plan.Count -or
+        [string]$Report.outcome -eq 'partial' -or
+        $hasFailedOrPartialSubResult) {
+        return 'partial'
+    }
+
+    return 'completed'
 }
 
 # ---------------------------------------------------------------------------
@@ -4427,7 +4466,7 @@ if ($ReviewPhase -ne 'post') {
     }
 
     try {
-        Assert-ConsolidatedReport -ReportText $output -Plan $leafPlan
+        $consolidatedReport = Assert-ConsolidatedReport -ReportText $output -Plan $leafPlan
     }
     catch {
         $rootFailure = $_
@@ -4457,7 +4496,13 @@ if ($ReviewPhase -ne 'post') {
         -Metrics $script:LastCopilotInvocationMetrics `
         -ExitCode 0 `
         -ReportPath $reportFilePath
-    Save-ReviewRunManifest -Status $reviewCompletionStatus
+    $reviewCompletionStatus = Get-ConsolidatedReviewStatus `
+        -Plan $leafPlan `
+        -LeafResults $leafResults `
+        -Report $consolidatedReport
+    Save-ReviewRunManifest `
+        -Status $reviewCompletionStatus `
+        -FailureReason $(if ($reviewCompletionStatus -eq 'failed') { [string]$consolidatedReport.'outcome-reason' } else { $null })
 
     # Persist the raw agent output (plus transcript and filter report) so the
     # separate, write-capable publish phase can post findings without the

@@ -1048,6 +1048,186 @@ Describe 'Deterministic leaf orchestration contract' {
         $malformedSuppressed.suppressed[0].PSObject.Properties.Match('reference').Count | Should -Be 0
     }
 
+    It 'rejects super-skill-only fields in an otherwise schema-valid leaf report' {
+        $report = [pscustomobject]@{
+            skill = [pscustomobject]@{ id = 'al-security-review' }
+            findings = @()
+            suppressed = @()
+            'sub-results' = @()
+            'skipped-sub-skills' = @()
+        }
+
+        { Assert-LeafReportRole -ReportObject $report } |
+            Should -Throw '*super-skill-only field(s): sub-results, skipped-sub-skills*'
+    }
+
+    It 'marks a schema-valid leaf with super-skill fields failed during orchestration' {
+        $plan = @(Get-ReviewLeafPlan)
+        $script:TestLeafReports['al-security-review'] = @{
+            skill = @{ id = 'al-security-review' }
+            findings = @()
+            suppressed = @()
+            'sub-results' = @()
+            'skipped-sub-skills' = @()
+        }
+
+        $results = @(Invoke-DeterministicLeafReviews -Plan @($plan[0]))
+
+        $results.Count | Should -Be 0
+        $script:FailedLeafReviews[0].Leaf.id | Should -Be 'al-security-review'
+        $script:FailedLeafReviews[0].Reason |
+            Should -Match 'super-skill-only field'
+    }
+
+    It 'accepts a normal leaf report without super-skill fields' {
+        $report = [pscustomobject]@{
+            skill = [pscustomobject]@{ id = 'al-security-review' }
+            findings = @()
+            suppressed = @()
+        }
+
+        { Assert-LeafReportRole -ReportObject $report } | Should -Not -Throw
+    }
+
+    It 'reconciles final status from leaf coverage and the validated root report' {
+        $plan = @(Get-ReviewLeafPlan)
+        $complete = [pscustomobject]@{
+            outcome = 'completed'
+            'sub-results' = @(
+                [pscustomobject]@{ outcome = 'completed' },
+                [pscustomobject]@{ outcome = 'not-applicable' }
+            )
+        }
+        $partialRoot = [pscustomobject]@{
+            outcome = 'completed'
+            'sub-results' = @(
+                [pscustomobject]@{ outcome = 'completed' },
+                [pscustomobject]@{ outcome = 'failed' }
+            )
+        }
+        $failedRoot = [pscustomobject]@{
+            outcome = 'failed'
+            'sub-results' = @(
+                [pscustomobject]@{ outcome = 'failed' },
+                [pscustomobject]@{ outcome = 'failed' }
+            )
+        }
+        $allLeaves = @([pscustomobject]@{ Leaf = $plan[0] }, [pscustomobject]@{ Leaf = $plan[1] })
+        $oneLeaf = @([pscustomobject]@{ Leaf = $plan[0] })
+
+        Get-ConsolidatedReviewStatus -Plan $plan -LeafResults $allLeaves -Report $complete |
+            Should -Be 'completed'
+        Get-ConsolidatedReviewStatus -Plan $plan -LeafResults $oneLeaf -Report $complete |
+            Should -Be 'partial'
+        Get-ConsolidatedReviewStatus -Plan $plan -LeafResults $allLeaves -Report $partialRoot |
+            Should -Be 'partial'
+        Get-ConsolidatedReviewStatus -Plan $plan -LeafResults $allLeaves -Report $failedRoot |
+            Should -Be 'failed'
+    }
+
+    It 'harvests OTel before recovering a nonzero leaf exit' {
+        $workDir = Join-Path $TestDrive 'nonzero-leaf'
+        New-Item -ItemType Directory -Path $workDir -Force | Out-Null
+        $otel = @(
+            '{"type":"span","attributes":{"gen_ai.operation.name":"invoke_agent","gen_ai.agent.version":"1.0.83"}}',
+            '{"type":"span","status":{"code":2},"attributes":{"gen_ai.operation.name":"chat","gen_ai.request.model":"gpt-5.4","gen_ai.usage.input_tokens":90,"gen_ai.usage.output_tokens":10}}'
+        )
+        Set-Content -LiteralPath (Join-Path $workDir 'otel.jsonl') -Value $otel
+        $process = [pscustomobject]@{ HasExited = $true; ExitCode = 7 }
+        $process | Add-Member -MemberType ScriptMethod -Name Dispose -Value {}
+        Mock Save-CopilotRunMetrics {
+            param($Records, $OutputDir, $WallTimeSeconds, $MalformedRecords)
+            Get-CopilotRunMetrics -Records $Records -WallTimeSeconds $WallTimeSeconds -MalformedRecords $MalformedRecords
+        }
+        $leaf = @(Get-ReviewLeafPlan)[0]
+        $state = [pscustomobject]@{
+            Leaf = $leaf
+            WorkDir = $workDir
+            OtelPath = Join-Path $workDir 'otel.jsonl'
+            Process = $process
+            StdoutTask = [System.Threading.Tasks.Task]::FromResult([string]'')
+            StderrTask = [System.Threading.Tasks.Task]::FromResult([string]'')
+            StartedAt = [DateTime]::UtcNow.AddSeconds(-1)
+        }
+
+        $result = Receive-LeafCopilotProcess -State $state
+
+        $result | Should -BeNullOrEmpty
+        $script:CopilotOtelRecords.Count | Should -Be 2
+        $failed = @($script:ReviewProcessTelemetry | Where-Object status -eq 'failed')
+        $failed[0].metrics.total_tokens | Should -Be 100
+        $failed[0].failure_reason | Should -Match 'exited with code 7'
+    }
+
+    It 'harvests OTel before recovering a timed-out leaf' {
+        $workDir = Join-Path $TestDrive 'timeout-leaf'
+        New-Item -ItemType Directory -Path $workDir -Force | Out-Null
+        @(
+            '{"type":"span","attributes":{"gen_ai.operation.name":"invoke_agent","gen_ai.agent.version":"1.0.83"}}',
+            '{"type":"span","status":{"code":2},"attributes":{"gen_ai.operation.name":"chat","gen_ai.request.model":"gpt-5.4","gen_ai.usage.input_tokens":40,"gen_ai.usage.output_tokens":6}}'
+        ) | Set-Content -LiteralPath (Join-Path $workDir 'otel.jsonl')
+        $process = [pscustomobject]@{ HasExited = $true; ExitCode = 0 }
+        $process | Add-Member -MemberType ScriptMethod -Name Dispose -Value {}
+        Mock Save-CopilotRunMetrics {
+            param($Records, $OutputDir, $WallTimeSeconds, $MalformedRecords)
+            Get-CopilotRunMetrics -Records $Records -WallTimeSeconds $WallTimeSeconds -MalformedRecords $MalformedRecords
+        }
+        $leaf = @(Get-ReviewLeafPlan)[0]
+        $oldTimeout = $CopilotCliTimeoutMinutes
+        $CopilotCliTimeoutMinutes = 1
+        try {
+            $state = [pscustomobject]@{
+                Leaf = $leaf
+                WorkDir = $workDir
+                OtelPath = Join-Path $workDir 'otel.jsonl'
+                Process = $process
+                StdoutTask = [System.Threading.Tasks.Task]::FromResult([string]'')
+                StderrTask = [System.Threading.Tasks.Task]::FromResult([string]'')
+                StartedAt = [DateTime]::UtcNow.AddMinutes(-2)
+            }
+
+            $result = Receive-LeafCopilotProcess -State $state
+
+            $result | Should -BeNullOrEmpty
+            $script:CopilotOtelRecords.Count | Should -Be 2
+            $failed = @($script:ReviewProcessTelemetry | Where-Object status -eq 'failed')
+            $failed[0].metrics.total_tokens | Should -Be 46
+            $failed[0].failure_reason | Should -Match 'timed out'
+        }
+        finally {
+            $CopilotCliTimeoutMinutes = $oldTimeout
+        }
+    }
+
+    It 'hard-fails a nonzero leaf when harvested OTel has the wrong model' {
+        $workDir = Join-Path $TestDrive 'nonzero-wrong-model'
+        New-Item -ItemType Directory -Path $workDir -Force | Out-Null
+        @(
+            '{"type":"span","attributes":{"gen_ai.operation.name":"invoke_agent","gen_ai.agent.version":"1.0.83"}}',
+            '{"type":"span","status":{"code":2},"attributes":{"gen_ai.operation.name":"chat","gen_ai.request.model":"gemini-3.6-flash","gen_ai.usage.input_tokens":90,"gen_ai.usage.output_tokens":10}}'
+        ) | Set-Content -LiteralPath (Join-Path $workDir 'otel.jsonl')
+        $process = [pscustomobject]@{ HasExited = $true; ExitCode = 7 }
+        $process | Add-Member -MemberType ScriptMethod -Name Dispose -Value {}
+        Mock Save-CopilotRunMetrics {
+            param($Records, $OutputDir, $WallTimeSeconds, $MalformedRecords)
+            Get-CopilotRunMetrics -Records $Records -WallTimeSeconds $WallTimeSeconds -MalformedRecords $MalformedRecords
+        }
+        $leaf = @(Get-ReviewLeafPlan)[0]
+        $state = [pscustomobject]@{
+            Leaf = $leaf
+            WorkDir = $workDir
+            OtelPath = Join-Path $workDir 'otel.jsonl'
+            Process = $process
+            StdoutTask = [System.Threading.Tasks.Task]::FromResult([string]'')
+            StderrTask = [System.Threading.Tasks.Task]::FromResult([string]'')
+            StartedAt = [DateTime]::UtcNow.AddSeconds(-1)
+        }
+
+        { Receive-LeafCopilotProcess -State $state } |
+            Should -Throw "*required model 'gpt-5.4'*"
+        $script:CopilotOtelRecords.Count | Should -Be 2
+    }
+
     It 'consolidates only after ordered leaf reports exist and forbids leaf retries' {
         $AnalysisWorkspace = 'C:\review-target'
         $DiffRange = 'origin/main...HEAD'
