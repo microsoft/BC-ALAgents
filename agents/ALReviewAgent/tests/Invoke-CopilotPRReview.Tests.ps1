@@ -1199,6 +1199,57 @@ Describe 'Deterministic leaf orchestration contract' {
         }
     }
 
+    It 'records an uncontrolled timed-out leaf before refusing to drain output' {
+        $workDir = Join-Path $TestDrive 'uncontrolled-timeout-leaf'
+        New-Item -ItemType Directory -Path $workDir -Force | Out-Null
+        $process = [pscustomobject]@{ HasExited = $false; ExitCode = $null }
+        $process | Add-Member -MemberType ScriptMethod -Name Kill -Value { param($EntireProcessTree) }
+        $process | Add-Member -MemberType ScriptMethod -Name WaitForExit -Value { param($Milliseconds) return $false }
+        $process | Add-Member -MemberType ScriptMethod -Name Dispose -Value {}
+        $script:OutputDrainAttempted = $false
+        $stdoutTask = [pscustomobject]@{}
+        $stdoutTask | Add-Member -MemberType ScriptMethod -Name GetAwaiter -Value {
+            $script:OutputDrainAttempted = $true
+            throw 'stdout drain must not be attempted'
+        }
+        $stderrTask = [pscustomobject]@{}
+        $stderrTask | Add-Member -MemberType ScriptMethod -Name GetAwaiter -Value {
+            $script:OutputDrainAttempted = $true
+            throw 'stderr drain must not be attempted'
+        }
+        Mock Add-ReviewProcessTelemetry {}
+        Mock Save-ReviewRunManifest {}
+        $leaf = @(Get-ReviewLeafPlan)[0]
+        $oldTimeout = $CopilotCliTimeoutMinutes
+        $CopilotCliTimeoutMinutes = 1
+        try {
+            $state = [pscustomobject]@{
+                Leaf = $leaf
+                WorkDir = $workDir
+                OtelPath = Join-Path $workDir 'otel.jsonl'
+                Process = $process
+                StdoutTask = $stdoutTask
+                StderrTask = $stderrTask
+                StartedAt = [DateTime]::UtcNow.AddMinutes(-2)
+            }
+
+            { Receive-LeafCopilotProcess -State $state } |
+                Should -Throw "*remained running after timeout kill*"
+            $script:OutputDrainAttempted | Should -BeFalse
+            Should -Invoke Add-ReviewProcessTelemetry -Times 1 -Exactly -ParameterFilter {
+                $Status -eq 'failed' -and
+                $FailureReason -match 'remained running after timeout kill'
+            }
+            Should -Invoke Save-ReviewRunManifest -Times 1 -Exactly -ParameterFilter {
+                $Status -eq 'failed' -and
+                $FailureReason -match 'remained running after timeout kill'
+            }
+        }
+        finally {
+            $CopilotCliTimeoutMinutes = $oldTimeout
+        }
+    }
+
     It 'hard-fails a nonzero leaf when harvested OTel has the wrong model' {
         $workDir = Join-Path $TestDrive 'nonzero-wrong-model'
         New-Item -ItemType Directory -Path $workDir -Force | Out-Null

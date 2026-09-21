@@ -1896,18 +1896,34 @@ function Receive-LeafCopilotProcess {
     $elapsed = [DateTime]::UtcNow - $State.StartedAt
     $timedOut = $CopilotCliTimeoutMinutes -gt 0 -and $elapsed.TotalMinutes -ge $CopilotCliTimeoutMinutes
     $integrityFailure = $false
-    if ($timedOut -and -not $process.HasExited) {
-        try { $process.Kill($true) } catch { if (-not $process.HasExited) { $process.Kill() } }
-        $null = $process.WaitForExit(10000)
-        try {
-            Assert-ActiveLeafProcessHasExited -Process $process -LeafId $State.Leaf.id
-        }
-        catch {
-            $integrityFailure = $true
-            throw
-        }
-    }
     try {
+        if ($timedOut -and -not $process.HasExited) {
+            try {
+                $process.Kill($true)
+            }
+            catch {
+                if (-not $process.HasExited) {
+                    try {
+                        $process.Kill()
+                    }
+                    catch {
+                        $integrityFailure = $true
+                        throw
+                    }
+                }
+            }
+            try {
+                $null = $process.WaitForExit(10000)
+            }
+            catch {
+                $integrityFailure = $true
+                throw
+            }
+            if (-not $process.HasExited) {
+                $integrityFailure = $true
+                Assert-ActiveLeafProcessHasExited -Process $process -LeafId $State.Leaf.id
+            }
+        }
         if (-not $process.HasExited) {
             $integrityFailure = $true
             throw "Leaf '$($State.Leaf.id)' was received before completion."
