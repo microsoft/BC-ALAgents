@@ -853,12 +853,41 @@ Describe 'Deterministic leaf orchestration contract' {
         $ReviewSource = 'local'
         $BCQualitySha = 'b74967bc5b7a454eae19d6a1250199afd869f064'
         $AgentVersion = '1.0.0'
+        $ReportFileName = '_review-report.json'
+        $AgentWorkDir = $BCQualityRoot
+        $AnalysisWorkspace = 'C:\review-target'
+        $DiffRange = 'origin/main...HEAD'
+        $script:AgentTranscript = ''
+        $script:CopilotOtelRecords = @()
+        $script:CopilotOtelMalformedRecords = 0
+        $script:FailedLeafReviews = @()
         $script:ReviewProcessTelemetry = [System.Collections.Generic.List[object]]::new()
         $script:ReviewRunCompletedAt = $null
         New-Item -ItemType Directory -Path (Join-Path $BCQualityRoot 'microsoft/skills/review') -Force | Out-Null
         New-Item -ItemType Directory -Path (Join-Path $BCQualityRoot 'skills') -Force | Out-Null
         New-Item -ItemType Directory -Path (Join-Path $BCQualityRoot 'schemas') -Force | Out-Null
-        '{}' | Set-Content -LiteralPath (Join-Path $BCQualityRoot 'schemas/findings-report.schema.json')
+        @'
+{
+  "type": "object",
+  "required": ["skill", "findings", "suppressed"],
+  "properties": {
+    "skill": {
+      "type": "object",
+      "required": ["id"],
+      "properties": { "id": { "type": "string" } }
+    },
+    "findings": { "type": "array" },
+    "suppressed": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "required": ["reference"],
+        "properties": { "reference": { "type": "object" } }
+      }
+    }
+  }
+}
+'@ | Set-Content -LiteralPath (Join-Path $BCQualityRoot 'schemas/findings-report.schema.json')
         Set-Content -LiteralPath (Join-Path $BCQualityRoot 'microsoft/skills/review/al-security-review.md') -Value '# security'
         Set-Content -LiteralPath (Join-Path $BCQualityRoot 'microsoft/skills/review/al-style-review.md') -Value '# style'
 
@@ -896,6 +925,38 @@ Describe 'Deterministic leaf orchestration contract' {
         $script:BCQualityConfigCache = @{
             'enabled-layers' = @('microsoft')
             'disabled-skills' = @()
+        }
+        $script:TestLeafReports = @{}
+        $script:TestLeafMetrics = [pscustomobject]@{
+            models = @('gpt-5.4')
+            usage_complete = $true
+            malformed_records = 0
+            cli_version = '1.0.83'
+            total_tokens = 12
+        }
+
+        Mock Save-CopilotRunMetrics { $script:TestLeafMetrics }
+        Mock Start-LeafCopilotProcess {
+            param($Leaf, $WorkDir, $Prompt)
+
+            New-Item -ItemType Directory -Path $WorkDir -Force | Out-Null
+            $script:TestLeafReports[$Leaf.id] |
+                ConvertTo-Json -Depth 20 |
+                Set-Content -LiteralPath (Join-Path $WorkDir $ReportFileName)
+            $process = [pscustomobject]@{
+                HasExited = $true
+                ExitCode = 0
+            }
+            $process | Add-Member -MemberType ScriptMethod -Name Dispose -Value {}
+            return [pscustomobject]@{
+                Leaf = $Leaf
+                WorkDir = $WorkDir
+                OtelPath = Join-Path $WorkDir 'missing-otel.jsonl'
+                Process = $process
+                StdoutTask = [System.Threading.Tasks.Task]::FromResult([string]'')
+                StderrTask = [System.Threading.Tasks.Task]::FromResult([string]'')
+                StartedAt = [DateTime]::UtcNow.AddSeconds(-1)
+            }
         }
     }
 
@@ -987,6 +1048,132 @@ Describe 'Deterministic leaf orchestration contract' {
         $prompt | Should -Match 'al-style-review: failed before a usable findings-report was available'
         $prompt | Should -Match "outcome 'failed'"
         $prompt | Should -Match 'Failed leaves are distinct from\s+skipped'
+    }
+
+    It 'continues after a schema-invalid leaf and records partial coverage' {
+        $plan = @(Get-ReviewLeafPlan)
+        $script:TestLeafReports['al-security-review'] = @{
+            skill = @{ id = 'al-security-review' }
+            findings = @()
+        }
+        $script:TestLeafReports['al-style-review'] = @{
+            skill = @{ id = 'al-style-review' }
+            findings = @()
+            suppressed = @(@{ reason = 'missing reference' })
+        }
+
+        $results = @(Invoke-DeterministicLeafReviews -Plan $plan)
+        $status = Assert-UsableLeafReviewCoverage -Plan $plan -LeafResults $results
+        $prompt = Build-ConsolidationPrompt -LeafResults $results -FailedLeaves $script:FailedLeafReviews
+        Save-ReviewRunManifest -Status $status
+
+        $results.Count | Should -Be 1
+        $results[0].Leaf.id | Should -Be 'al-security-review'
+        $status | Should -Be 'partial'
+        $prompt | Should -Match 'al-style-review: failed before a usable findings-report was available'
+        $repaired = Get-Content -LiteralPath $results[0].ReportPath -Raw | ConvertFrom-Json
+        $repaired.PSObject.Properties.Match('suppressed').Count | Should -Be 1
+        @($repaired.suppressed).Count | Should -Be 0
+        $script:TestLeafReports['al-style-review'].suppressed[0].ContainsKey('reference') | Should -BeFalse
+
+        $manifest = Get-Content -LiteralPath (Join-Path $ReviewOutputDir '_run-manifest.json') -Raw |
+            ConvertFrom-Json
+        $manifest.status | Should -Be 'partial'
+        @($manifest.processes | Where-Object status -eq 'completed').Count | Should -Be 1
+        @($manifest.processes | Where-Object status -eq 'failed').Count | Should -Be 1
+        ($manifest.processes | Where-Object status -eq 'failed').skill_id | Should -Be 'al-style-review'
+        ($manifest.processes | Where-Object status -eq 'failed').failure_reason |
+            Should -Match 'Required properties.*reference'
+    }
+
+    It 'fails before root consolidation when every leaf report is unusable' {
+        $plan = @(Get-ReviewLeafPlan)
+        foreach ($leaf in $plan) {
+            $script:TestLeafReports[$leaf.id] = @{
+                skill = @{ id = $leaf.id }
+                findings = @()
+                suppressed = @(@{ reason = 'missing reference' })
+            }
+        }
+
+        $results = @(Invoke-DeterministicLeafReviews -Plan $plan)
+
+        $results.Count | Should -Be 0
+        { Assert-UsableLeafReviewCoverage -Plan $plan -LeafResults $results } |
+            Should -Throw '*All 2 deterministic review leaves failed*root consolidation was not run*'
+        $manifest = Get-Content -LiteralPath (Join-Path $ReviewOutputDir '_run-manifest.json') -Raw |
+            ConvertFrom-Json
+        $manifest.status | Should -Be 'failed'
+        @($manifest.processes | Where-Object status -eq 'completed').Count | Should -Be 0
+        @($manifest.processes | Where-Object status -eq 'failed').Count | Should -Be 2
+        @($manifest.processes | Where-Object status -eq 'failed').skill_id |
+            Should -Be @('al-security-review', 'al-style-review')
+    }
+
+    It 'stops the orchestration immediately on <Name> integrity failure' -ForEach @(
+        @{
+            Name = 'wrong-model'
+            Metrics = [pscustomobject]@{
+                models = @('gemini-3.6-flash')
+                usage_complete = $true
+                malformed_records = 0
+                cli_version = '1.0.83'
+                total_tokens = 12
+            }
+            ErrorPattern = "*required model 'gpt-5.4'*"
+        },
+        @{
+            Name = 'incomplete-usage'
+            Metrics = [pscustomobject]@{
+                models = @('gpt-5.4')
+                usage_complete = $false
+                malformed_records = 0
+                cli_version = '1.0.83'
+                total_tokens = 12
+            }
+            ErrorPattern = '*incomplete Copilot usage telemetry*'
+        },
+        @{
+            Name = 'malformed-telemetry'
+            Metrics = [pscustomobject]@{
+                models = @('gpt-5.4')
+                usage_complete = $true
+                malformed_records = 1
+                cli_version = '1.0.83'
+                total_tokens = 12
+            }
+            ErrorPattern = '*malformed Copilot telemetry record*'
+        },
+        @{
+            Name = 'wrong-CLI'
+            Metrics = [pscustomobject]@{
+                models = @('gpt-5.4')
+                usage_complete = $true
+                malformed_records = 0
+                cli_version = '1.0.82'
+                total_tokens = 12
+            }
+            ErrorPattern = "*expected Copilot CLI '1.0.83'*"
+        }
+    ) {
+        $plan = @(Get-ReviewLeafPlan)
+        foreach ($leaf in $plan) {
+            $script:TestLeafReports[$leaf.id] = @{
+                skill = @{ id = $leaf.id }
+                findings = @()
+                suppressed = @()
+            }
+        }
+        $script:TestLeafMetrics = $Metrics
+
+        { Invoke-DeterministicLeafReviews -Plan $plan } |
+            Should -Throw $ErrorPattern
+        Should -Invoke Start-LeafCopilotProcess -Times 1 -Exactly
+        $manifest = Get-Content -LiteralPath (Join-Path $ReviewOutputDir '_run-manifest.json') -Raw |
+            ConvertFrom-Json
+        $manifest.status | Should -Be 'failed'
+        @($manifest.processes | Where-Object status -eq 'failed').Count | Should -Be 1
+        @($manifest.processes).Count | Should -Be 1
     }
 
     It 'rejects a consolidated report that changes the declared leaf order' {

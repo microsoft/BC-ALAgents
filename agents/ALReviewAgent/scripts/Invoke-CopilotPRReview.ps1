@@ -1560,7 +1560,7 @@ function Assert-CopilotInvocationMetrics {
 
 function Save-ReviewRunManifest {
     param(
-        [Parameter(Mandatory)][ValidateSet('running', 'completed', 'failed')][string] $Status,
+        [Parameter(Mandatory)][ValidateSet('running', 'completed', 'partial', 'failed')][string] $Status,
         [string] $FailureReason
     )
 
@@ -1613,6 +1613,25 @@ function Save-ReviewRunManifest {
     Set-Content -LiteralPath (Join-Path $ReviewOutputDir '_run-manifest.json') `
         -Value $manifestJson `
         -Encoding UTF8
+}
+
+function Assert-UsableLeafReviewCoverage {
+    param(
+        [Parameter(Mandatory)][object[]] $Plan,
+        [Parameter(Mandatory)][AllowEmptyCollection()][object[]] $LeafResults
+    )
+
+    if ($LeafResults.Count -gt 0) {
+        return $(if ($LeafResults.Count -eq $Plan.Count) { 'completed' } else { 'partial' })
+    }
+
+    $failedIds = @($script:FailedLeafReviews | ForEach-Object { [string]$_.Leaf.id })
+    $reason = "All $($Plan.Count) deterministic review leaves failed; root consolidation was not run because no usable leaf reports were produced."
+    if ($failedIds.Count -gt 0) {
+        $reason += " Failed leaves: $($failedIds -join ', ')."
+    }
+    Save-ReviewRunManifest -Status failed -FailureReason $reason
+    throw $reason
 }
 
 function Get-ReviewLeafPlan {
@@ -4317,7 +4336,8 @@ if ($ReviewPhase -ne 'post') {
     Write-LogPhaseDetail "Resolved $($leafPlan.Count) ordered review leaves from BCQuality's generated skill index."
     Save-ReviewRunManifest -Status running
     $leafResults = @(Invoke-DeterministicLeafReviews -Plan $leafPlan)
-    Write-LogPhaseDetail "All $($leafResults.Count) leaf processes completed; starting root consolidation on $CopilotModel."
+    $reviewCompletionStatus = Assert-UsableLeafReviewCoverage -Plan $leafPlan -LeafResults $leafResults
+    Write-LogPhaseDetail "$($leafResults.Count) leaf process(es) produced usable reports; $(@($script:FailedLeafReviews).Count) failed. Starting root consolidation on $CopilotModel."
     $prompt = Build-ConsolidationPrompt `
         -LeafResults $leafResults `
         -FailedLeaves $script:FailedLeafReviews
@@ -4410,7 +4430,7 @@ if ($ReviewPhase -ne 'post') {
         -Metrics $script:LastCopilotInvocationMetrics `
         -ExitCode 0 `
         -ReportPath $reportFilePath
-    Save-ReviewRunManifest -Status completed
+    Save-ReviewRunManifest -Status $reviewCompletionStatus
 
     # Persist the raw agent output (plus transcript and filter report) so the
     # separate, write-capable publish phase can post findings without the

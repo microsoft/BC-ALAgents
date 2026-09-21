@@ -125,7 +125,11 @@ commit for [BCQuality#182](https://github.com/microsoft/BCQuality/pull/182),
 which introduced the findings-report and skill-index schemas used by the
 orchestrator. A leaf that produces malformed or schema-invalid JSON is recorded
 as failed and the remaining leaves continue; model-substitution and telemetry
-integrity failures remain fail-closed.
+integrity failures remain fail-closed. `_run-manifest.json` records leaf coverage
+with a top-level `partial` status when only some leaves succeed; its existing
+per-process records identify failed leaf IDs and reasons. If every leaf fails,
+the run stops before root consolidation and records `failed` rather than
+publishing a zero-coverage review.
 
 1. A caller-provided `config_path`, resolved from the target repository.
 2. Individual workflow inputs such as `bcquality_repo` and `bcquality_ref`,
