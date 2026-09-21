@@ -1876,6 +1876,17 @@ function Assert-LeafReportRole {
     }
 }
 
+function Assert-ActiveLeafProcessHasExited {
+    param(
+        [Parameter(Mandatory)][object] $Process,
+        [Parameter(Mandatory)][string] $LeafId
+    )
+
+    if (-not $Process.HasExited) {
+        throw "Leaf '$LeafId' remained running after timeout kill; refusing to drain stdout/stderr or continue with an uncontrolled leaf process."
+    }
+}
+
 function Receive-LeafCopilotProcess {
     param([Parameter(Mandatory)][object] $State)
 
@@ -1884,12 +1895,23 @@ function Receive-LeafCopilotProcess {
     $reportPath = Join-Path $State.WorkDir $ReportFileName
     $elapsed = [DateTime]::UtcNow - $State.StartedAt
     $timedOut = $CopilotCliTimeoutMinutes -gt 0 -and $elapsed.TotalMinutes -ge $CopilotCliTimeoutMinutes
+    $integrityFailure = $false
     if ($timedOut -and -not $process.HasExited) {
         try { $process.Kill($true) } catch { if (-not $process.HasExited) { $process.Kill() } }
         $null = $process.WaitForExit(10000)
+        try {
+            Assert-ActiveLeafProcessHasExited -Process $process -LeafId $State.Leaf.id
+        }
+        catch {
+            $integrityFailure = $true
+            throw
+        }
     }
-    $integrityFailure = $false
     try {
+        if (-not $process.HasExited) {
+            $integrityFailure = $true
+            throw "Leaf '$($State.Leaf.id)' was received before completion."
+        }
         $stdout = $State.StdoutTask.GetAwaiter().GetResult()
         $stderr = $State.StderrTask.GetAwaiter().GetResult()
         Set-Content -LiteralPath (Join-Path $State.WorkDir 'stdout.txt') -Value $stdout -Encoding UTF8
