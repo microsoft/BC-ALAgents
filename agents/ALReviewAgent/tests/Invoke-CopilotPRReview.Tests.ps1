@@ -835,6 +835,43 @@ Describe 'Domain rendering safety' {
 
         $body | Should -Match 'API \\\| 100%\\_safe &amp; &lt;test&gt; &#36;math&#36; &#64;team &#58;smile&#58;'
     }
+
+    It 'renders failed sub-skills separately from intentionally skipped sub-skills' {
+        $body = Build-SummaryBody -Outcome partial -OutcomeReason 'One review domain failed.' `
+            -DomainSummary @{} -Suppressed @() `
+            -SkippedSubSkills @([pscustomobject]@{ id = 'al-testing-review'; reason = 'configuration' }) `
+            -FailedSubSkills @([pscustomobject]@{
+                id = 'al-error-handling-review'
+                reason = 'Leaf report failed schema validation.'
+            }) `
+            -FilterReport $null
+
+        $body | Should -Match '### Sub-skills skipped'
+        $body | Should -Match 'al-testing-review — configuration'
+        $body | Should -Match '### Sub-skills failed — review coverage is incomplete'
+        $body | Should -Match '\| al-error-handling-review \| Leaf report failed schema validation\. \|'
+    }
+
+    It 'uses a bounded fallback when a failed sub-skill has no report explanation' {
+        $body = Build-SummaryBody -Outcome partial -OutcomeReason '' -DomainSummary @{} `
+            -Suppressed @() -SkippedSubSkills @() `
+            -FailedSubSkills @([pscustomobject]@{ id = 'al-query-review'; reason = '' }) `
+            -FilterReport $null
+
+        $body | Should -Match 'al-query-review'
+        $body | Should -Match 'Failed without a report-provided explanation; see the run manifest'
+    }
+
+    It 'omits the failed sub-skills section when no sub-result failed' {
+        $body = Build-SummaryBody -Outcome completed -OutcomeReason '' -DomainSummary @{} `
+            -Suppressed @([pscustomobject]@{ path = 'microsoft/knowledge/a.md'; reason = 'configuration' }) `
+            -SkippedSubSkills @([pscustomobject]@{ id = 'al-testing-review'; reason = 'not-applicable' }) `
+            -FailedSubSkills @() -FilterReport $null
+
+        $body | Should -Match 'Knowledge files suppressed'
+        $body | Should -Match '### Sub-skills skipped'
+        $body | Should -Not -Match 'Sub-skills failed'
+    }
 }
 
 Describe 'Deterministic leaf orchestration contract' {
@@ -1048,6 +1085,51 @@ Describe 'Deterministic leaf orchestration contract' {
         $prompt | Should -Match 'al-style-review: failed before a usable findings-report was available'
         $prompt | Should -Match "outcome 'failed'"
         $prompt | Should -Match 'Failed leaves are distinct from\s+skipped'
+    }
+
+    It 'parses failed sub-results and their schema-defined outcome reasons' {
+        $report = @{
+            skill = @{ id = 'al-code-review'; version = 1 }
+            outcome = 'partial'
+            'outcome-reason' = 'One leaf failed.'
+            summary = @{
+                counts = @{ blocker = 0; major = 0; minor = 0; info = 0 }
+                coverage = @{ 'worklist-size' = 2; 'items-evaluated' = 1 }
+            }
+            findings = @()
+            suppressed = @()
+            'sub-results' = @(
+                @{
+                    skill = @{ id = 'al-security-review'; version = 1 }
+                    outcome = 'completed'
+                    summary = @{
+                        counts = @{ blocker = 0; major = 0; minor = 0; info = 0 }
+                        coverage = @{ 'worklist-size' = 1; 'items-evaluated' = 1 }
+                    }
+                    findings = @()
+                    suppressed = @()
+                },
+                @{
+                    skill = @{ id = 'al-style-review'; version = 1 }
+                    outcome = 'failed'
+                    'outcome-reason' = 'Schema-invalid leaf report.'
+                    summary = @{
+                        counts = @{ blocker = 0; major = 0; minor = 0; info = 0 }
+                        coverage = @{ 'worklist-size' = 1; 'items-evaluated' = 0 }
+                    }
+                    findings = @()
+                    suppressed = @()
+                }
+            )
+            'skipped-sub-skills' = @()
+        } | ConvertTo-Json -Depth 20
+
+        $parsed = Parse-BCQualityReport -Output $report
+
+        $parsed.FailedSubSkills.Count | Should -Be 1
+        $parsed.FailedSubSkills[0].id | Should -Be 'al-style-review'
+        $parsed.FailedSubSkills[0].reason | Should -Be 'Schema-invalid leaf report.'
+        $parsed.SkippedSubSkills.Count | Should -Be 0
     }
 
     It 'continues after a schema-invalid leaf and records partial coverage' {

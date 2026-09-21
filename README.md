@@ -129,7 +129,9 @@ integrity failures remain fail-closed. `_run-manifest.json` records leaf coverag
 with a top-level `partial` status when only some leaves succeed; its existing
 per-process records identify failed leaf IDs and reasons. If every leaf fails,
 the run stops before root consolidation and records `failed` rather than
-publishing a zero-coverage review.
+publishing a zero-coverage review. When summary posting is enabled, failed
+sub-skills also appear in a distinct incomplete-coverage section rather than
+being presented as skipped or as successful zero-finding reviews.
 
 1. A caller-provided `config_path`, resolved from the target repository.
 2. Individual workflow inputs such as `bcquality_repo` and `bcquality_ref`,

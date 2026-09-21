@@ -2763,7 +2763,7 @@ function Parse-BCQualityReport {
     if ($null -eq $report) {
         return [pscustomobject]@{
             Outcome = 'failed'; OutcomeReason = 'No parseable JSON object in Copilot output'
-            Findings = @(); Suppressed = @(); SkippedSubSkills = @(); SubResults = @(); SubResultCount = 0
+            Findings = @(); Suppressed = @(); SkippedSubSkills = @(); FailedSubSkills = @(); SubResults = @(); SubResultCount = 0
         }
     }
 
@@ -2776,7 +2776,7 @@ function Parse-BCQualityReport {
         return [pscustomobject]@{
             Outcome = ([string]$report.outcome ?? 'failed')
             OutcomeReason = $reason
-            Findings = @(); Suppressed = @(); SkippedSubSkills = @(); SubResults = @(); SubResultCount = 0
+            Findings = @(); Suppressed = @(); SkippedSubSkills = @(); FailedSubSkills = @(); SubResults = @(); SubResultCount = 0
         }
     }
 
@@ -2958,6 +2958,10 @@ function Parse-BCQualityReport {
 
             $srOutcome = ''
             if ($sr.PSObject.Properties.Match('outcome').Count -gt 0) { $srOutcome = [string]$sr.outcome }
+            $srOutcomeReason = ''
+            if ($sr.PSObject.Properties.Match('outcome-reason').Count -gt 0) {
+                $srOutcomeReason = [string]$sr.'outcome-reason'
+            }
 
             $srFindingCount = $null
             if ($sr.PSObject.Properties.Match('findings').Count -gt 0 -and $null -ne $sr.findings) {
@@ -2986,12 +2990,19 @@ function Parse-BCQualityReport {
             [pscustomobject]@{
                 id           = $id
                 outcome      = $srOutcome
+                outcomeReason = $srOutcomeReason
                 findingCount = $srFindingCount
                 references   = @($srRefs)
             }
         })
     }
     $subResultCount = $subResults.Count
+    $failedSubSkills = @($subResults | Where-Object { $_.outcome -eq 'failed' } | ForEach-Object {
+        [pscustomobject]@{
+            id = $_.id
+            reason = $_.outcomeReason
+        }
+    })
 
     # Per-domain cap, then global sort.
     $byDomain = Get-OrdinalDictionary
@@ -3013,6 +3024,7 @@ function Parse-BCQualityReport {
         Findings = @($capped)
         Suppressed = $suppressed
         SkippedSubSkills = $skippedSubSkills
+        FailedSubSkills = $failedSubSkills
         SubResults = @($subResults)
         SubResultCount = $subResultCount
     }
@@ -3866,6 +3878,7 @@ function Build-SummaryBody {
         [System.Collections.IDictionary] $DomainSummary,
         [object[]] $Suppressed,
         [object[]] $SkippedSubSkills,
+        [object[]] $FailedSubSkills,
         [object] $FilterReport
     )
 
@@ -3933,6 +3946,20 @@ function Build-SummaryBody {
         $lines.Add('### Sub-skills skipped') | Out-Null
         foreach ($s in $SkippedSubSkills) {
             $lines.Add("- $($s.id) — $($s.reason)") | Out-Null
+        }
+    }
+
+    if ($FailedSubSkills -and $FailedSubSkills.Count -gt 0) {
+        $lines.Add('') | Out-Null
+        $lines.Add('### Sub-skills failed — review coverage is incomplete') | Out-Null
+        $lines.Add('') | Out-Null
+        $lines.Add('| Sub-skill | Reported failure |') | Out-Null
+        $lines.Add('|---|---|') | Out-Null
+        foreach ($s in $FailedSubSkills) {
+            $safeId = ConvertTo-MarkdownTableCell -Value ([string]$s.id)
+            $reason = if ($s.reason) { [string]$s.reason } else { 'Failed without a report-provided explanation; see the run manifest for process details.' }
+            $safeReason = ConvertTo-MarkdownTableCell -Value $reason
+            $lines.Add("| $safeId | $safeReason |") | Out-Null
         }
     }
 
@@ -4524,6 +4551,7 @@ $summaryBody = Build-SummaryBody `
     -DomainSummary $domainSummary `
     -Suppressed $report.Suppressed `
     -SkippedSubSkills $report.SkippedSubSkills `
+    -FailedSubSkills $report.FailedSubSkills `
     -FilterReport $script:FilterReport
 
 if ($PostSummaryComment) {
