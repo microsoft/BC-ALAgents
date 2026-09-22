@@ -70,7 +70,7 @@ if (Test-Path -LiteralPath $skillIndexScript -PathType Leaf) {
     & $skillIndexScript -BCQualityRoot $BCQualityRoot -IndexPath $skillIndexPath | Out-Null
 }
 else {
-    Write-Warning "BCQuality checkout has no skill-index generator; deterministic review execution will reject this checkout."
+    Write-Warning "BCQuality checkout has no skill-index generator; deterministic review execution will reject this checkout. BCQuality commit b74967bc5b7a454eae19d6a1250199afd869f064 or a newer ref is required (introduced by microsoft/BCQuality#182)."
 }
 
 $layers = @($Config['enabled-layers'])

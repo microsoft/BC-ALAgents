@@ -55,7 +55,7 @@
                                                 CLI credential store.
         COPILOT_MODEL                        - explicit model name for Copilot CLI
         COPILOT_REVIEW_CLI_VERSION           - pinned Copilot CLI version
-        COPILOT_REVIEW_LEAF_MODEL            - required explicit model for leaf processes
+        COPILOT_REVIEW_LEAF_MODEL            - model for leaf processes (defaults in review.yml)
         COPILOT_REVIEW_LEAF_EXECUTION        - serial|parallel (default serial)
         COPILOT_REVIEW_MAX_LEAF_CONCURRENCY  - positive concurrency bound for parallel mode
         MINIMUM_SEVERITY                     - Critical | High | Medium | Low (default: Medium)
@@ -383,7 +383,7 @@ function Assert-Config {
         }
         $findingsSchema = Join-Path $BCQualityRoot 'schemas/findings-report.schema.json'
         if (-not (Test-Path -LiteralPath $findingsSchema -PathType Leaf)) {
-            throw "Pinned BCQuality checkout is missing the findings-report schema: $findingsSchema"
+            throw "Pinned BCQuality checkout is missing the findings-report schema: $findingsSchema. BCQuality commit b74967bc5b7a454eae19d6a1250199afd869f064 or a newer ref is required (introduced by microsoft/BCQuality#182)."
         }
         if (-not (Get-Command copilot -ErrorAction SilentlyContinue)) {
             throw 'Copilot CLI not found in PATH. Install @github/copilot before running this script.'
@@ -1560,7 +1560,7 @@ function Assert-CopilotInvocationMetrics {
 
 function Save-ReviewRunManifest {
     param(
-        [Parameter(Mandatory)][ValidateSet('running', 'completed', 'failed')][string] $Status,
+        [Parameter(Mandatory)][ValidateSet('running', 'completed', 'partial', 'failed')][string] $Status,
         [string] $FailureReason
     )
 
@@ -1613,6 +1613,25 @@ function Save-ReviewRunManifest {
     Set-Content -LiteralPath (Join-Path $ReviewOutputDir '_run-manifest.json') `
         -Value $manifestJson `
         -Encoding UTF8
+}
+
+function Assert-UsableLeafReviewCoverage {
+    param(
+        [Parameter(Mandatory)][object[]] $Plan,
+        [Parameter(Mandatory)][AllowEmptyCollection()][object[]] $LeafResults
+    )
+
+    if ($LeafResults.Count -gt 0) {
+        return $(if ($LeafResults.Count -eq $Plan.Count) { 'completed' } else { 'partial' })
+    }
+
+    $failedIds = @($script:FailedLeafReviews | ForEach-Object { [string]$_.Leaf.id })
+    $reason = "All $($Plan.Count) deterministic review leaves failed; root consolidation was not run because no usable leaf reports were produced."
+    if ($failedIds.Count -gt 0) {
+        $reason += " Failed leaves: $($failedIds -join ', ')."
+    }
+    Save-ReviewRunManifest -Status failed -FailureReason $reason
+    throw $reason
 }
 
 function Get-ReviewLeafPlan {
@@ -1835,6 +1854,39 @@ function Start-LeafCopilotProcess {
     }
 }
 
+function Repair-MissingSuppressedProperty {
+    param([Parameter(Mandatory)][object] $ReportObject)
+
+    if ($ReportObject.PSObject.Properties.Match('suppressed').Count -eq 0) {
+        $ReportObject | Add-Member -NotePropertyName suppressed -NotePropertyValue @()
+        return $true
+    }
+    return $false
+}
+
+function Assert-LeafReportRole {
+    param([Parameter(Mandatory)][object] $ReportObject)
+
+    $superSkillFields = @('sub-results', 'skipped-sub-skills')
+    $present = @($superSkillFields | Where-Object {
+        $ReportObject.PSObject.Properties.Match($_).Count -gt 0
+    })
+    if ($present.Count -gt 0) {
+        throw "Leaf report contains super-skill-only field(s): $($present -join ', ')."
+    }
+}
+
+function Assert-ActiveLeafProcessHasExited {
+    param(
+        [Parameter(Mandatory)][object] $Process,
+        [Parameter(Mandatory)][string] $LeafId
+    )
+
+    if (-not $Process.HasExited) {
+        throw "Leaf '$LeafId' remained running after timeout kill; refusing to drain stdout/stderr or continue with an uncontrolled leaf process."
+    }
+}
+
 function Receive-LeafCopilotProcess {
     param([Parameter(Mandatory)][object] $State)
 
@@ -1843,15 +1895,39 @@ function Receive-LeafCopilotProcess {
     $reportPath = Join-Path $State.WorkDir $ReportFileName
     $elapsed = [DateTime]::UtcNow - $State.StartedAt
     $timedOut = $CopilotCliTimeoutMinutes -gt 0 -and $elapsed.TotalMinutes -ge $CopilotCliTimeoutMinutes
-    if ($timedOut -and -not $process.HasExited) {
-        try { $process.Kill($true) } catch { if (-not $process.HasExited) { $process.Kill() } }
-        $null = $process.WaitForExit(10000)
-    }
-    if (-not $process.HasExited) {
-        throw "Leaf '$($State.Leaf.id)' was received before completion."
-    }
-
+    $integrityFailure = $false
     try {
+        if ($timedOut -and -not $process.HasExited) {
+            try {
+                $process.Kill($true)
+            }
+            catch {
+                if (-not $process.HasExited) {
+                    try {
+                        $process.Kill()
+                    }
+                    catch {
+                        $integrityFailure = $true
+                        throw
+                    }
+                }
+            }
+            try {
+                $null = $process.WaitForExit(10000)
+            }
+            catch {
+                $integrityFailure = $true
+                throw
+            }
+            if (-not $process.HasExited) {
+                $integrityFailure = $true
+                Assert-ActiveLeafProcessHasExited -Process $process -LeafId $State.Leaf.id
+            }
+        }
+        if (-not $process.HasExited) {
+            $integrityFailure = $true
+            throw "Leaf '$($State.Leaf.id)' was received before completion."
+        }
         $stdout = $State.StdoutTask.GetAwaiter().GetResult()
         $stderr = $State.StderrTask.GetAwaiter().GetResult()
         Set-Content -LiteralPath (Join-Path $State.WorkDir 'stdout.txt') -Value $stdout -Encoding UTF8
@@ -1860,11 +1936,13 @@ function Receive-LeafCopilotProcess {
         if ($stdout) { $script:AgentTranscript += "out: $stdout`n" }
         if ($stderr) { $script:AgentTranscript += "err: $stderr`n" }
 
+        $terminationFailure = $null
         if ($timedOut) {
-            throw "Copilot CLI leaf '$($State.Leaf.id)' timed out after $CopilotCliTimeoutMinutes minutes."
-        }
-        if ($process.ExitCode -ne 0) {
-            throw "Copilot CLI leaf '$($State.Leaf.id)' exited with code $($process.ExitCode)."
+            $terminationFailure = "Copilot CLI leaf '$($State.Leaf.id)' timed out after $CopilotCliTimeoutMinutes minutes."
+        } elseif (-not $process.HasExited) {
+            $terminationFailure = "Leaf '$($State.Leaf.id)' was received before completion."
+        } elseif ($process.ExitCode -ne 0) {
+            $terminationFailure = "Copilot CLI leaf '$($State.Leaf.id)' exited with code $($process.ExitCode)."
         }
 
         $parsedTelemetry = if (Test-Path -LiteralPath $State.OtelPath -PathType Leaf) {
@@ -1881,10 +1959,20 @@ function Receive-LeafCopilotProcess {
         $script:CopilotOtelRecords = @($existingRecords) + @($parsedTelemetry.Records)
         $script:CopilotOtelMalformedRecords += $parsedTelemetry.MalformedRecords
 
-        Assert-CopilotInvocationMetrics `
-            -Metrics $leafMetrics `
-            -RequestedModel $LeafModel `
-            -InvocationLabel "Leaf '$($State.Leaf.id)'"
+        try {
+            Assert-CopilotInvocationMetrics `
+                -Metrics $leafMetrics `
+                -RequestedModel $LeafModel `
+                -InvocationLabel "Leaf '$($State.Leaf.id)'"
+        }
+        catch {
+            $integrityFailure = $true
+            throw
+        }
+
+        if ($terminationFailure) {
+            throw $terminationFailure
+        }
 
         if (-not (Test-Path -LiteralPath $reportPath -PathType Leaf)) {
             throw "Leaf '$($State.Leaf.id)' did not produce '$reportPath'."
@@ -1900,10 +1988,15 @@ function Receive-LeafCopilotProcess {
             throw "Leaf '$($State.Leaf.id)' returned report for '$($reportObject.skill.id)'."
         }
 
+        if (Repair-MissingSuppressedProperty -ReportObject $reportObject) {
+            $reportText = $reportObject | ConvertTo-Json -Depth 40
+            Set-Content -LiteralPath $reportPath -Value $reportText -Encoding UTF8
+        }
         $schemaPath = Join-Path $BCQualityRoot 'schemas/findings-report.schema.json'
         if (-not ($reportText | Test-Json -SchemaFile $schemaPath -ErrorAction Stop)) {
             throw "Leaf '$($State.Leaf.id)' report does not conform to the findings-report schema."
         }
+        Assert-LeafReportRole -ReportObject $reportObject
 
         Write-LogPhaseDetail "Leaf $($State.Leaf.ordinal)/$($State.Leaf.id) completed: $(@($reportObject.findings).Count) finding(s), $($leafMetrics.total_tokens) token(s)."
         $completedAt = [DateTime]::UtcNow
@@ -1942,8 +2035,13 @@ function Receive-LeafCopilotProcess {
             -ExitCode $exitCode `
             -ReportPath $(if (Test-Path -LiteralPath $reportPath -PathType Leaf) { $reportPath } else { $null }) `
             -FailureReason $failure.Exception.Message
-        Save-ReviewRunManifest -Status failed -FailureReason $failure.Exception.Message
-        throw $failure
+        if ($integrityFailure) {
+            Save-ReviewRunManifest -Status failed -FailureReason $failure.Exception.Message
+            throw $failure
+        }
+        Save-ReviewRunManifest -Status running
+        Write-LogNotice 'Leaf failed; continuing review' "Leaf '$($State.Leaf.id)' was marked failed and will be surfaced to root consolidation: $($failure.Exception.Message)"
+        return $null
     }
     finally {
         $process.Dispose()
@@ -1960,6 +2058,8 @@ function Invoke-DeterministicLeafReviews {
     foreach ($leaf in $Plan) { $pending.Enqueue($leaf) }
     $active = [System.Collections.Generic.List[object]]::new()
     $results = @{}
+    $failedLeaves = [System.Collections.Generic.List[object]]::new()
+    $script:FailedLeafReviews = @()
 
     try {
         while ($pending.Count -gt 0 -or $active.Count -gt 0) {
@@ -1983,8 +2083,11 @@ function Invoke-DeterministicLeafReviews {
                         -CompletedAt ([DateTime]::UtcNow) `
                         -ExitCode $null `
                         -FailureReason $_.Exception.Message
-                    Save-ReviewRunManifest -Status failed -FailureReason $_.Exception.Message
-                    throw
+                    Save-ReviewRunManifest -Status running
+                    $failedLeaves.Add([pscustomobject]@{
+                        Leaf = $leaf
+                        Reason = $_.Exception.Message
+                    }) | Out-Null
                 }
             }
 
@@ -2001,7 +2104,17 @@ function Invoke-DeterministicLeafReviews {
             foreach ($state in $completed) {
                 [void]$active.Remove($state)
                 $result = Receive-LeafCopilotProcess -State $state
-                $results[$result.Leaf.path] = $result
+                if ($null -ne $result) {
+                    $results[$result.Leaf.path] = $result
+                }
+                else {
+                    $failedLeaves.Add([pscustomobject]@{
+                        Leaf = $state.Leaf
+                        Reason = ($script:ReviewProcessTelemetry |
+                            Where-Object { $_.role -eq 'leaf' -and $_.skill_id -eq $state.Leaf.id } |
+                            Select-Object -Last 1).failure_reason
+                    }) | Out-Null
+                }
             }
         }
     }
@@ -2015,17 +2128,28 @@ function Invoke-DeterministicLeafReviews {
         throw
     }
 
-    return @($Plan | ForEach-Object { $results[$_.path] })
+    $script:FailedLeafReviews = @($failedLeaves)
+    return @($Plan | Where-Object { $results.ContainsKey($_.path) } | ForEach-Object { $results[$_.path] })
 }
 
 function Build-ConsolidationPrompt {
-    param([Parameter(Mandatory)][object[]] $LeafResults)
+    param(
+        [Parameter(Mandatory)][object[]] $LeafResults,
+        [object[]] $FailedLeaves = @()
+    )
 
     $reviewRoot = ($AnalysisWorkspace -replace '\\', '/')
     $bcqualityRootFwd = ($BCQualityRoot -replace '\\', '/')
     $taskContextPath = ((Join-Path $AgentWorkDir '_task-context.json') -replace '\\', '/')
     $orderedReports = @($LeafResults | ForEach-Object { ($_.ReportPath -replace '\\', '/') })
     $reportList = ($orderedReports | ForEach-Object { "- $_" }) -join "`n"
+    $failedList = if (@($FailedLeaves).Count -gt 0) {
+        (@($FailedLeaves) | ForEach-Object {
+            "- $($_.Leaf.id): failed before a usable findings-report was available; reason: $($_.Reason)"
+        }) -join "`n"
+    } else {
+        '- none'
+    }
 
     return @"
 Consolidate a deterministic Business Central review after all leaf processes
@@ -2039,6 +2163,9 @@ Authoritative contracts:
 Leaf findings-reports, already ordered by the super-skill contract:
 $reportList
 
+Leaf processes that failed without a usable report:
+$failedList
+
 Target repository worktree: $reviewRoot
 Diff range: $DiffRange
 
@@ -2047,9 +2174,12 @@ Aggregate their findings according to the super-skill contract, then perform
 the super-skill's root self-review pass against the complete diff. Root
 self-review may add only genuine cross-domain or otherwise missed findings and
 must use from-sub-skill "agent" with references [] when no BCQuality article
-backs a finding. Record configured omissions from the task context in
-skipped-sub-skills rather than inventing sub-results for leaves that were not
-executed.
+backs a finding. Record configured omissions from the task context in skipped-sub-skills rather
+than inventing sub-results for leaves that were not executed. For every failed
+leaf listed above, include a sub-result in the declared plan order with that
+skill, outcome 'failed', zero findings, and the failure reason. Do not invent
+findings or references for a failed leaf. Failed leaves are distinct from
+skipped-sub-skills.
 
 Do not invoke child agents, Task tools, or leaf skills; those executions are
 complete. Do not omit, retry, or replace any leaf report.
@@ -2090,6 +2220,30 @@ function Assert-ConsolidatedReport {
             throw "Root consolidation sub-result $($i + 1) was '$($actualIds[$i])'; expected '$($expectedIds[$i])'."
         }
     }
+    return $report
+}
+
+function Get-ConsolidatedReviewStatus {
+    param(
+        [Parameter(Mandatory)][object[]] $Plan,
+        [Parameter(Mandatory)][AllowEmptyCollection()][object[]] $LeafResults,
+        [Parameter(Mandatory)][object] $Report
+    )
+
+    if ([string]$Report.outcome -eq 'failed') {
+        return 'failed'
+    }
+
+    $hasFailedOrPartialSubResult = @($Report.'sub-results' | Where-Object {
+        [string]$_.outcome -in @('failed', 'partial')
+    }).Count -gt 0
+    if ($LeafResults.Count -lt $Plan.Count -or
+        [string]$Report.outcome -eq 'partial' -or
+        $hasFailedOrPartialSubResult) {
+        return 'partial'
+    }
+
+    return 'completed'
 }
 
 # ---------------------------------------------------------------------------
@@ -2686,7 +2840,7 @@ function Parse-BCQualityReport {
     if ($null -eq $report) {
         return [pscustomobject]@{
             Outcome = 'failed'; OutcomeReason = 'No parseable JSON object in Copilot output'
-            Findings = @(); Suppressed = @(); SkippedSubSkills = @(); SubResults = @(); SubResultCount = 0
+            Findings = @(); Suppressed = @(); SkippedSubSkills = @(); FailedSubSkills = @(); SubResults = @(); SubResultCount = 0
         }
     }
 
@@ -2699,7 +2853,7 @@ function Parse-BCQualityReport {
         return [pscustomobject]@{
             Outcome = ([string]$report.outcome ?? 'failed')
             OutcomeReason = $reason
-            Findings = @(); Suppressed = @(); SkippedSubSkills = @(); SubResults = @(); SubResultCount = 0
+            Findings = @(); Suppressed = @(); SkippedSubSkills = @(); FailedSubSkills = @(); SubResults = @(); SubResultCount = 0
         }
     }
 
@@ -2881,6 +3035,10 @@ function Parse-BCQualityReport {
 
             $srOutcome = ''
             if ($sr.PSObject.Properties.Match('outcome').Count -gt 0) { $srOutcome = [string]$sr.outcome }
+            $srOutcomeReason = ''
+            if ($sr.PSObject.Properties.Match('outcome-reason').Count -gt 0) {
+                $srOutcomeReason = [string]$sr.'outcome-reason'
+            }
 
             $srFindingCount = $null
             if ($sr.PSObject.Properties.Match('findings').Count -gt 0 -and $null -ne $sr.findings) {
@@ -2909,12 +3067,19 @@ function Parse-BCQualityReport {
             [pscustomobject]@{
                 id           = $id
                 outcome      = $srOutcome
+                outcomeReason = $srOutcomeReason
                 findingCount = $srFindingCount
                 references   = @($srRefs)
             }
         })
     }
     $subResultCount = $subResults.Count
+    $failedSubSkills = @($subResults | Where-Object { $_.outcome -eq 'failed' } | ForEach-Object {
+        [pscustomobject]@{
+            id = $_.id
+            reason = $_.outcomeReason
+        }
+    })
 
     # Per-domain cap, then global sort.
     $byDomain = Get-OrdinalDictionary
@@ -2936,6 +3101,7 @@ function Parse-BCQualityReport {
         Findings = @($capped)
         Suppressed = $suppressed
         SkippedSubSkills = $skippedSubSkills
+        FailedSubSkills = $failedSubSkills
         SubResults = @($subResults)
         SubResultCount = $subResultCount
     }
@@ -3789,6 +3955,7 @@ function Build-SummaryBody {
         [System.Collections.IDictionary] $DomainSummary,
         [object[]] $Suppressed,
         [object[]] $SkippedSubSkills,
+        [object[]] $FailedSubSkills,
         [object] $FilterReport
     )
 
@@ -3856,6 +4023,20 @@ function Build-SummaryBody {
         $lines.Add('### Sub-skills skipped') | Out-Null
         foreach ($s in $SkippedSubSkills) {
             $lines.Add("- $($s.id) — $($s.reason)") | Out-Null
+        }
+    }
+
+    if ($FailedSubSkills -and $FailedSubSkills.Count -gt 0) {
+        $lines.Add('') | Out-Null
+        $lines.Add('### Sub-skills failed — review coverage is incomplete') | Out-Null
+        $lines.Add('') | Out-Null
+        $lines.Add('| Sub-skill | Reported failure |') | Out-Null
+        $lines.Add('|---|---|') | Out-Null
+        foreach ($s in $FailedSubSkills) {
+            $safeId = ConvertTo-MarkdownTableCell -Value ([string]$s.id)
+            $reason = if ($s.reason) { [string]$s.reason } else { 'Failed without a report-provided explanation; see the run manifest for process details.' }
+            $safeReason = ConvertTo-MarkdownTableCell -Value $reason
+            $lines.Add("| $safeId | $safeReason |") | Out-Null
         }
     }
 
@@ -4259,8 +4440,11 @@ if ($ReviewPhase -ne 'post') {
     Write-LogPhaseDetail "Resolved $($leafPlan.Count) ordered review leaves from BCQuality's generated skill index."
     Save-ReviewRunManifest -Status running
     $leafResults = @(Invoke-DeterministicLeafReviews -Plan $leafPlan)
-    Write-LogPhaseDetail "All $($leafResults.Count) leaf processes completed; starting root consolidation on $CopilotModel."
-    $prompt = Build-ConsolidationPrompt -LeafResults $leafResults
+    $reviewCompletionStatus = Assert-UsableLeafReviewCoverage -Plan $leafPlan -LeafResults $leafResults
+    Write-LogPhaseDetail "$($leafResults.Count) leaf process(es) produced usable reports; $(@($script:FailedLeafReviews).Count) failed. Starting root consolidation on $CopilotModel."
+    $prompt = Build-ConsolidationPrompt `
+        -LeafResults $leafResults `
+        -FailedLeaves $script:FailedLeafReviews
     $rootStartedAt = [DateTime]::UtcNow
     try {
         $output = Invoke-CopilotCli -Prompt $prompt
@@ -4320,7 +4504,7 @@ if ($ReviewPhase -ne 'post') {
     }
 
     try {
-        Assert-ConsolidatedReport -ReportText $output -Plan $leafPlan
+        $consolidatedReport = Assert-ConsolidatedReport -ReportText $output -Plan $leafPlan
     }
     catch {
         $rootFailure = $_
@@ -4350,7 +4534,13 @@ if ($ReviewPhase -ne 'post') {
         -Metrics $script:LastCopilotInvocationMetrics `
         -ExitCode 0 `
         -ReportPath $reportFilePath
-    Save-ReviewRunManifest -Status completed
+    $reviewCompletionStatus = Get-ConsolidatedReviewStatus `
+        -Plan $leafPlan `
+        -LeafResults $leafResults `
+        -Report $consolidatedReport
+    Save-ReviewRunManifest `
+        -Status $reviewCompletionStatus `
+        -FailureReason $(if ($reviewCompletionStatus -eq 'failed') { [string]$consolidatedReport.'outcome-reason' } else { $null })
 
     # Persist the raw agent output (plus transcript and filter report) so the
     # separate, write-capable publish phase can post findings without the
@@ -4444,6 +4634,7 @@ $summaryBody = Build-SummaryBody `
     -DomainSummary $domainSummary `
     -Suppressed $report.Suppressed `
     -SkippedSubSkills $report.SkippedSubSkills `
+    -FailedSubSkills $report.FailedSubSkills `
     -FilterReport $script:FilterReport
 
 if ($PostSummaryComment) {

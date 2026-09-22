@@ -83,6 +83,8 @@ check out the same engine version.
 | `config_path` | *(empty)* | Path to the consumer's `bcquality.config.yaml`, relative to the target repo root. Empty uses the engine default. |
 | `pr_number` / `head_sha` / `base_ref` | *(empty)* | Explicit PR coordinates; bypasses `workflow_run` resolution. |
 | `minimum_severity` | `Medium` | Lowest severity to report (`Critical`/`High`/`Medium`/`Low`). |
+| `copilot_model` | `gpt-5.6-sol` | Root model for final self-review and consolidation; consumers may override it. |
+| `copilot_leaf_model` | `gpt-5.6-luna` | Model for isolated review leaves; consumers may override it. |
 
 BCQuality policy (`bcquality_repo`, `bcquality_ref`, `enabled_layers`,
 `disabled_skills`, `knowledge_allow`, `knowledge_deny`) and reviewer behaviour
@@ -116,6 +118,21 @@ single-token metadata and headings use a separate lowercase compatibility path.
 ### BCQuality dependency and rollout
 
 The reusable workflow accepts three levels of BCQuality configuration:
+
+Deterministic leaf execution requires BCQuality commit
+`b74967bc5b7a454eae19d6a1250199afd869f064` or a newer ref. This is the merge
+commit for [BCQuality#182](https://github.com/microsoft/BCQuality/pull/182),
+which introduced the findings-report and skill-index schemas used by the
+orchestrator. A leaf that produces malformed or schema-invalid JSON is recorded
+as failed and the remaining leaves continue; model-substitution and telemetry
+integrity failures remain fail-closed. `_run-manifest.json` records leaf and
+consolidated-report coverage with a top-level `partial` status when any usable
+review is incomplete; its existing per-process records identify failed leaf IDs
+and reasons. If every leaf fails,
+the run stops before root consolidation and records `failed` rather than
+publishing a zero-coverage review. When summary posting is enabled, failed
+sub-skills also appear in a distinct incomplete-coverage section rather than
+being presented as skipped or as successful zero-finding reviews.
 
 1. A caller-provided `config_path`, resolved from the target repository.
 2. Individual workflow inputs such as `bcquality_repo` and `bcquality_ref`,
