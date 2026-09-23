@@ -1589,6 +1589,30 @@ Describe 'BCQuality revision ownership' {
         { Resolve-BCQualityCommit -Root $root -ExpectedCommit ('f' * 40) } |
             Should -Throw "*does not match expected commit*"
     }
+
+    It 'uses the workflow-provided provenance in post without resolving a checkout' {
+        $postSha = 'a' * 40
+
+        $resolved = Resolve-BCQualityCommitForPhase `
+            -Phase 'post' `
+            -Root (Join-Path $TestDrive 'no-bcquality-checkout') `
+            -ExpectedCommit $postSha
+
+        $resolved | Should -Be $postSha
+    }
+
+    It 'requires a generation SHA in post' {
+        {
+            Resolve-BCQualityCommitForPhase -Phase 'post' -Root '' -ExpectedCommit ''
+        } | Should -Throw '*BCQUALITY_SHA must contain the resolved 40-character lowercase commit SHA from the generate phase*'
+    }
+
+    It 'requires a lowercase resolved generation SHA in post' {
+        {
+            Resolve-BCQualityCommitForPhase -Phase 'post' -Root '' -ExpectedCommit ('A' * 40)
+        } | Should -Throw '*BCQUALITY_SHA must contain the resolved 40-character lowercase commit SHA from the generate phase*'
+    }
+
 }
 
 Describe 'Local review authentication' {
@@ -1640,6 +1664,57 @@ Describe 'Local review authentication' {
         $PrHeadSha = 'abc123'
 
         { Assert-Config } | Should -Throw '*GH_TOKEN is required*'
+    }
+
+    It 'allows post validation with generated provenance and no BCQuality checkout' {
+        $ReviewPhase = 'post'
+        $ReviewSource = 'pr'
+        $GithubToken = 'post-token'
+        $PrNumber = 1
+        $PrHeadSha = 'abc123'
+        $BCQualityRoot = $null
+        $BCQualitySha = Resolve-BCQualityCommitForPhase `
+            -Phase $ReviewPhase `
+            -Root $BCQualityRoot `
+            -ExpectedCommit ('b' * 40)
+
+        { Assert-Config } | Should -Not -Throw
+        $BCQualitySha | Should -Be ('b' * 40)
+    }
+
+    It 'publishes generated findings after post validation without a BCQuality checkout' {
+        $ReviewPhase = 'post'
+        $ReviewSource = 'pr'
+        $GithubToken = 'post-token'
+        $PrNumber = 1
+        $PrHeadSha = 'abc123'
+        $BCQualityRoot = $null
+        $BCQualitySha = Resolve-BCQualityCommitForPhase `
+            -Phase $ReviewPhase `
+            -Root $BCQualityRoot `
+            -ExpectedCommit ('c' * 40)
+        Mock Post-Findings {
+            [pscustomobject]@{ inline = $Findings.Count; fallback = 0 }
+        }
+
+        { Assert-Config } | Should -Not -Throw
+        $summary = Publish-FindingsByDomain `
+            -Findings @([pscustomobject]@{ domain = 'Style'; isAgentFinding = $false }) `
+            -LineMaps @{} `
+            -ChangedFileSet @{}
+
+        $summary['Style'].inline | Should -Be 1
+        Should -Invoke Post-Findings -Times 1 -Exactly
+    }
+
+    It 'continues requiring BCQUALITY_ROOT for all and generate' -ForEach @('all', 'generate') {
+        $ReviewPhase = $_
+        $BCQualityRoot = $null
+
+        { Assert-Config } | Should -Throw '*BCQUALITY_ROOT is required*'
+
+        $BCQualityRoot = Join-Path $TestDrive 'missing-bcquality'
+        { Assert-Config } | Should -Throw '*BCQUALITY_ROOT does not exist*'
     }
 
     It 'launches the child Copilot process without a visible console window' {

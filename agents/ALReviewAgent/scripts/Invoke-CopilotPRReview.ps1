@@ -40,10 +40,12 @@
         GITHUB_REPOSITORY  - owner/repo
         PR_NUMBER          - pull request number
         PR_HEAD_SHA        - head commit SHA of the pull request
-        BCQUALITY_ROOT     - path to the filtered BCQuality clone
+        BCQUALITY_ROOT     - path to the filtered BCQuality clone (all/generate)
+        BCQUALITY_SHA      - resolved BCQuality commit (required for post)
 
     Optional environment variables:
-        BCQUALITY_SHA                        - optional expected BCQuality SHA; the checkout remains authoritative
+        BCQUALITY_SHA                        - optional expected BCQuality SHA for all/generate;
+                                               required resolved SHA from generate for post
         REVIEW_WORKSPACE                     - trusted base checkout path (default: GITHUB_WORKSPACE)
         REVIEW_OUTPUT_DIR                    - artifact output folder
         REVIEW_TARGET_WORKSPACE              - detached PR-head worktree path
@@ -96,6 +98,12 @@ $TrustedWorkspace = $env:REVIEW_WORKSPACE ?? $env:GITHUB_WORKSPACE ?? (Get-Locat
 $PrNumber         = [int]($env:PR_NUMBER ?? 0)
 $PrHeadSha        = $env:PR_HEAD_SHA
 $BCQualityRoot    = $env:BCQUALITY_ROOT
+# Review phase. Splits the privileged single-job runner into a minimal-
+# permission "generate" phase (runs the tool-enabled Copilot CLI with a
+# read-only token) and a write-capable "post" phase (posts comments from the
+# saved agent output). 'all' preserves the original single-process behaviour
+# for local development.
+$ReviewPhase      = (($env:REVIEW_PHASE ?? 'all') + '').Trim().ToLowerInvariant()
 function Resolve-BCQualityCommit {
     param(
         [Parameter(Mandatory)][string] $Root,
@@ -112,7 +120,28 @@ function Resolve-BCQualityCommit {
     }
     return $resolvedCommit
 }
-$BCQualitySha = Resolve-BCQualityCommit -Root $BCQualityRoot -ExpectedCommit (($env:BCQUALITY_SHA ?? '').Trim())
+
+function Resolve-BCQualityCommitForPhase {
+    param(
+        [string] $Phase,
+        [string] $Root,
+        [string] $ExpectedCommit
+    )
+
+    if ($Phase -eq 'post') {
+        if ($ExpectedCommit -cnotmatch '\A[0-9a-f]{40}\z') {
+            throw 'BCQUALITY_SHA must contain the resolved 40-character lowercase commit SHA from the generate phase when REVIEW_PHASE=post.'
+        }
+        return $ExpectedCommit
+    }
+
+    return Resolve-BCQualityCommit -Root $Root -ExpectedCommit $ExpectedCommit
+}
+
+$BCQualitySha = Resolve-BCQualityCommitForPhase `
+    -Phase $ReviewPhase `
+    -Root $BCQualityRoot `
+    -ExpectedCommit (($env:BCQUALITY_SHA ?? '').Trim())
 # BCQuality consumption mode. 'cwd' (default, legacy) runs the Copilot CLI with
 # its working directory set to the BCQuality clone, so the agent reads
 # ./skills/entry.md directly and writes per-run artifacts into the clone. 'plugin'
@@ -187,12 +216,6 @@ $DiffRange = if ((($env:REVIEW_DIFF_STYLE ?? '') + '').Trim().ToLowerInvariant()
 $SummaryMarker    = '<!-- copilot-pr-review-summary -->'
 $BaseUrl          = "$GitHubApiUrl/repos/$Repository"
 
-# Review phase. Splits the privileged single-job runner into a minimal-
-# permission "generate" phase (runs the tool-enabled Copilot CLI with a
-# read-only token) and a write-capable "post" phase (posts comments from the
-# saved agent output). 'all' preserves the original single-process behaviour
-# for local development.
-$ReviewPhase      = (($env:REVIEW_PHASE ?? 'all') + '').Trim().ToLowerInvariant()
 $AgentOutputFile  = 'agent-output.txt'
 $CopilotOtelPath  = if ($ReviewPhase -eq 'post') {
     $null

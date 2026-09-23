@@ -177,6 +177,11 @@ BCQuality checkout via `BCQUALITY_ROOT`, the repo under review via
 `REVIEW_WORKSPACE`, and point `BCQUALITY_CONFIG_PATH` at a policy config; then
 invoke `agents/ALReviewAgent/scripts/Invoke-CopilotPRReview.ps1`.
 
+In the reusable two-job workflow, `BCQUALITY_ROOT` is required only by the
+`generate` phase. The checkout's resolved 40-character SHA is passed to the
+checkout-free `post` phase as `BCQUALITY_SHA`; post requires that value and
+publishes only the generated artifact.
+
 Each generate/all run also writes `_run-metrics.json` to `REVIEW_OUTPUT_DIR`.
 Schema version `1` has one 18-field shape and two `metrics_source` values:
 `copilot-cli-otel` for executed reviews and `not-applicable` when the local
