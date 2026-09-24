@@ -22,6 +22,7 @@ Consumer repo (policy)  ──uses──▶  this engine (mechanism)  ──clon
 | `agents/ALReviewAgent/scripts/Get-BCQualityConfig.ps1` | Loads `bcquality.config.yaml` and applies environment-variable overrides. |
 | `agents/ALReviewAgent/scripts/Invoke-BCQualityFilter.ps1` | Prunes a BCQuality clone on disk per the resolved allow/deny/layers policy. |
 | `agents/ALReviewAgent/bcquality.config.yaml` | Default policy baseline. Consumers point at their own copy instead. |
+| `agents/ALReviewAgent/copilot-cli-compatibility.psd1` | Exact Copilot CLI releases the engine has compatibility-validated, including their OTel CLI-version behavior. |
 | `.github/workflows/review.yml` | Reusable (`workflow_call`) workflow that wires the whole thing together. |
 | `Online Evals/` | Pull-based scoring pipeline for evaluating review quality. |
 
@@ -181,6 +182,37 @@ In the reusable two-job workflow, `BCQUALITY_ROOT` is required only by the
 `generate` phase. The checkout's resolved 40-character SHA is passed to the
 checkout-free `post` phase as `BCQUALITY_SHA`; post requires that value and
 publishes only the generated artifact.
+
+### Copilot CLI compatibility
+
+The reusable workflow installs the exact `copilot_cli_version` input (default:
+`1.0.88`), never `latest`. Direct callers must continue to set
+`COPILOT_REVIEW_CLI_VERSION` explicitly. Before any model process starts, the
+engine resolves the same executable used for leaf and root processes, runs
+`copilot --version`, and accepts exactly one semantic-version line. The
+requested pin must exactly equal that startup probe and must have an explicit
+entry in [`copilot-cli-compatibility.psd1`](agents/ALReviewAgent/copilot-cli-compatibility.psd1).
+
+| Exact startup version | OTel `cli_version` contract |
+| --- | --- |
+| `1.0.83` | Required and must exactly equal the startup probe. |
+| `1.0.88` | May be absent; when present, it must exactly equal the startup probe. |
+| Any other version | Rejected before model invocation as not compatibility-validated. |
+
+Model identity, complete token usage, valid telemetry records, and each
+process's requested-model contract remain strict for every supported release.
+`_run-manifest.json` remains schema version `1`:
+`configuration.copilot_cli_version` is the startup-probed authoritative runtime
+version, while `configuration.requested_copilot_cli_version` preserves the
+caller/workflow pin.
+
+To adopt a new CLI release, run the candidate exact version in a
+non-production compatibility canary; verify the executable probe and root/leaf
+model, usage, and telemetry contracts; then add an exact policy entry with its
+tested OTel behavior. Only after that change is reviewed and released should
+the reusable-workflow default be bumped. Production callers must remain pinned
+to a released engine SHA and an exact validated CLI version; no scheduled
+workflow moves either pin automatically.
 
 Each generate/all run also writes `_run-metrics.json` to `REVIEW_OUTPUT_DIR`.
 Schema version `1` has one 18-field shape and two `metrics_source` values:

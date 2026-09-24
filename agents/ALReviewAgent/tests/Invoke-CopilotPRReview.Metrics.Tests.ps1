@@ -155,6 +155,31 @@ Describe 'Get-CopilotRunMetrics' {
         )
     }
 
+    It 'retains conflicting OTel CLI versions so integrity validation fails closed' {
+        $records = @(
+            [pscustomobject]@{
+                type = 'span'
+                name = 'invoke_agent'
+                attributes = [pscustomobject]@{
+                    'gen_ai.operation.name' = 'invoke_agent'
+                    'gen_ai.agent.version' = '1.0.83'
+                }
+            },
+            [pscustomobject]@{
+                type = 'span'
+                name = 'invoke_agent'
+                attributes = [pscustomobject]@{
+                    'gen_ai.operation.name' = 'invoke_agent'
+                    'gen_ai.agent.version' = '1.0.88'
+                }
+            }
+        )
+
+        $metrics = Get-CopilotRunMetrics -Records $records
+
+        $metrics.cli_version | Should -Be '1.0.83, 1.0.88'
+    }
+
     It 'ignores cumulative metric snapshots to avoid double counting' {
         $records = @(
             (New-ChatSpan -Model 'gpt-5.6-sol' -InputTokens 100 -OutputTokens 10 `

@@ -56,7 +56,7 @@
                                                 Other local reviews use the Copilot
                                                 CLI credential store.
         COPILOT_MODEL                        - explicit model name for Copilot CLI
-        COPILOT_REVIEW_CLI_VERSION           - pinned Copilot CLI version
+        COPILOT_REVIEW_CLI_VERSION           - requested pinned Copilot CLI version
         COPILOT_REVIEW_LEAF_MODEL            - model for leaf processes (defaults in review.yml)
         COPILOT_REVIEW_LEAF_EXECUTION        - serial|parallel (default serial)
         COPILOT_REVIEW_MAX_LEAF_CONCURRENCY  - positive concurrency bound for parallel mode
@@ -278,6 +278,9 @@ $script:ReviewProcessTelemetry = [System.Collections.Generic.List[object]]::new(
 $script:ReviewPlanIds = @()
 $script:ReviewPlanSourceSnapshot = ''
 $script:ReviewRunCompletedAt = $null
+$script:CopilotExecutable = $null
+$script:ObservedCopilotCliVersion = $null
+$script:CopilotCliCompatibility = $null
 
 # ---------------------------------------------------------------------------
 # Logging helpers
@@ -359,6 +362,110 @@ function Format-Duration {
 # ---------------------------------------------------------------------------
 # Validation
 # ---------------------------------------------------------------------------
+function Test-CopilotCliVersionFormat {
+    param([Parameter(Mandatory)][string] $Version)
+
+    return $Version -cmatch '\A(?:0|[1-9]\d*)\.(?:0|[1-9]\d*)\.(?:0|[1-9]\d*)(?:-(?:0|[1-9]\d*))?\z'
+}
+
+function Resolve-CopilotExecutable {
+    $copilotCommand = Get-Command copilot.exe -CommandType Application -ErrorAction SilentlyContinue |
+        Select-Object -First 1
+    if (-not $copilotCommand) {
+        $copilotCommand = Get-Command copilot -CommandType Application -ErrorAction SilentlyContinue |
+            Select-Object -First 1
+    }
+    if (-not $copilotCommand -or -not $copilotCommand.Source) {
+        throw 'Copilot CLI not found in PATH. Install an exact compatibility-validated @github/copilot release before running this script.'
+    }
+
+    return [string]$copilotCommand.Source
+}
+
+function Invoke-CopilotVersionProbe {
+    param([Parameter(Mandatory)][string] $Executable)
+
+    $output = @(& $Executable --version 2>&1)
+    if ($LASTEXITCODE -ne 0) {
+        throw "Copilot CLI version probe failed for '$Executable' with exit code $LASTEXITCODE."
+    }
+    return $output
+}
+
+function Get-CopilotExecutableVersion {
+    param([Parameter(Mandatory)][string] $Executable)
+
+    $versionLines = @(
+        Invoke-CopilotVersionProbe -Executable $Executable |
+            ForEach-Object { ([string]$_).Trim() } |
+            Where-Object { $_ }
+    )
+    if ($versionLines.Count -ne 1 -or -not (Test-CopilotCliVersionFormat -Version $versionLines[0])) {
+        $reported = if ($versionLines.Count -gt 0) { $versionLines -join ' | ' } else { '(no output)' }
+        throw "Copilot CLI version probe for '$Executable' must return exactly one semantic version (for example '1.0.88' or '1.0.89-1'); received '$reported'."
+    }
+
+    return $versionLines[0]
+}
+
+function Get-CopilotCliCompatibility {
+    param([Parameter(Mandatory)][string] $Version)
+
+    $policyPath = Join-Path $EngineRoot 'agents/ALReviewAgent/copilot-cli-compatibility.psd1'
+    if (-not (Test-Path -LiteralPath $policyPath -PathType Leaf)) {
+        throw "Copilot CLI compatibility policy is missing: $policyPath"
+    }
+
+    try {
+        $policy = Import-PowerShellDataFile -Path $policyPath -ErrorAction Stop
+    }
+    catch {
+        throw "Could not load Copilot CLI compatibility policy '$policyPath': $($_.Exception.Message)"
+    }
+
+    if (
+        $policy -isnot [hashtable] -or
+        -not $policy.ContainsKey('schema_version') -or
+        $policy.schema_version -ne 1 -or
+        -not $policy.ContainsKey('supported_versions') -or
+        $policy.supported_versions -isnot [hashtable]
+    ) {
+        throw "Copilot CLI compatibility policy '$policyPath' has an unsupported schema."
+    }
+
+    $versionPolicy = $policy.supported_versions[$Version]
+    if ($versionPolicy -isnot [hashtable]) {
+        $supportedVersions = @($policy.supported_versions.Keys | Sort-Object)
+        throw "Copilot CLI version '$Version' has not been compatibility-validated. Supported exact versions: $($supportedVersions -join ', '). Run a non-production compatibility canary and add an explicit policy entry before using a new release."
+    }
+    if (-not $versionPolicy.ContainsKey('otel_cli_version')) {
+        throw "Copilot CLI compatibility policy for '$Version' is missing OTel CLI-version behavior."
+    }
+
+    $otelBehavior = [string]$versionPolicy.otel_cli_version
+    if ($otelBehavior -notin @('required', 'optional')) {
+        throw "Copilot CLI compatibility policy for '$Version' has unsupported OTel CLI-version behavior '$otelBehavior'."
+    }
+
+    return [pscustomobject][ordered]@{
+        version = $Version
+        otel_cli_version = $otelBehavior
+    }
+}
+
+function Initialize-CopilotCliCompatibility {
+    $executable = Resolve-CopilotExecutable
+    $observedVersion = Get-CopilotExecutableVersion -Executable $executable
+    $script:CopilotExecutable = $executable
+    $script:ObservedCopilotCliVersion = $observedVersion
+    if ($CopilotCliVersion -cne $observedVersion) {
+        throw "COPILOT_REVIEW_CLI_VERSION '$CopilotCliVersion' does not match startup-probed Copilot CLI version '$observedVersion' from '$executable'."
+    }
+
+    $compatibility = Get-CopilotCliCompatibility -Version $observedVersion
+    $script:CopilotCliCompatibility = $compatibility
+}
+
 function Assert-Config {
     if ($ReviewPhase -notin @('all', 'generate', 'post')) {
         throw "Unsupported REVIEW_PHASE: $ReviewPhase (expected all | generate | post)"
@@ -395,8 +502,8 @@ function Assert-Config {
         if (-not $CopilotModel) {
             throw 'COPILOT_MODEL is required for deterministic root consolidation.'
         }
-        if ($CopilotCliVersion -notmatch '^\d+\.\d+\.\d+(?:-\d+)?$') {
-            throw 'COPILOT_REVIEW_CLI_VERSION must contain the pinned Copilot CLI version.'
+        if (-not (Test-CopilotCliVersionFormat -Version $CopilotCliVersion)) {
+            throw 'COPILOT_REVIEW_CLI_VERSION must contain an exact semantic Copilot CLI version.'
         }
         if (-not $LeafModel) {
             throw 'COPILOT_REVIEW_LEAF_MODEL is required for deterministic leaf execution.'
@@ -408,9 +515,7 @@ function Assert-Config {
         if (-not (Test-Path -LiteralPath $findingsSchema -PathType Leaf)) {
             throw "Pinned BCQuality checkout is missing the findings-report schema: $findingsSchema. BCQuality commit b74967bc5b7a454eae19d6a1250199afd869f064 or a newer ref is required (introduced by microsoft/BCQuality#182)."
         }
-        if (-not (Get-Command copilot -ErrorAction SilentlyContinue)) {
-            throw 'Copilot CLI not found in PATH. Install @github/copilot before running this script.'
-        }
+        Initialize-CopilotCliCompatibility
         if ($CopilotCliTimeoutMinutes -lt 0) {
             throw "COPILOT_REVIEW_CLI_TIMEOUT_MINUTES must be 0 (unlimited) or a positive integer. Actual: $CopilotCliTimeoutMinutes"
         }
@@ -1206,6 +1311,7 @@ function Get-CopilotRunMetrics {
     $invalidStructuredRecords = 0
     $models = [System.Collections.Generic.HashSet[string]]::new([System.StringComparer]::Ordinal)
     $cliVersions = [System.Collections.Generic.HashSet[string]]::new([System.StringComparer]::Ordinal)
+    $hasEmptyCliVersion = $false
 
     foreach ($record in @($Records)) {
         if ((Get-ObjectPropertyValue -InputObject $record -Name 'type') -ne 'span') { continue }
@@ -1213,8 +1319,16 @@ function Get-CopilotRunMetrics {
         $operation = [string](Get-ObjectPropertyValue -InputObject $attributes -Name 'gen_ai.operation.name')
 
         if ($operation -eq 'invoke_agent') {
-            $version = [string](Get-ObjectPropertyValue -InputObject $attributes -Name 'gen_ai.agent.version')
-            if ($version) { [void]$cliVersions.Add($version) }
+            $rawVersion = Get-ObjectPropertyValue -InputObject $attributes -Name 'gen_ai.agent.version'
+            if ($null -ne $rawVersion) {
+                $version = ([string]$rawVersion).Trim()
+                if ($version) {
+                    [void]$cliVersions.Add($version)
+                }
+                else {
+                    $hasEmptyCliVersion = $true
+                }
+            }
             continue
         }
         if ($operation -ne 'chat') { continue }
@@ -1289,7 +1403,15 @@ function Get-CopilotRunMetrics {
     return [pscustomobject][ordered]@{
         schema_version        = 1
         metrics_source        = 'copilot-cli-otel'
-        cli_version           = if ($cliVersions.Count -eq 1) { [string]@($cliVersions)[0] } else { $null }
+        cli_version           = if ($hasEmptyCliVersion) {
+            '(empty)'
+        } elseif ($cliVersions.Count -eq 1) {
+            [string]@($cliVersions)[0]
+        } elseif ($cliVersions.Count -gt 1) {
+            (@($cliVersions | Sort-Object) -join ', ')
+        } else {
+            $null
+        }
         wall_time_seconds     = $roundedWallTime
         prompt_tokens         = if ($usageApiCalls -gt 0) { $inputTokens } else { $null }
         cached_tokens         = if ($hasCachedTokens) { $cachedTokens } else { $null }
@@ -1575,9 +1697,22 @@ function Assert-CopilotInvocationMetrics {
     if ([int]$Metrics.malformed_records -ne 0) {
         throw "$InvocationLabel produced $($Metrics.malformed_records) malformed Copilot telemetry record(s)."
     }
-    if (([string]$Metrics.cli_version).Trim() -ne $CopilotCliVersion) {
-        $observedVersion = if ($Metrics.cli_version) { $Metrics.cli_version } else { '(none)' }
-        throw "$InvocationLabel expected Copilot CLI '$CopilotCliVersion'; telemetry reported '$observedVersion'."
+    if (
+        -not $script:ObservedCopilotCliVersion -or
+        -not $script:CopilotCliCompatibility -or
+        $script:CopilotCliCompatibility.otel_cli_version -notin @('required', 'optional')
+    ) {
+        throw "$InvocationLabel cannot validate Copilot CLI telemetry because startup compatibility validation did not complete."
+    }
+
+    $reportedVersion = ([string]$Metrics.cli_version).Trim()
+    if ($reportedVersion) {
+        if ($reportedVersion -cne $script:ObservedCopilotCliVersion) {
+            throw "$InvocationLabel expected startup-probed Copilot CLI '$script:ObservedCopilotCliVersion'; telemetry reported '$reportedVersion'."
+        }
+    }
+    elseif ($script:CopilotCliCompatibility.otel_cli_version -eq 'required') {
+        throw "$InvocationLabel expected startup-probed Copilot CLI '$script:ObservedCopilotCliVersion'; telemetry reported '(none)'."
     }
 }
 
@@ -1609,7 +1744,8 @@ function Save-ReviewRunManifest {
             source_snapshot = if ($script:ReviewPlanSourceSnapshot) { $script:ReviewPlanSourceSnapshot } else { $null }
         }
         configuration = [pscustomobject][ordered]@{
-            copilot_cli_version = $CopilotCliVersion
+            copilot_cli_version = $script:ObservedCopilotCliVersion
+            requested_copilot_cli_version = $CopilotCliVersion
             root_model = $CopilotModel
             leaf_model = $LeafModel
             leaf_execution = $LeafExecution
@@ -1828,15 +1964,12 @@ function Start-LeafCopilotProcess {
     $cleanEnv['COPILOT_OTEL_FILE_EXPORTER_PATH'] = $otelPath
     $cleanEnv['OTEL_INSTRUMENTATION_GENAI_CAPTURE_MESSAGE_CONTENT'] = 'false'
 
-    $copilotCommand = Get-Command copilot.exe -CommandType Application -ErrorAction SilentlyContinue |
-        Select-Object -First 1
-    if (-not $copilotCommand) {
-        $copilotCommand = Get-Command copilot -CommandType Application -ErrorAction Stop |
-            Select-Object -First 1
+    if (-not $script:CopilotExecutable) {
+        throw "Copilot CLI compatibility was not initialized before starting leaf '$($Leaf.id)'."
     }
 
     $startInfo = [System.Diagnostics.ProcessStartInfo]::new()
-    $startInfo.FileName = $copilotCommand.Source
+    $startInfo.FileName = $script:CopilotExecutable
     $startInfo.UseShellExecute = $false
     $startInfo.CreateNoWindow = $true
     $startInfo.RedirectStandardInput = $false
@@ -2346,15 +2479,12 @@ function Invoke-CopilotCli {
     $script:CurrentCopilotInvocationStartedAt = $startedAt
 
     try {
-        $copilotCommand = Get-Command copilot.exe -CommandType Application -ErrorAction SilentlyContinue |
-            Select-Object -First 1
-        if (-not $copilotCommand) {
-            $copilotCommand = Get-Command copilot -CommandType Application -ErrorAction Stop |
-                Select-Object -First 1
+        if (-not $script:CopilotExecutable) {
+            throw 'Copilot CLI compatibility was not initialized before starting root consolidation.'
         }
 
         $startInfo = [System.Diagnostics.ProcessStartInfo]::new()
-        $startInfo.FileName               = $copilotCommand.Source
+        $startInfo.FileName               = $script:CopilotExecutable
         $startInfo.UseShellExecute        = $false
         $startInfo.CreateNoWindow         = $true
         $startInfo.RedirectStandardInput  = $false
@@ -4350,6 +4480,9 @@ $modelDisplay = if ($CopilotModel) {
 }
 Write-LogPhaseDetail "Model:     $modelDisplay"
 Write-LogPhaseDetail "Leaves:    $LeafModel ($LeafExecution, max concurrency $MaxLeafConcurrency)"
+if ($script:ObservedCopilotCliVersion) {
+    Write-LogPhaseDetail "Copilot CLI: requested $CopilotCliVersion; startup-probed $script:ObservedCopilotCliVersion ($($script:CopilotCliCompatibility.otel_cli_version) OTel CLI version)"
+}
 Write-LogPhaseDetail "Agent:     $AgentLabel v$AgentVersion"
 Write-LogPhaseDetail "Severity:  knowledge≥$MinimumSeverity, agent≥$AgentMinimumSeverity (max $MaxFindings findings/domain)"
 $bcqRef = if ($BCQualitySha) { $BCQualitySha } else { '(unresolved ref)' }

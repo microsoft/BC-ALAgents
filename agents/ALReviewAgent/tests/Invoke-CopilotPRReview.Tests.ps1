@@ -900,6 +900,11 @@ Describe 'Deterministic leaf orchestration contract' {
         $script:FailedLeafReviews = @()
         $script:ReviewProcessTelemetry = [System.Collections.Generic.List[object]]::new()
         $script:ReviewRunCompletedAt = $null
+        $script:ObservedCopilotCliVersion = '1.0.83'
+        $script:CopilotCliCompatibility = [pscustomobject]@{
+            version = '1.0.83'
+            otel_cli_version = 'required'
+        }
         New-Item -ItemType Directory -Path (Join-Path $BCQualityRoot 'microsoft/skills/review') -Force | Out-Null
         New-Item -ItemType Directory -Path (Join-Path $BCQualityRoot 'skills') -Force | Out-Null
         New-Item -ItemType Directory -Path (Join-Path $BCQualityRoot 'schemas') -Force | Out-Null
@@ -1466,7 +1471,7 @@ Describe 'Deterministic leaf orchestration contract' {
                 cli_version = '1.0.82'
                 total_tokens = 12
             }
-            ErrorPattern = "*expected Copilot CLI '1.0.83'*"
+            ErrorPattern = "*expected startup-probed Copilot CLI '1.0.83'*"
         }
     ) {
         $plan = @(Get-ReviewLeafPlan)
@@ -1537,7 +1542,70 @@ Describe 'Deterministic leaf orchestration contract' {
         $wrongCli = $valid.PSObject.Copy()
         $wrongCli.cli_version = '1.0.82'
         { Assert-CopilotInvocationMetrics -Metrics $wrongCli -RequestedModel 'gpt-5.4' -InvocationLabel 'leaf' } |
-            Should -Throw "*expected Copilot CLI '1.0.83'*"
+            Should -Throw "*expected startup-probed Copilot CLI '1.0.83'*"
+    }
+
+    It 'requires OTel CLI version for the 1.0.83 compatibility policy' {
+        $metrics = [pscustomobject]@{
+            models = @('gpt-5.4')
+            usage_complete = $true
+            malformed_records = 0
+            cli_version = $null
+        }
+
+        { Assert-CopilotInvocationMetrics -Metrics $metrics -RequestedModel 'gpt-5.4' -InvocationLabel 'leaf' } |
+            Should -Throw "*expected startup-probed Copilot CLI '1.0.83'; telemetry reported '(none)'*"
+    }
+
+    It 'accepts absent OTel CLI version only for the 1.0.88 compatibility policy' {
+        $script:ObservedCopilotCliVersion = '1.0.88'
+        $script:CopilotCliCompatibility = [pscustomobject]@{
+            version = '1.0.88'
+            otel_cli_version = 'optional'
+        }
+        $metrics = [pscustomobject]@{
+            models = @('gpt-5.4')
+            usage_complete = $true
+            malformed_records = 0
+            cli_version = $null
+        }
+
+        { Assert-CopilotInvocationMetrics -Metrics $metrics -RequestedModel 'gpt-5.4' -InvocationLabel 'leaf' } |
+            Should -Not -Throw
+    }
+
+    It 'accepts a matching OTel CLI version for the 1.0.88 compatibility policy' {
+        $script:ObservedCopilotCliVersion = '1.0.88'
+        $script:CopilotCliCompatibility = [pscustomobject]@{
+            version = '1.0.88'
+            otel_cli_version = 'optional'
+        }
+        $metrics = [pscustomobject]@{
+            models = @('gpt-5.4')
+            usage_complete = $true
+            malformed_records = 0
+            cli_version = '1.0.88'
+        }
+
+        { Assert-CopilotInvocationMetrics -Metrics $metrics -RequestedModel 'gpt-5.4' -InvocationLabel 'leaf' } |
+            Should -Not -Throw
+    }
+
+    It 'rejects a mismatched OTel CLI version for the 1.0.88 compatibility policy' {
+        $script:ObservedCopilotCliVersion = '1.0.88'
+        $script:CopilotCliCompatibility = [pscustomobject]@{
+            version = '1.0.88'
+            otel_cli_version = 'optional'
+        }
+        $metrics = [pscustomobject]@{
+            models = @('gpt-5.4')
+            usage_complete = $true
+            malformed_records = 0
+            cli_version = '1.0.83'
+        }
+
+        { Assert-CopilotInvocationMetrics -Metrics $metrics -RequestedModel 'gpt-5.4' -InvocationLabel 'leaf' } |
+            Should -Throw "*expected startup-probed Copilot CLI '1.0.88'; telemetry reported '1.0.83'*"
     }
 
     It 'writes a resolved run manifest with ordered per-process telemetry' {
@@ -1563,6 +1631,7 @@ Describe 'Deterministic leaf orchestration contract' {
         $manifest.schema_version | Should -Be 1
         $manifest.status | Should -Be 'completed'
         $manifest.configuration.copilot_cli_version | Should -Be '1.0.83'
+        $manifest.configuration.requested_copilot_cli_version | Should -Be '1.0.83'
         $manifest.configuration.root_model | Should -Be 'claude-sonnet-5'
         $manifest.configuration.leaf_execution | Should -Be 'serial'
         $manifest.bcquality.commit | Should -Be $BCQualitySha
@@ -1645,17 +1714,60 @@ Describe 'Local review authentication' {
         $CopilotModel = 'claude-sonnet-5'
         $CopilotCliVersion = '1.0.83'
         $LeafModel = 'gpt-5.4'
+        $script:CopilotExecutable = $null
+        $script:ObservedCopilotCliVersion = $null
+        $script:CopilotCliCompatibility = $null
 
-        Mock Get-Command {
-            [pscustomobject]@{ Source = 'copilot' }
-        } -ParameterFilter { $Name -eq 'copilot' }
         Mock Get-Command {
             [pscustomobject]@{ Name = 'Test-Json' }
         } -ParameterFilter { $Name -eq 'Test-Json' }
+        Mock Resolve-CopilotExecutable { 'C:\tools\copilot.exe' }
+        Mock Invoke-CopilotVersionProbe { @('1.0.83') }
     }
 
     It 'allows local generation without GH_TOKEN' {
         { Assert-Config } | Should -Not -Throw
+    }
+
+    It 'probes the exact child executable and applies the requested pin at startup' {
+        { Assert-Config } | Should -Not -Throw
+
+        $script:CopilotExecutable | Should -Be 'C:\tools\copilot.exe'
+        $script:ObservedCopilotCliVersion | Should -Be '1.0.83'
+        $script:CopilotCliCompatibility.otel_cli_version | Should -Be 'required'
+        Should -Invoke Resolve-CopilotExecutable -Times 1 -Exactly
+        Should -Invoke Invoke-CopilotVersionProbe -Times 1 -Exactly -ParameterFilter {
+            $Executable -eq 'C:\tools\copilot.exe'
+        }
+    }
+
+    It 'accepts the numeric CLI prerelease syntax before policy enforcement' {
+        Mock Invoke-CopilotVersionProbe { @('1.0.89-1') }
+
+        Get-CopilotExecutableVersion -Executable 'C:\tools\copilot.exe' | Should -Be '1.0.89-1'
+    }
+
+    It 'fails during preflight before an agent process for an unsupported CLI version' {
+        $CopilotCliVersion = '1.0.89'
+        Mock Invoke-CopilotVersionProbe { @('1.0.89') }
+        Mock Start-LeafCopilotProcess {}
+
+        { Assert-Config } | Should -Throw "*has not been compatibility-validated*"
+        Should -Invoke Start-LeafCopilotProcess -Times 0 -Exactly
+    }
+
+    It 'fails early when the requested CLI pin differs from the startup probe' {
+        Mock Invoke-CopilotVersionProbe { @('1.0.88') }
+
+        { Assert-Config } |
+            Should -Throw "*COPILOT_REVIEW_CLI_VERSION '1.0.83' does not match startup-probed Copilot CLI version '1.0.88'*"
+    }
+
+    It 'fails early when the executable version output is unparseable' {
+        Mock Invoke-CopilotVersionProbe { @('copilot version 1.0.83') }
+
+        { Assert-Config } |
+            Should -Throw '*must return exactly one semantic version*'
     }
 
     It 'still requires GH_TOKEN for PR generation' {
@@ -1721,6 +1833,7 @@ Describe 'Local review authentication' {
         $source = Get-Content -LiteralPath $scriptPath -Raw
         $source | Should -Match '\$startInfo\.CreateNoWindow\s*=\s*\$true'
         $source | Should -Match 'Get-Command copilot\.exe'
+        $source | Should -Match '\$startInfo\.FileName\s*=\s*\$script:CopilotExecutable'
     }
 
     It 'does not forward inherited tokens to a local non-CI child process' {
