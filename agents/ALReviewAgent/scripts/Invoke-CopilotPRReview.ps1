@@ -395,17 +395,29 @@ function Invoke-CopilotVersionProbe {
 function Get-CopilotExecutableVersion {
     param([Parameter(Mandatory)][string] $Executable)
 
-    $versionLines = @(
+    $outputLines = @(
         Invoke-CopilotVersionProbe -Executable $Executable |
             ForEach-Object { ([string]$_).Trim() } |
             Where-Object { $_ }
     )
-    if ($versionLines.Count -ne 1 -or -not (Test-CopilotCliVersionFormat -Version $versionLines[0])) {
-        $reported = if ($versionLines.Count -gt 0) { $versionLines -join ' | ' } else { '(no output)' }
-        throw "Copilot CLI version probe for '$Executable' must return exactly one semantic version (for example '1.0.88' or '1.0.89-1'); received '$reported'."
+    $bannerLines = @($outputLines | Where-Object { $_ -cmatch '\AGitHub Copilot CLI ' })
+    $bannerVersions = @(
+        $bannerLines | ForEach-Object {
+            if ($_ -cmatch '\AGitHub Copilot CLI (?<version>\S+)\.\z') {
+                $Matches['version']
+            }
+        }
+    )
+    if (
+        $bannerLines.Count -ne 1 -or
+        $bannerVersions.Count -ne 1 -or
+        -not (Test-CopilotCliVersionFormat -Version $bannerVersions[0])
+    ) {
+        $reported = if ($outputLines.Count -gt 0) { $outputLines -join ' | ' } else { '(no output)' }
+        throw "Copilot CLI version probe for '$Executable' must return exactly one 'GitHub Copilot CLI <semantic-version>.' banner (for example 'GitHub Copilot CLI 1.0.88.'); received '$reported'."
     }
 
-    return $versionLines[0]
+    return $bannerVersions[0]
 }
 
 function Get-CopilotCliCompatibility {

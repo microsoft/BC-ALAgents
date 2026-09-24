@@ -1734,7 +1734,12 @@ Describe 'Local review authentication' {
             [pscustomobject]@{ Name = 'Test-Json' }
         } -ParameterFilter { $Name -eq 'Test-Json' }
         Mock Resolve-CopilotExecutable { 'C:\tools\copilot.exe' }
-        Mock Invoke-CopilotVersionProbe { @('1.0.83') }
+        Mock Invoke-CopilotVersionProbe {
+            @(
+                'GitHub Copilot CLI 1.0.83.',
+                "Run 'copilot update' to check for updates."
+            )
+        }
     }
 
     It 'allows local generation without GH_TOKEN' {
@@ -1753,15 +1758,25 @@ Describe 'Local review authentication' {
         }
     }
 
-    It 'accepts the numeric CLI prerelease syntax before policy enforcement' {
-        Mock Invoke-CopilotVersionProbe { @('1.0.89-1') }
+    It 'accepts a numeric CLI prerelease from the verified multi-line banner' {
+        Mock Invoke-CopilotVersionProbe {
+            @(
+                'GitHub Copilot CLI 1.0.89-1.',
+                "Run 'copilot update' to check for updates."
+            )
+        }
 
         Get-CopilotExecutableVersion -Executable 'C:\tools\copilot.exe' | Should -Be '1.0.89-1'
     }
 
     It 'fails during preflight before an agent process for an unsupported CLI version' {
         $CopilotCliVersion = '1.0.89'
-        Mock Invoke-CopilotVersionProbe { @('1.0.89') }
+        Mock Invoke-CopilotVersionProbe {
+            @(
+                'GitHub Copilot CLI 1.0.89.',
+                "Run 'copilot update' to check for updates."
+            )
+        }
         Mock Start-LeafCopilotProcess {}
 
         { Assert-Config } | Should -Throw "*has not been compatibility-validated*"
@@ -1769,17 +1784,39 @@ Describe 'Local review authentication' {
     }
 
     It 'fails early when the requested CLI pin differs from the startup probe' {
-        Mock Invoke-CopilotVersionProbe { @('1.0.88') }
+        Mock Invoke-CopilotVersionProbe {
+            @(
+                'GitHub Copilot CLI 1.0.88.',
+                "Run 'copilot update' to check for updates."
+            )
+        }
 
         { Assert-Config } |
             Should -Throw "*COPILOT_REVIEW_CLI_VERSION '1.0.83' does not match startup-probed Copilot CLI version '1.0.88'*"
     }
 
     It 'fails early when the executable version output is unparseable' {
-        Mock Invoke-CopilotVersionProbe { @('copilot version 1.0.83') }
+        Mock Invoke-CopilotVersionProbe {
+            @(
+                'GitHub Copilot CLI 1.0.83',
+                "Run 'copilot update' to check for updates."
+            )
+        }
 
         { Assert-Config } |
-            Should -Throw '*must return exactly one semantic version*'
+            Should -Throw "*must return exactly one 'GitHub Copilot CLI <semantic-version>.' banner*"
+    }
+
+    It 'fails early when the executable version output has competing CLI banners' {
+        Mock Invoke-CopilotVersionProbe {
+            @(
+                'GitHub Copilot CLI 1.0.83.',
+                'GitHub Copilot CLI 1.0.88.'
+            )
+        }
+
+        { Get-CopilotExecutableVersion -Executable 'C:\tools\copilot.exe' } |
+            Should -Throw "*must return exactly one 'GitHub Copilot CLI <semantic-version>.' banner*"
     }
 
     It 'still requires GH_TOKEN for PR generation' {

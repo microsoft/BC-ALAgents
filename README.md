@@ -189,9 +189,10 @@ The reusable workflow installs the exact `copilot_cli_version` input (default:
 `1.0.88`), never `latest`. Direct callers must continue to set
 `COPILOT_REVIEW_CLI_VERSION` explicitly. Before any model process starts, the
 engine resolves the same executable used for leaf and root processes, runs
-`copilot --version`, and accepts exactly one semantic-version line. The
-requested pin must exactly equal that startup probe and must have an explicit
-entry in [`copilot-cli-compatibility.psd1`](agents/ALReviewAgent/copilot-cli-compatibility.psd1).
+`copilot --version`, and extracts a strict semantic version from exactly one
+official `GitHub Copilot CLI <version>.` banner. The requested pin must exactly
+equal that startup probe and must have an explicit entry in
+[`copilot-cli-compatibility.psd1`](agents/ALReviewAgent/copilot-cli-compatibility.psd1).
 
 | Exact startup version | OTel `cli_version` contract |
 | --- | --- |
