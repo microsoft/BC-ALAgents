@@ -203,8 +203,9 @@ Model identity, complete token usage, valid telemetry records, and each
 process's requested-model contract remain strict for every supported release.
 `_run-manifest.json` remains schema version `1`:
 `configuration.copilot_cli_version` is the startup-probed authoritative runtime
-version, while `configuration.requested_copilot_cli_version` preserves the
-caller/workflow pin.
+version. The caller/workflow pin is validated as exactly equal to that value
+before any model process starts, so the existing v1 manifest shape needs no
+second requested-version property.
 
 To adopt a new CLI release, run the candidate exact version in a
 non-production compatibility canary; verify the executable probe and root/leaf

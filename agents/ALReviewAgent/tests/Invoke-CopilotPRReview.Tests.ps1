@@ -1631,7 +1631,19 @@ Describe 'Deterministic leaf orchestration contract' {
         $manifest.schema_version | Should -Be 1
         $manifest.status | Should -Be 'completed'
         $manifest.configuration.copilot_cli_version | Should -Be '1.0.83'
-        $manifest.configuration.requested_copilot_cli_version | Should -Be '1.0.83'
+        $manifest.configuration.PSObject.Properties.Name | Should -Be @(
+            'copilot_cli_version',
+            'root_model',
+            'leaf_model',
+            'leaf_execution',
+            'max_leaf_concurrency',
+            'cli_timeout_minutes',
+            'minimum_severity',
+            'agent_minimum_severity',
+            'review_source'
+        )
+        $manifest.configuration.PSObject.Properties.Match('requested_copilot_cli_version').Count |
+            Should -Be 0
         $manifest.configuration.root_model | Should -Be 'claude-sonnet-5'
         $manifest.configuration.leaf_execution | Should -Be 'serial'
         $manifest.bcquality.commit | Should -Be $BCQualitySha

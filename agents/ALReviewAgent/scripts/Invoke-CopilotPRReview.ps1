@@ -1745,7 +1745,6 @@ function Save-ReviewRunManifest {
         }
         configuration = [pscustomobject][ordered]@{
             copilot_cli_version = $script:ObservedCopilotCliVersion
-            requested_copilot_cli_version = $CopilotCliVersion
             root_model = $CopilotModel
             leaf_model = $LeafModel
             leaf_execution = $LeafExecution
