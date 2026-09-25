@@ -168,12 +168,52 @@ Describe 'Hidden local Windows review execution' {
         $skill | Should -Match '& \$reviewScript @reviewParameters'
     }
 
-    It 'disables Copilot PowerShell tools for local Windows reviews' {
+    It 'uses the platform-independent reviewer security boundary' {
         $reviewScriptPath = Join-Path (Join-Path (Split-Path -Parent $PSScriptRoot) 'scripts') 'Invoke-CopilotPRReview.ps1'
         $source = Get-Content -LiteralPath $reviewScriptPath -Raw
+        $localScriptPath = Join-Path (Join-Path (Split-Path -Parent $PSScriptRoot) 'scripts') 'Invoke-LocalReview.ps1'
+        $localSource = Get-Content -LiteralPath $localScriptPath -Raw
 
-        $source | Should -Match '\$ReviewSource -eq ''local'' -and \$IsWindows'
-        $source | Should -Match "'--excluded-tools'"
-        $source | Should -Match 'powershell,read_powershell,write_powershell,stop_powershell,list_powershell'
+        $source | Should -Match "'--available-tools', 'view,glob,grep,create'"
+        $source | Should -Match "'--deny-tool', 'shell\(\*\)'"
+        $source | Should -Match "'--deny-tool', 'url\(\*\)'"
+        $source | Should -Not -Match "'--allow-all-paths'"
+        $source | Should -Not -Match "'--allow-all-tools'"
+        $localSource | Should -Not -Match "COPILOT_ALLOW_ALL_PATHS\s*=\s*'true'"
+    }
+}
+
+Describe 'Local review isolation' {
+    BeforeAll {
+        $source = Get-Content -LiteralPath $scriptPath -Raw
+    }
+
+    It 'uses a fresh model output directory outside the reviewed repository' {
+        $source | Should -Match "\[IO\.Path\]::GetTempPath\(\)"
+        $source | Should -Match '\$env:REVIEW_OUTPUT_DIR\s+=\s+\$modelOutputDir'
+        $source | Should -Not -Match '\$env:REVIEW_OUTPUT_DIR\s+=\s+\$OutputDir'
+    }
+
+    It 'copies model artifacts to the caller output only after reviewer execution' {
+        $invokeIndex = $source.IndexOf('& $reviewScript')
+        $copyIndex = $source.IndexOf('Copy-Item -LiteralPath $artifact.FullName')
+
+        $invokeIndex | Should -BeGreaterOrEqual 0
+        $copyIndex | Should -BeGreaterThan $invokeIndex
+        $source | Should -Match 'Join-Path \$OutputDir \$artifact\.Name'
+    }
+
+    It 'always removes the internal output and non-Git shadow repositories' {
+        $source | Should -Match 'finally\s*\{[\s\S]*Remove-Item -LiteralPath \$modelOutputDir'
+        $source | Should -Match 'finally\s*\{[\s\S]*Remove-Item -LiteralPath \$shadowRepo'
+    }
+
+    It 'recreates a managed BCQuality checkout without running Git in the old checkout' {
+        $removeIndex = $source.IndexOf('Remove-Item -LiteralPath $bcqPath -Recurse -Force')
+        $cloneIndex = $source.IndexOf('& git clone --depth 1 $bcqUrl $bcqPath')
+
+        $removeIndex | Should -BeGreaterOrEqual 0
+        $cloneIndex | Should -BeGreaterThan $removeIndex
+        $source | Should -Not -Match 'git -C \$bcqPath'
     }
 }

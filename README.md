@@ -158,8 +158,21 @@ Do not pin the engine to an unmerged BCQuality pull-request commit.
 
 ## Security model
 
-* The **review** job is read-only. It runs the tool-enabled Copilot CLI over
-  untrusted PR-diff content and therefore never holds a write token.
+* The **review** job gives Copilot CLI only native read tools plus a
+  path-scoped write grant for its structured report. Shell, network, MCP, and
+  arbitrary file-write tools are unavailable.
+* The repository under review is exported to a sanitized snapshot before it is
+  mounted. Repository-owned `.github/skills`, `.github/agents`, custom
+  instruction files, and equivalent trusted-configuration roots are excluded;
+  their changes remain visible as inert text in `_review-diff.patch`.
+* The model never receives the original worktree. BCQuality is mounted as a
+  plugin and is not used as a writable working directory. Model working
+  directories are disjoint from the target repository, and Copilot's automatic
+  system-temporary-directory access is disabled; explicitly mounted sanitized
+  snapshots remain the only source view.
+* Copilot authentication uses `COPILOT_GITHUB_TOKEN`, which is declared secret
+  to the CLI so it is redacted and removed from tool and MCP child
+  environments. The job token remains read-only.
 * The **publish** job holds `issues`/`pull-requests: write` but never runs the
   model; it only posts findings saved as an artifact by the review job.
 * Both jobs check out with `persist-credentials: false` so a successful
@@ -167,6 +180,9 @@ Do not pin the engine to an unmerged BCQuality pull-request commit.
 * BCQuality is cloned and filtered **before** the model runs. Point
   `bcquality.repo` only at a trusted source and pin `bcquality.ref` to a
   reviewed commit — a compromised fork can embed prompt-injection payloads.
+  Local managed checkouts are recreated without invoking Git against any prior
+  cache metadata, then reset and cleaned before filtering. Executable BCQuality
+  tooling must match the resolved Git commit.
 
 ## Running locally / in a benchmark
 
