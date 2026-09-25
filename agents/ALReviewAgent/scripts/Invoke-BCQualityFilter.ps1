@@ -67,6 +67,17 @@ if (-not $ReportPath) {
 $skillIndexScript = Join-Path $BCQualityRoot 'tools/Build-SkillIndex.ps1'
 $skillIndexPath = Join-Path $BCQualityRoot '_skill-index.json'
 if (Test-Path -LiteralPath $skillIndexScript -PathType Leaf) {
+    & git -C $BCQualityRoot rev-parse --is-inside-work-tree 2>$null | Out-Null
+    if ($LASTEXITCODE -eq 0) {
+        & git -C $BCQualityRoot ls-files --error-unmatch -- 'tools/Build-SkillIndex.ps1' 2>$null | Out-Null
+        if ($LASTEXITCODE -ne 0) {
+            throw 'BCQuality skill-index generator is not tracked by the resolved Git checkout.'
+        }
+        & git -C $BCQualityRoot diff --quiet HEAD -- 'tools/Build-SkillIndex.ps1'
+        if ($LASTEXITCODE -ne 0) {
+            throw 'BCQuality skill-index generator differs from the resolved Git commit; refusing to execute it.'
+        }
+    }
     & $skillIndexScript -BCQualityRoot $BCQualityRoot -IndexPath $skillIndexPath | Out-Null
 }
 else {
