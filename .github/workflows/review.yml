@@ -106,6 +106,11 @@ on:
         type: string
         required: false
         default: gpt-5.6-luna
+      copilot_cli_version:
+        description: Exact compatibility-validated Copilot CLI release to install and verify at engine startup.
+        type: string
+        required: false
+        default: '1.0.88'
       leaf_execution:
         description: Run deterministic leaf processes serially or with bounded parallelism.
         type: string
@@ -307,9 +312,29 @@ jobs:
         with:
           node-version: 24
 
-      - name: Install Copilot CLI
+      - name: Validate Copilot CLI compatibility pin
+        id: copilot-cli
+        shell: pwsh
+        env:
+          REQUESTED_COPILOT_CLI_VERSION: ${{ inputs.copilot_cli_version }}
         run: |
-          npm install --global @github/copilot@1.0.83
+          $requested = $env:REQUESTED_COPILOT_CLI_VERSION.Trim()
+          if ($requested -notmatch '\A(?:0|[1-9]\d*)\.(?:0|[1-9]\d*)\.(?:0|[1-9]\d*)(?:-(?:0|[1-9]\d*))?\z') {
+            throw "copilot_cli_version must be an exact semantic version; received '$requested'."
+          }
+          $policyPath = "${{ github.workspace }}/engine/agents/ALReviewAgent/copilot-cli-compatibility.psd1"
+          $policy = Import-PowerShellDataFile -Path $policyPath -ErrorAction Stop
+          if ($policy.schema_version -ne 1 -or -not $policy.supported_versions.ContainsKey($requested)) {
+            throw "Copilot CLI version '$requested' has not been compatibility-validated by the engine policy."
+          }
+          "version=$requested" >> $env:GITHUB_OUTPUT
+
+      - name: Install Copilot CLI
+        shell: pwsh
+        env:
+          COPILOT_CLI_VERSION: ${{ steps.copilot-cli.outputs.version }}
+        run: |
+          npm install --global "@github/copilot@$env:COPILOT_CLI_VERSION"
           copilot --version
 
       - name: Install powershell-yaml
@@ -382,7 +407,7 @@ jobs:
           BCQUALITY_APPLICATION_AREA: ${{ inputs.application_area }}
           BCQUALITY_BC_VERSION: ${{ inputs.bc_version }}
           COPILOT_MODEL: ${{ inputs.copilot_model }}
-          COPILOT_REVIEW_CLI_VERSION: 1.0.83
+          COPILOT_REVIEW_CLI_VERSION: ${{ steps.copilot-cli.outputs.version }}
           COPILOT_REVIEW_LEAF_MODEL: ${{ inputs.copilot_leaf_model }}
           COPILOT_REVIEW_LEAF_EXECUTION: ${{ inputs.leaf_execution }}
           COPILOT_REVIEW_MAX_LEAF_CONCURRENCY: ${{ inputs.max_leaf_concurrency }}
