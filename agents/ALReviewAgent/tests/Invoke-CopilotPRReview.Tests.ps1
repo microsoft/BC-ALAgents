@@ -1653,6 +1653,72 @@ Describe 'Deterministic leaf orchestration contract' {
     }
 }
 
+Describe 'Copilot sub-agent delegation guard' {
+    It 'excludes the task tool for CI reviews' {
+        $arguments = @(Get-CopilotExcludedToolArguments -ReviewSource 'pr' -IsWindowsHost $false)
+
+        $arguments | Should -Be @('--excluded-tools', 'task')
+    }
+
+    It 'excludes the task tool for local non-Windows reviews' {
+        $arguments = @(Get-CopilotExcludedToolArguments -ReviewSource 'local' -IsWindowsHost $false)
+
+        $arguments | Should -Be @('--excluded-tools', 'task')
+    }
+
+    It 'combines the task tool with PowerShell tools in one flag for local Windows reviews' {
+        $arguments = @(Get-CopilotExcludedToolArguments -ReviewSource 'local' -IsWindowsHost $true)
+
+        $arguments | Should -Be @(
+            '--excluded-tools',
+            'task,powershell,read_powershell,write_powershell,stop_powershell,list_powershell'
+        )
+    }
+
+    It 'applies the guard to every leaf and root Copilot invocation' {
+        $scriptPath = Join-Path (Join-Path (Split-Path -Parent $PSScriptRoot) 'scripts') 'Invoke-CopilotPRReview.ps1'
+        $scriptAst = [System.Management.Automation.Language.Parser]::ParseFile($scriptPath, [ref]$null, [ref]$null)
+        $functions = @($scriptAst.FindAll({
+            param($node)
+            $node -is [System.Management.Automation.Language.FunctionDefinitionAst]
+        }, $true))
+
+        foreach ($name in @('Start-LeafCopilotProcess', 'Invoke-CopilotCli')) {
+            $function = $functions | Where-Object Name -eq $name
+            $function | Should -Not -BeNullOrEmpty
+            $function.Body.Extent.Text | Should -Match '--allow-all-tools'
+            $function.Body.Extent.Text | Should -Match 'Get-CopilotExcludedToolArguments'
+        }
+        $allowAllToolFunctions = @($functions | Where-Object {
+            $_.Name -ne 'Get-CopilotExcludedToolArguments' -and
+            $_.Body.Extent.Text -match "'--allow-all-tools'"
+        } | ForEach-Object Name)
+        $allowAllToolFunctions | Sort-Object | Should -Be @('Invoke-CopilotCli', 'Start-LeafCopilotProcess')
+        $excludedToolFunctions = @($functions | Where-Object {
+            $_.Body.Extent.Text -match "'--excluded-tools'"
+        } | ForEach-Object Name)
+        $excludedToolFunctions | Should -Be @('Get-CopilotExcludedToolArguments')
+    }
+
+    It 'keeps delegated sub-agent chat spans without usage fail-closed' {
+        $records = @(
+            '{"type":"span","attributes":{"gen_ai.operation.name":"chat","gen_ai.request.model":"gpt-5.6-luna","gen_ai.usage.input_tokens":17551,"gen_ai.usage.output_tokens":151,"github.copilot.nano_aiu":125956000.0,"github.copilot.cost":1.0}}',
+            '{"type":"span","attributes":{"gen_ai.operation.name":"execute_tool","gen_ai.tool.name":"task"}}',
+            '{"type":"span","attributes":{"gen_ai.operation.name":"chat","gen_ai.request.model":"gpt-5.6-luna","github.copilot.interaction_id":"sub-agent"}}',
+            '{"type":"span","attributes":{"gen_ai.operation.name":"invoke_agent","gen_ai.agent.name":"security-review"}}'
+        ) | ForEach-Object { $_ | ConvertFrom-Json }
+
+        $metrics = Get-CopilotRunMetrics -Records $records
+
+        $metrics.api_calls | Should -Be 2
+        $metrics.usage_api_calls | Should -Be 1
+        $metrics.usage_complete | Should -BeFalse
+        $metrics.ai_credits | Should -BeNullOrEmpty
+        { Assert-CopilotInvocationMetrics -Metrics $metrics -RequestedModel 'gpt-5.6-luna' -InvocationLabel "Leaf 'al-security-review'" } |
+            Should -Throw "*Leaf 'al-security-review' produced incomplete Copilot usage telemetry*"
+    }
+}
+
 Describe 'BCQuality revision ownership' {
     It 'derives the commit from the checkout and only treats an input SHA as an assertion' {
         $root = Join-Path $TestDrive 'bcquality-revision'

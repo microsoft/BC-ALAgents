@@ -172,8 +172,8 @@ Describe 'Hidden local Windows review execution' {
         $reviewScriptPath = Join-Path (Join-Path (Split-Path -Parent $PSScriptRoot) 'scripts') 'Invoke-CopilotPRReview.ps1'
         $source = Get-Content -LiteralPath $reviewScriptPath -Raw
 
-        $source | Should -Match '\$ReviewSource -eq ''local'' -and \$IsWindows'
+        $source | Should -Match '\$ReviewSource -eq ''local'' -and \$IsWindowsHost'
         $source | Should -Match "'--excluded-tools'"
-        $source | Should -Match 'powershell,read_powershell,write_powershell,stop_powershell,list_powershell'
+        $source | Should -Match "@\('powershell', 'read_powershell', 'write_powershell', 'stop_powershell', 'list_powershell'\)"
     }
 }
