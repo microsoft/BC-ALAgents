@@ -124,7 +124,27 @@ Deterministic leaf execution requires BCQuality commit
 `b74967bc5b7a454eae19d6a1250199afd869f064` or a newer ref. This is the merge
 commit for [BCQuality#182](https://github.com/microsoft/BCQuality/pull/182),
 which introduced the findings-report and skill-index schemas used by the
-orchestrator. A leaf that produces malformed or schema-invalid JSON is recorded
+orchestrator. BCQuality ships one findings-report schema for both roles, so
+`sub-results` and `skipped-sub-skills` are optional there and nested
+`sub-results` recurse into the whole report. Before running leaves, the
+orchestrator derives two role contracts from that pinned schema, writes them as
+`_review-findings-report.leaf.schema.json` and
+`_review-findings-report.root.schema.json`, and points each process at its own
+contract:
+
+- The **leaf** contract removes the super-skill-only `sub-results` and
+  `skipped-sub-skills` properties. The shared `additionalProperties: false`
+  then rejects them, even as empty arrays.
+- The **root** contract requires `sub-results` and validates each entry
+  against the embedded leaf contract instead of recursing into the root
+  contract.
+
+Both are mechanical transforms of the pinned schema, not copies. If a BCQuality
+schema change removes the shape the transforms depend on, the run fails closed.
+The engine validates reports against its in-memory copies, not the files that
+review processes can write. It never strips or rewrites role-violating fields,
+and a separate role assertion still names any super-skill-only field found in a
+leaf or nested sub-result. A leaf that produces malformed or schema-invalid JSON is recorded
 as failed and the remaining leaves continue; model-substitution and telemetry
 integrity failures remain fail-closed. `_run-manifest.json` records leaf and
 consolidated-report coverage with a top-level `partial` status when any usable
