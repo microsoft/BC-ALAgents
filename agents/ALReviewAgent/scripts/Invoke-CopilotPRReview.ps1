@@ -4108,8 +4108,64 @@ function Test-NearDuplicateLocation {
 # ---------------------------------------------------------------------------
 # Post findings
 # ---------------------------------------------------------------------------
+function Submit-ReviewBatch {
+    <#
+    Submits queued inline comments as ONE pull request review (event COMMENT, so it
+    stays informational). GitHub sends one notification per review rather than one
+    per comment. If GitHub rejects the batch (a single unplaceable anchor fails the
+    whole review with 422), fall back to posting each comment on its own so no
+    finding is lost.
+    #>
+    param([System.Collections.Generic.List[object]] $Batch)
+
+    $result = [pscustomobject]@{ batched = 0; individual = 0; fallback = 0 }
+    if ($null -eq $Batch -or $Batch.Count -eq 0) { return $result }
+
+    $comments = @(foreach ($entry in $Batch) {
+        $comment = @{ body = $entry.body; path = $entry.path; line = $entry.line; side = $entry.side }
+        if ($entry.startLine -gt 0 -and $entry.startLine -lt $entry.line) {
+            $comment.start_line = $entry.startLine
+            $comment.start_side = if ($entry.startSide) { $entry.startSide } else { $entry.side }
+        }
+        $comment
+    })
+
+    try {
+        $null = Invoke-GitHubApi -Method POST -Endpoint "/pulls/$PrNumber/reviews" -Body @{
+            commit_id = $PrHeadSha
+            event     = 'COMMENT'
+            body      = "Automated review: $($Batch.Count) inline finding(s)."
+            comments  = $comments
+        }
+        $result.batched = $Batch.Count
+        return $result
+    } catch {
+        Write-Warning "Batched review submission failed; posting $($Batch.Count) comment(s) individually: $_"
+    }
+
+    foreach ($entry in $Batch) {
+        try {
+            $null = New-ReviewComment -Body $entry.body -Path $entry.path -Line $entry.line -Side $entry.side -StartLine $entry.startLine -StartSide $entry.startSide
+            $result.individual++
+        } catch {
+            Write-Warning "Failed to post review comment for $($entry.path):$($entry.line) : $_"
+            $fallbackBody = Add-CommentNotice -Body $entry.body -Notice '_Posting this finding as an issue comment because inline comment placement failed._'
+            $null = New-IssueComment -Body $fallbackBody
+            $result.fallback++
+        }
+        Start-Sleep -Seconds $CommentDelay
+    }
+    return $result
+}
+
 function Post-Findings {
-    param([string] $Domain, [object[]] $Findings, [hashtable] $LineMaps, [hashtable] $ChangedFileSet)
+    # When -Batch is supplied, inline comments are queued on it instead of being
+    # posted one by one; the caller submits them as a single PR review with
+    # Submit-ReviewBatch so reviewers get one notification, not one per finding.
+    param(
+        [string] $Domain, [object[]] $Findings, [hashtable] $LineMaps, [hashtable] $ChangedFileSet,
+        [System.Collections.Generic.List[object]] $Batch = $null
+    )
 
     $postedInline = 0
     $postedFallback = 0
@@ -4210,7 +4266,14 @@ function Post-Findings {
 
         try {
             if ($location) {
-                $null = New-ReviewComment -Body $body -Path $filePath -Line $location.line -Side $location.side -StartLine $commentStartLine -StartSide $commentStartSide
+                if ($null -ne $Batch) {
+                    $Batch.Add([pscustomobject]@{
+                        body = $body; path = $filePath; line = [int]$location.line; side = $location.side
+                        startLine = $commentStartLine; startSide = $commentStartSide
+                    })
+                } else {
+                    $null = New-ReviewComment -Body $body -Path $filePath -Line $location.line -Side $location.side -StartLine $commentStartLine -StartSide $commentStartSide
+                }
                 if ($locationInferred) {
                     $existingSourceKeys.Add("${filePath}:${lineNumber}") | Out-Null
                 } else {
@@ -4223,7 +4286,7 @@ function Post-Findings {
                 $null = New-IssueComment -Body $fallbackBody
                 $postedFallback++
             }
-            Start-Sleep -Seconds $CommentDelay
+            if ($null -eq $Batch -or -not $location) { Start-Sleep -Seconds $CommentDelay }
         } catch {
             Write-Warning "Failed to post review comment for $filePath`:$lineNumber : $_"
             $fallbackBody = Add-CommentNotice -Body $body -Notice '_Posting this finding as an issue comment because inline comment placement failed._'
@@ -4438,12 +4501,14 @@ function Publish-FindingsByDomain {
         $findingsByDomain[$domain].Add($finding) | Out-Null
     }
 
+    # Queue inline comments across all domains and submit them as one review.
+    $batch = [System.Collections.Generic.List[object]]::new()
     $domainSummary = Get-OrdinalDictionary
     foreach ($domain in (Get-OrdinalSortedKey -Dictionary $findingsByDomain)) {
         $domainFindings = @($findingsByDomain[$domain])
         Write-Host "Posting $($domainFindings.Count) $domain finding(s)…"
         $posted = Post-Findings -Domain $domain -Findings $domainFindings `
-            -LineMaps $LineMaps -ChangedFileSet $ChangedFileSet
+            -LineMaps $LineMaps -ChangedFileSet $ChangedFileSet -Batch $batch
         $agentCount = @($domainFindings | Where-Object { $_.isAgentFinding }).Count
         $backedCount = $domainFindings.Count - $agentCount
         Write-LogPhaseDetail "inline: $($posted.inline)  fallback: $($posted.fallback)  knowledge-backed: $backedCount  agent: $agentCount"
@@ -4454,6 +4519,11 @@ function Publish-FindingsByDomain {
             knowledgeBacked = $backedCount
             agentFindings   = $agentCount
         }
+    }
+
+    $submitted = Submit-ReviewBatch -Batch $batch
+    if ($batch.Count -gt 0) {
+        Write-LogPhaseDetail "review: batched $($submitted.batched)  individual: $($submitted.individual)  issue-comment fallback: $($submitted.fallback)"
     }
 
     return $domainSummary
