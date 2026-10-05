@@ -155,6 +155,29 @@ publishing a zero-coverage review. When summary posting is enabled, failed
 sub-skills also appear in a distinct incomplete-coverage section rather than
 being presented as skipped or as successful zero-finding reviews.
 
+Before launching leaves, the engine captures the changed-file scope, actual
+final-source line counts, and knowledge paths in the pinned, filtered BCQuality
+checkout. Each leaf receives `_review-source-bounds.json` with exact
+repo-relative paths, file existence, and line counts (zero for empty files,
+null for missing/deleted or linked files). Locations use final-source lines,
+not patch lines; location-less findings remain permitted.
+
+After JSON, role, and schema checks, deterministic consumer acceptance requires
+each citation-based finding ID to exactly equal its primary reference path,
+every reference to be a safe existing knowledge path, and each location to name
+an exact in-scope existing file with valid inclusive line bounds. Range starts
+must equal the anchor line. Uncited confidence/severity caps follow the pinned
+DO contract, including pins whose schema does not yet express those caps.
+Validation uses engine-held pre-run inventories, never the model-writable
+bounds artifact. It rejects the whole leaf without clamping, rewriting findings,
+or retrying, and records the precise reason in `_run-manifest.json`.
+`leaf-results/*/_review-report.raw.json` preserves the original report bytes,
+including when the existing omitted-`suppressed` compatibility repair produces
+an accepted derived report. Invalid originals are never rewritten. Bounds and
+raw reports follow the existing `_review-*`/`leaf-results` cleanup lifecycle.
+Article retrieval proof and review knowledge remain BCQuality responsibilities;
+this gate does not claim that an existing cited article was read in full.
+
 1. A caller-provided `config_path`, resolved from the target repository.
 2. Individual workflow inputs such as `bcquality_repo` and `bcquality_ref`,
    which override the selected config through environment variables.
