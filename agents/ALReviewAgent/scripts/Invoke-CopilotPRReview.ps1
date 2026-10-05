@@ -1735,7 +1735,9 @@ function Initialize-FindingsConsumerContext {
 function Assert-LeafConsumerAcceptance {
     param(
         [Parameter(Mandatory)][object] $ReportObject,
-        [Parameter(Mandatory)][object] $Context
+        [Parameter(Mandatory)][object] $Context,
+        [switch] $PermitPrimaryReferenceMismatch,
+        [switch] $PermitRangeStartMismatch
     )
 
     # Shape/types have already passed the engine-held leaf schema. This gate
@@ -1745,14 +1747,21 @@ function Assert-LeafConsumerAcceptance {
         $finding = $findings[$index]
         $prefix = "Consumer acceptance failed at findings[$index]"
         $references = @($finding.references)
+        if ($finding.PSObject.Properties.Match('from-sub-skill').Count -gt 0) {
+            throw "${prefix}.from-sub-skill: leaf findings cannot declare a producer."
+        }
         if ($references.Count -gt 0) {
-            if ([string]$finding.id -cne [string]$references[0].path) {
+            if ($finding.id -cmatch '(^|:)agent:') {
+                throw "${prefix}.id: an agent finding cannot carry knowledge references."
+            }
+            if (-not $PermitPrimaryReferenceMismatch -and [string]$finding.id -cne [string]$references[0].path) {
                 throw "${prefix}.id: '$($finding.id)' must exactly equal primary reference '$($references[0].path)'."
             }
             for ($refIndex = 0; $refIndex -lt $references.Count; $refIndex++) {
                 $path = [string]$references[$refIndex].path
                 if (-not (Test-ReviewRelativePath -Path $path) -or
-                    $path -cnotmatch '^(microsoft|community|custom)/knowledge/.+\.md$') {
+                    $path -cnotmatch '^(microsoft|community|custom)/knowledge/.+\.md$' -or
+                    $path -match '[#?%*\x7f]') {
                     throw "${prefix}.references[$refIndex].path: '$path' is not a safe repo-relative knowledge path."
                 }
                 if (-not $Context.KnowledgePaths.Contains($path)) {
@@ -1760,6 +1769,9 @@ function Assert-LeafConsumerAcceptance {
                 }
             }
         } else {
+            if ($finding.id -cnotmatch '^agent:[a-z0-9]+(?:-[a-z0-9]+)*$') {
+                throw "${prefix}.id: an uncited leaf finding must use an agent: slug."
+            }
             # The pinned DO contract caps uncited findings even where older
             # versions of the shared schema do not yet express these caps.
             if ($finding.confidence -ceq 'high') {
@@ -1786,13 +1798,115 @@ function Assert-LeafConsumerAcceptance {
         }
         if ($location.PSObject.Properties.Match('range').Count -gt 0) {
             $range = $location.range
-            if ($range.'start-line' -ne $location.line) {
+            if (-not $PermitRangeStartMismatch -and $range.'start-line' -ne $location.line) {
                 throw "${prefix}.location.range.start-line: $($range.'start-line') must equal line $($location.line)."
             }
             if ($range.'end-line' -lt $range.'start-line' -or $range.'end-line' -gt $count) {
                 throw "${prefix}.location.range.end-line: $($range.'end-line') must be between $($range.'start-line') and $count in '$path'."
             }
         }
+    }
+    $summary = Get-ObjectPropertyValue -InputObject $ReportObject -Name summary
+    if ($null -ne $summary) {
+        foreach ($severity in @('blocker', 'major', 'minor', 'info')) {
+            $actual = @($findings | Where-Object severity -CEQ $severity).Count
+            if ($summary.counts.$severity -ne $actual) {
+                throw "Consumer acceptance failed at summary.counts.${severity}: expected $actual."
+            }
+        }
+        $size = $summary.coverage.'worklist-size'
+        $evaluated = $summary.coverage.'items-evaluated'
+        if ($evaluated -gt $size -or
+            ($ReportObject.outcome -ceq 'completed' -and $evaluated -ne $size) -or
+            ($ReportObject.outcome -ceq 'partial' -and ($evaluated -le 0 -or $evaluated -ge $size))) {
+            throw 'Consumer acceptance failed at summary.coverage: evaluated work does not match the declared outcome and worklist.'
+        }
+    }
+}
+
+function New-AcceptedLeafReport {
+    param(
+        [Parameter(Mandatory)][string] $ReportText,
+        [Parameter(Mandatory)][string] $Schema,
+        [Parameter(Mandatory)][object] $Context
+    )
+
+    $original = $ReportText | ConvertFrom-Json -Depth 40 -ErrorAction Stop
+    Assert-LeafReportRole -ReportObject $original
+    if (-not ($ReportText | Test-Json -Schema $Schema -ErrorAction Stop)) {
+        throw 'Leaf report does not conform to the leaf findings-report schema.'
+    }
+    # Validate all original fields, including range shape/endpoints, before
+    # forming a private candidate. Only the two declared mismatches may defer.
+    Assert-LeafConsumerAcceptance -ReportObject $original -Context $Context `
+        -PermitPrimaryReferenceMismatch -PermitRangeStartMismatch
+    $candidate = $ReportText | ConvertFrom-Json -Depth 40 -ErrorAction Stop
+    $changes = [Collections.Generic.List[object]]::new()
+    $findings = @(Get-ObjectPropertyValue -InputObject $candidate -Name findings)
+    for ($index = 0; $index -lt $findings.Count; $index++) {
+        $finding = $findings[$index]
+        $references = @($finding.references)
+        if ($references.Count -gt 0 -and $finding.id -cne $references[0].path) {
+            $changes.Add([pscustomobject][ordered]@{
+                kind = 'finding-id'
+                finding_index = $index
+                original_id = $finding.id
+                canonical_id = $references[0].path
+            })
+            $finding.id = $references[0].path
+        }
+    }
+
+    for ($index = 0; $index -lt $findings.Count; $index++) {
+        $finding = $findings[$index]
+        $location = Get-ObjectPropertyValue -InputObject $finding -Name location
+        $range = Get-ObjectPropertyValue -InputObject $location -Name range
+        if ($null -eq $range -or $range.'start-line' -eq $location.line) { continue }
+        if ($range.'start-line' -gt $location.line -or $location.line -gt $range.'end-line' -or
+            $finding.PSObject.Properties.Match('suggested-code').Count -gt 0) {
+            throw "Consumer acceptance failed at findings[$index].location.range: start-line mismatch is not eligible for bounded normalization."
+        }
+        $changes.Add([pscustomobject][ordered]@{
+            kind = 'location-range'
+            finding_index = $index
+            file = $location.file
+            line = $location.line
+            original_range = $range
+        })
+        $location.PSObject.Properties.Remove('range')
+    }
+
+    Assert-LeafReportRole -ReportObject $candidate
+    $candidateText = $ReportText
+    if ($changes.Count -gt 0) {
+        # Preserve untouched JSON strings (notably ISO timestamps, which
+        # ConvertFrom-Json can coerce to DateTime) on every supported PS version.
+        $reader = [Newtonsoft.Json.JsonTextReader]::new([IO.StringReader]::new($ReportText))
+        try {
+            $reader.DateParseHandling = [Newtonsoft.Json.DateParseHandling]::None
+            $json = [Newtonsoft.Json.Linq.JObject]::Load($reader)
+            foreach ($change in $changes) {
+                $jsonFinding = $json['findings'][$change.finding_index]
+                if ($change.kind -eq 'finding-id') {
+                    $jsonFinding['id'] = [Newtonsoft.Json.Linq.JValue]::new([string]$change.canonical_id)
+                } else {
+                    $jsonFinding['location'].Property('range').Remove()
+                }
+            }
+            $candidateText = $json.ToString()
+        }
+        finally {
+            $reader.Close()
+        }
+    }
+    if (-not ($candidateText | Test-Json -Schema $Schema -ErrorAction Stop)) {
+        throw 'Normalized leaf report does not conform to the leaf findings-report schema.'
+    }
+    Assert-LeafConsumerAcceptance -ReportObject $candidate -Context $Context
+    return [pscustomobject]@{
+        Report = $candidate
+        Text = $candidateText
+        Changes = @($changes)
     }
 }
 
@@ -1814,14 +1928,15 @@ function Add-ReviewProcessTelemetry {
         [object] $Metrics,
         [object] $ExitCode,
         [string] $ReportPath,
-        [string] $FailureReason
+        [string] $FailureReason,
+        [object] $Normalization
     )
 
     $observedModels = [string[]]@()
     if ($null -ne $Metrics) {
         $observedModels = [string[]]@($Metrics.models)
     }
-    $script:ReviewProcessTelemetry.Add([pscustomobject][ordered]@{
+    $record = [ordered]@{
         role = $Role
         ordinal = $Ordinal
         skill_id = $SkillId
@@ -1835,7 +1950,9 @@ function Add-ReviewProcessTelemetry {
         report_path = Get-ReviewRelativeArtifactPath -Path $ReportPath
         failure_reason = if ($FailureReason) { $FailureReason } else { $null }
         metrics = $Metrics
-    }) | Out-Null
+    }
+    if ($null -ne $Normalization) { $record['normalization'] = $Normalization }
+    $script:ReviewProcessTelemetry.Add([pscustomobject]$record) | Out-Null
 }
 
 function Assert-CopilotInvocationMetrics {
@@ -2460,15 +2577,19 @@ function Receive-LeafCopilotProcess {
         if ($repairedSuppressed) {
             $reportText = $reportObject | ConvertTo-Json -Depth 40
         }
-        # Report the role violation by name before the leaf schema rejects the
-        # same super-skill-only fields as additional properties.
-        Assert-LeafReportRole -ReportObject $reportObject
-        if (-not ($reportText | Test-Json -Schema (Get-FindingsReportRoleSchema -Role leaf) -ErrorAction Stop)) {
-            throw "Leaf '$($State.Leaf.id)' report does not conform to the leaf findings-report schema."
+        $accepted = New-AcceptedLeafReport -ReportText $reportText `
+            -Schema (Get-FindingsReportRoleSchema -Role leaf) -Context $script:FindingsConsumerContext
+        $reportObject = $accepted.Report
+        $normalization = $null
+        if ($accepted.Changes.Count -gt 0) {
+            $normalization = [ordered]@{
+                raw_report_path = Get-ReviewRelativeArtifactPath -Path $rawReportPath
+                raw_report_sha256 = (Get-FileHash -LiteralPath $rawReportPath -Algorithm SHA256).Hash.ToLowerInvariant()
+                changes = $accepted.Changes
+            }
         }
-        Assert-LeafConsumerAcceptance -ReportObject $reportObject -Context $script:FindingsConsumerContext
-        if ($repairedSuppressed) {
-            Set-Content -LiteralPath $reportPath -Value $reportText -Encoding UTF8
+        if ($repairedSuppressed -or $null -ne $normalization) {
+            Set-Content -LiteralPath $reportPath -Value $accepted.Text -Encoding UTF8
         }
 
         Write-LogPhaseDetail "Leaf $($State.Leaf.ordinal)/$($State.Leaf.id) completed: $(@($reportObject.findings).Count) finding(s), $($leafMetrics.total_tokens) token(s)."
@@ -2483,7 +2604,8 @@ function Receive-LeafCopilotProcess {
             -CompletedAt $completedAt `
             -Metrics $leafMetrics `
             -ExitCode $process.ExitCode `
-            -ReportPath $reportPath
+            -ReportPath $reportPath `
+            -Normalization $normalization
         Save-ReviewRunManifest -Status running
         return [pscustomobject]@{
             Leaf = $State.Leaf

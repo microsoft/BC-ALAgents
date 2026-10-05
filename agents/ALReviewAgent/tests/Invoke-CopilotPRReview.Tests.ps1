@@ -8,7 +8,9 @@
     '',
     Justification = 'The test intentionally covers Unicode domain labels and rendered Unicode output.'
 )]
-param()
+param(
+    [string] $NormalizationSchemaPath = (Join-Path $PSScriptRoot 'fixtures/findings-report-roles/bcquality-findings-report.b74967bc.schema.json')
+)
 
 BeforeAll {
     $scriptPath = Join-Path (Join-Path (Split-Path -Parent $PSScriptRoot) 'scripts') 'Invoke-CopilotPRReview.ps1'
@@ -1588,6 +1590,65 @@ Describe 'Deterministic leaf orchestration contract' {
         Should -Invoke Start-LeafCopilotProcess -Times 2 -Exactly
     }
 
+    It 'retains raw BOM/CRLF bytes and records only fully accepted normalization: <Valid>' -ForEach @(
+        @{ Valid = $true }, @{ Valid = $false }
+    ) {
+        $fixture = Join-Path $PSScriptRoot 'fixtures/findings-consumer/privacy-015-normalization.json'
+        $report = Get-Content $fixture -Raw | ConvertFrom-Json
+        if (-not $Valid) { $report.findings[3].location.range.'end-line' = 58 }
+        $script:FindingsReportRoleSchemas = New-FindingsReportRoleSchemas -SharedSchemaJson (
+            Get-Content -LiteralPath $NormalizationSchemaPath -Raw
+        )
+        $sourceCounts = @(34, 29, 42, 57)
+        for ($index = 0; $index -lt 4; $index++) {
+            $script:FindingsConsumerContext.SourceFiles[$report.findings[$index].location.file] = @{
+                exists = $true; line_count = $sourceCounts[$index]
+            }
+            $null = $script:FindingsConsumerContext.KnowledgePaths.Add($report.findings[$index].references[0].path)
+        }
+        $leaf = [pscustomobject]@{ id = 'al-privacy-review'; version = 1; ordinal = 1 }
+        $script:ReviewPlanIds = @($leaf.id)
+        $state = Start-LeafCopilotProcess -Leaf $leaf -WorkDir (Join-Path $ReviewOutputDir 'leaf-results/03-al-privacy-review') -Prompt 'unused'
+        $path = Join-Path $state.WorkDir $ReportFileName
+        $text = ($report | ConvertTo-Json -Depth 40) -replace '\r?\n', "`r`n"
+        $bytes = [byte[]](@(0xef, 0xbb, 0xbf) + [Text.Encoding]::UTF8.GetBytes(" `r`n$text`r`n`t"))
+        [IO.File]::WriteAllBytes($path, $bytes)
+        $rawHash = (Get-FileHash $path).Hash
+
+        $result = Receive-LeafCopilotProcess -State $state
+
+        ($null -ne $result) | Should -Be $Valid
+        $rawPath = Join-Path $state.WorkDir '_review-report.raw.json'
+        [Convert]::ToBase64String([IO.File]::ReadAllBytes($rawPath)) |
+            Should -Be ([Convert]::ToBase64String($bytes))
+        $manifest = Get-Content (Join-Path $ReviewOutputDir '_run-manifest.json') -Raw | ConvertFrom-Json
+        $manifest.schema_version | Should -Be 1
+        $manifest.processes.Count | Should -Be 1
+        $manifest.processes[0].requested_model | Should -Be $LeafModel
+        $manifest.processes[0].metrics.total_tokens | Should -Be 12
+        $manifest.processes[0].report_path | Should -Be 'leaf-results/03-al-privacy-review/_review-report.json'
+        if ($Valid) {
+            $manifest.processes[0].status | Should -Be 'completed'
+            $manifest.processes[0].normalization.raw_report_path | Should -Be 'leaf-results/03-al-privacy-review/_review-report.raw.json'
+            $manifest.processes[0].normalization.raw_report_sha256 | Should -BeExactly $rawHash.ToLowerInvariant()
+            $manifest.processes[0].normalization.changes.Count | Should -Be 8
+            $acceptedText = Get-Content $result.ReportPath -Raw
+            ($acceptedText | ConvertFrom-Json | ConvertTo-Json -Depth 40) | Should -Be ($result.Report | ConvertTo-Json -Depth 40)
+            $result.Report.findings[3].id | Should -Be $report.findings[3].references[0].path
+            $result.Report.findings[3].location.PSObject.Properties.Match('range').Count | Should -Be 0
+            $prompt = Build-ConsolidationPrompt -LeafResults @($result)
+            $prompt | Should -Match ([regex]::Escape(($result.ReportPath -replace '\\', '/')))
+            $prompt | Should -Not -Match '_review-report.raw.json'
+            $manifest.processes[0].normalization.changes = @()
+            ($manifest | ConvertTo-Json -Depth 40 | Test-Json -SchemaFile (Join-Path $EngineRoot 'agents/ALReviewAgent/schemas/run-manifest.schema.json') -ErrorAction SilentlyContinue) | Should -BeFalse
+        } else {
+            $manifest.processes[0].status | Should -Be 'failed'
+            $manifest.processes[0].failure_reason | Should -Match 'findings\[3\]\.location.range.end-line'
+            $manifest.processes[0].PSObject.Properties.Match('normalization').Count | Should -Be 0
+            (Get-FileHash $path).Hash | Should -Be $rawHash
+        }
+    }
+
     It 'preserves exact raw bytes through <Stage> validation' -ForEach @(
         @{ Stage = 'JSON'; Payload = "{`r`ninvalid"; Valid = $false },
         @{ Stage = 'role'; Payload = '{"skill":{"id":"al-security-review"},"findings":[],"suppressed":[],"sub-results":[]}'; Valid = $false },
@@ -2500,6 +2561,8 @@ Describe 'Deterministic findings consumer acceptance' {
             $valid.findings[0].id = 'agent:repository-wide'
             $valid.findings[0].confidence = 'medium'
             $valid.findings[0].severity = 'minor'
+            $valid.summary.counts.major = 0
+            $valid.summary.counts.minor = 1
             Assert-LeafConsumerAcceptance -ReportObject $valid -Context $context
         }
     }
@@ -2547,6 +2610,7 @@ Describe 'Deterministic findings consumer acceptance' {
         $second = $valid.findings[0] | ConvertTo-Json -Depth 10 | ConvertFrom-Json
         $second.location.file = 'src/OutboxEmailDispatcher.Codeunit.al'
         $valid.findings += $second
+        $valid.summary.counts.major = 2
         { Assert-LeafConsumerAcceptance -ReportObject $valid -Context $context } | Should -Not -Throw
     }
 
@@ -2702,6 +2766,177 @@ Describe 'Deterministic findings consumer acceptance' {
         $bad = Get-Content (Join-Path $consumerFixtures 'privacy-008.json') -Raw | ConvertFrom-Json
         { Assert-LeafConsumerAcceptance -ReportObject $bad -Context $script:FindingsConsumerContext } |
             Should -Throw '*line 44*22 final-source lines*'
+    }
+}
+
+Describe 'Bounded leaf accepted-copy normalization' {
+    BeforeAll {
+        # Four findings from privacy-015/al-privacy-review in run 37310924454.
+        # IDs, references, source locations, ranges and counts are unchanged.
+        # Original SHA256: 26aead0958e6ffe60c947f740b95ecf016783116a88d1254e87cea5c54c10107.
+        $normalizationFixture = Join-Path $PSScriptRoot 'fixtures/findings-consumer/privacy-015-normalization.json'
+        $normalizationRaw = Get-Content -LiteralPath $normalizationFixture -Raw
+        $normalizationSchema = (New-FindingsReportRoleSchemas -SharedSchemaJson (
+            Get-Content -LiteralPath $NormalizationSchemaPath -Raw
+        )).Leaf
+        $normalizationSources = Get-OrdinalDictionary
+        foreach ($pair in @(
+            @('src/AIContextBuilder.Codeunit.al', 34),
+            @('src/CustomerDataExporter.Codeunit.al', 29),
+            @('src/ExternalCRMSync.Codeunit.al', 42),
+            @('src/OutboxEmailDispatcher.Codeunit.al', 57)
+        )) {
+            $normalizationSources[$pair[0]] = @{ exists = $true; line_count = $pair[1] }
+        }
+        $normalizationKnowledge = [Collections.Generic.HashSet[string]]::new([StringComparer]::Ordinal)
+        $normalizationPrimary = 'microsoft/knowledge/privacy/privacy-notice-consent-for-external-data-transfer.md'
+        $null = $normalizationKnowledge.Add($normalizationPrimary)
+        $normalizationContext = [pscustomobject]@{
+            SourceFiles = $normalizationSources
+            KnowledgePaths = $normalizationKnowledge
+        }
+    }
+
+    BeforeEach {
+        $normalizationReport = $normalizationRaw | ConvertFrom-Json
+    }
+
+    It 'normalizes all four IDs and ranges in one private candidate without changing any other value' {
+        $before = (Get-FileHash $normalizationFixture).Hash
+        $accepted = New-AcceptedLeafReport -ReportText $normalizationRaw -Schema $normalizationSchema -Context $normalizationContext
+        $accepted.Changes.Count | Should -Be 8
+        @($accepted.Report.findings).Count | Should -Be 4
+        $accepted.Report.findings.id | Should -Be (@($normalizationPrimary) * 4)
+        for ($index = 0; $index -lt 4; $index++) {
+            $accepted.Report.findings[$index].location.PSObject.Properties.Match('range').Count | Should -Be 0
+            $idChange = $accepted.Changes[$index]
+            $idChange.kind | Should -Be 'finding-id'
+            $idChange.finding_index | Should -Be $index
+            $idChange.original_id | Should -Be $normalizationReport.findings[$index].id
+            $idChange.canonical_id | Should -Be $normalizationPrimary
+            $rangeChange = $accepted.Changes[$index + 4]
+            $rangeChange.kind | Should -Be 'location-range'
+            $rangeChange.finding_index | Should -Be $index
+            $rangeChange.line | Should -Be $normalizationReport.findings[$index].location.line
+            ($rangeChange.original_range | ConvertTo-Json) |
+                Should -Be ($normalizationReport.findings[$index].location.range | ConvertTo-Json)
+            $normalizationReport.findings[$index].id = $normalizationPrimary
+            $normalizationReport.findings[$index].location.PSObject.Properties.Remove('range')
+        }
+        ($accepted.Report | ConvertTo-Json -Depth 40) | Should -Be ($normalizationReport | ConvertTo-Json -Depth 40)
+        ($accepted.Text | Test-Json -Schema $normalizationSchema) | Should -BeTrue
+        (Get-FileHash $normalizationFixture).Hash | Should -Be $before
+    }
+
+    It 'leaves canonical reports and telemetry unchanged on repeated acceptance' {
+        $accepted = New-AcceptedLeafReport -ReportText $normalizationRaw -Schema $normalizationSchema -Context $normalizationContext
+        $canonical = " `r`n$($accepted.Text)`r`n`t"
+        $again = New-AcceptedLeafReport -ReportText $canonical -Schema $normalizationSchema -Context $normalizationContext
+        $again.Text | Should -BeExactly $canonical
+        $again.Changes.Count | Should -Be 0
+        ($again.Report | ConvertTo-Json -Depth 40) | Should -Be ($accepted.Report | ConvertTo-Json -Depth 40)
+    }
+
+    It 'preserves untouched timestamp-shaped strings instead of applying PowerShell date conversion' {
+        $text = $normalizationRaw.Replace('Synthetic AI request privacy finding.', '2026-10-05T13:00:00+05:30')
+        $accepted = New-AcceptedLeafReport -ReportText $text -Schema $normalizationSchema -Context $normalizationContext
+        $accepted.Text | Should -Match ([regex]::Escape('"2026-10-05T13:00:00+05:30"'))
+        $accepted.Changes.Count | Should -Be 8
+    }
+
+    It 'canonicalizes cited IDs without requiring a location or removing a valid range' {
+        $normalizationReport.findings[0].PSObject.Properties.Remove('location')
+        $normalizationReport.findings[1].location.range.'start-line' = $normalizationReport.findings[1].location.line
+        $normalizationReport.findings[1] | Add-Member -NotePropertyName 'suggested-code' -NotePropertyValue 'SafeReplacement();'
+        $accepted = New-AcceptedLeafReport -ReportText ($normalizationReport | ConvertTo-Json -Depth 40) -Schema $normalizationSchema -Context $normalizationContext
+        $accepted.Changes.Count | Should -Be 6
+        $accepted.Report.findings[0].PSObject.Properties.Match('location').Count | Should -Be 0
+        $accepted.Report.findings[1].location.range.'start-line' | Should -Be 24
+        $accepted.Report.findings[1].'suggested-code' | Should -Be 'SafeReplacement();'
+    }
+
+    It 'permits existing range-only normalization for valid uncited agent findings without changing their IDs' {
+        foreach ($finding in $normalizationReport.findings) {
+            $finding.references = @()
+            $finding.id = 'agent:valid-concern'
+            $finding.severity = 'minor'
+            $finding.confidence = 'medium'
+        }
+        $normalizationReport.summary.counts.major = 0
+        $normalizationReport.summary.counts.minor = 4
+        $accepted = New-AcceptedLeafReport -ReportText ($normalizationReport | ConvertTo-Json -Depth 40) -Schema $normalizationSchema -Context $normalizationContext
+        $accepted.Changes.Count | Should -Be 4
+        @($accepted.Changes | Where-Object kind -eq 'finding-id').Count | Should -Be 0
+        $accepted.Report.findings.id | Should -Be (@('agent:valid-concern') * 4)
+        $accepted.Report.findings.confidence | Should -Be (@('medium') * 4)
+    }
+
+    It 'rejects the whole candidate for an unrelated defect: <Name>' -ForEach @(
+        @{ Name = 'unsafe reference'; Mutate = { $normalizationReport.findings[3].references[0].path = '../outside.md' } },
+        @{ Name = 'unknown reference'; Mutate = { $normalizationReport.findings[3].references[0].path = 'microsoft/knowledge/privacy/unknown.md' } },
+        @{ Name = 'unknown supporting reference'; Mutate = { $normalizationReport.findings[3].references += [pscustomobject]@{ path = 'microsoft/knowledge/privacy/unknown.md' } } },
+        @{ Name = 'wrong reference case'; Mutate = { $normalizationReport.findings[3].references[0].path = $normalizationPrimary.ToUpperInvariant() } },
+        @{ Name = 'malformed reference object'; Mutate = { $normalizationReport.findings[3].references[0] | Add-Member -NotePropertyName extra -NotePropertyValue $true } },
+        @{ Name = 'cited agent ID'; Mutate = { $normalizationReport.findings[3].id = 'agent:cited' } },
+        @{ Name = 'qualified cited agent ID'; Mutate = { $normalizationReport.findings[3].id = 'al-privacy-review:agent:cited' } },
+        @{ Name = 'leaf producer'; Mutate = { $normalizationReport.findings[3] | Add-Member -NotePropertyName 'from-sub-skill' -NotePropertyValue 'agent' } },
+        @{ Name = 'uncited nonagent ID'; Mutate = { $normalizationReport.findings[3].references = @() } },
+        @{ Name = 'high confidence agent'; Mutate = { $normalizationReport.findings[3].references = @(); $normalizationReport.findings[3].id = 'agent:uncited' } },
+        @{ Name = 'high severity agent'; Mutate = { $normalizationReport.findings[3].references = @(); $normalizationReport.findings[3].id = 'agent:uncited'; $normalizationReport.findings[3].confidence = 'medium' } },
+        @{ Name = 'blank ID'; Mutate = { $normalizationReport.findings[3].id = '' } },
+        @{ Name = 'null ID'; Mutate = { $normalizationReport.findings[3].id = $null } },
+        @{ Name = 'integer ID'; Mutate = { $normalizationReport.findings[3].id = 1 } },
+        @{ Name = 'missing ID'; Mutate = { $normalizationReport.findings[3].PSObject.Properties.Remove('id') } },
+        @{ Name = 'zero start'; Mutate = { $normalizationReport.findings[3].location.range.'start-line' = 0 } },
+        @{ Name = 'string start'; Mutate = { $normalizationReport.findings[3].location.range.'start-line' = '18' } },
+        @{ Name = 'fractional start'; Mutate = { $normalizationReport.findings[3].location.range.'start-line' = 18.5 } },
+        @{ Name = 'extra range property'; Mutate = { $normalizationReport.findings[3].location.range | Add-Member -NotePropertyName extra -NotePropertyValue $true } },
+        @{ Name = 'anchor outside range'; Mutate = { $normalizationReport.findings[3].location.range.'end-line' = 22 } },
+        @{ Name = 'start after anchor'; Mutate = { $normalizationReport.findings[3].location.range.'start-line' = 24; $normalizationReport.findings[3].location.range.'end-line' = 25 } },
+        @{ Name = 'reversed range'; Mutate = { $normalizationReport.findings[3].location.range.'end-line' = 17 } },
+        @{ Name = 'out of bounds end'; Mutate = { $normalizationReport.findings[3].location.range.'end-line' = 58 } },
+        @{ Name = 'out of bounds line'; Mutate = { $normalizationReport.findings[3].location.line = 58; $normalizationReport.findings[3].location.range.'end-line' = 58 } },
+        @{ Name = 'out of scope source'; Mutate = { $normalizationReport.findings[3].location.file = 'src/unknown.al' } },
+        @{ Name = 'suggested-code range'; Mutate = { $normalizationReport.findings[3] | Add-Member -NotePropertyName 'suggested-code' -NotePropertyValue 'Replacement();' } },
+        @{ Name = 'empty suggested-code'; Mutate = { $normalizationReport.findings[3] | Add-Member -NotePropertyName 'suggested-code' -NotePropertyValue '' } },
+        @{ Name = 'null suggested-code'; Mutate = { $normalizationReport.findings[3] | Add-Member -NotePropertyName 'suggested-code' -NotePropertyValue $null } },
+        @{ Name = 'incorrect counts'; Mutate = { $normalizationReport.summary.counts.major = 3 } },
+        @{ Name = 'incomplete completed coverage'; Mutate = { $normalizationReport.summary.coverage.'items-evaluated' = 1 } },
+        @{ Name = 'leaf role'; Mutate = { $normalizationReport | Add-Member -NotePropertyName 'sub-results' -NotePropertyValue @() } }
+    ) {
+        & $Mutate
+        $raw = $normalizationReport | ConvertTo-Json -Depth 40
+        $acceptedOutput = [Collections.Generic.List[object]]::new()
+        {
+            New-AcceptedLeafReport -ReportText $raw -Schema $normalizationSchema -Context $normalizationContext |
+                ForEach-Object { $acceptedOutput.Add($_) }
+        } | Should -Throw
+        $acceptedOutput.Count | Should -Be 0
+        ($normalizationReport | ConvertTo-Json -Depth 40) | Should -BeExactly $raw
+    }
+
+    It 'rejects non-JSON output instead of normalizing it' {
+        { New-AcceptedLeafReport -ReportText "prefix $normalizationRaw" -Schema $normalizationSchema -Context $normalizationContext } |
+            Should -Throw
+    }
+
+    It 'rejects URI and wildcard metacharacters even in inventoried reference paths: <_>' -ForEach @(
+        'microsoft/knowledge/privacy/encoded%20article.md',
+        'microsoft/knowledge/privacy/article#fragment.md',
+        'microsoft/knowledge/privacy/article?query.md',
+        'microsoft/knowledge/privacy/wildcard*.md',
+        "microsoft/knowledge/privacy/control$([char]0x7f).md"
+    ) {
+        $path = $_
+        $null = $normalizationContext.KnowledgePaths.Add($path)
+        try {
+            $normalizationReport.findings[3].references[0].path = $path
+            { New-AcceptedLeafReport -ReportText ($normalizationReport | ConvertTo-Json -Depth 40) -Schema $normalizationSchema -Context $normalizationContext } |
+                Should -Throw '*not a safe repo-relative knowledge path*'
+        }
+        finally {
+            $null = $normalizationContext.KnowledgePaths.Remove($path)
+        }
     }
 }
 
