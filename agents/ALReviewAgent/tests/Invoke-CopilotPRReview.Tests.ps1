@@ -900,12 +900,18 @@ Describe 'Deterministic leaf orchestration contract' {
         $script:FailedLeafReviews = @()
         $script:ReviewProcessTelemetry = [System.Collections.Generic.List[object]]::new()
         $script:ReviewRunCompletedAt = $null
+        $script:ObservedCopilotCliVersion = '1.0.83'
+        $script:CopilotCliCompatibility = [pscustomobject]@{
+            version = '1.0.83'
+            otel_cli_version = 'required'
+        }
         New-Item -ItemType Directory -Path (Join-Path $BCQualityRoot 'microsoft/skills/review') -Force | Out-Null
         New-Item -ItemType Directory -Path (Join-Path $BCQualityRoot 'skills') -Force | Out-Null
         New-Item -ItemType Directory -Path (Join-Path $BCQualityRoot 'schemas') -Force | Out-Null
         @'
 {
   "type": "object",
+  "additionalProperties": false,
   "required": ["skill", "findings", "suppressed"],
   "properties": {
     "skill": {
@@ -913,7 +919,11 @@ Describe 'Deterministic leaf orchestration contract' {
       "required": ["id"],
       "properties": { "id": { "type": "string" } }
     },
+    "outcome": { "type": "string" },
+    "outcome-reason": { "type": "string" },
+    "summary": { "type": "object" },
     "findings": { "type": "array" },
+    "references": { "type": "array" },
     "suppressed": {
       "type": "array",
       "items": {
@@ -921,10 +931,15 @@ Describe 'Deterministic leaf orchestration contract' {
         "required": ["reference"],
         "properties": { "reference": { "type": "object" } }
       }
-    }
+    },
+    "sub-results": { "type": "array", "items": { "$ref": "#" } },
+    "skipped-sub-skills": { "type": "array" }
   }
 }
 '@ | Set-Content -LiteralPath (Join-Path $BCQualityRoot 'schemas/findings-report.schema.json')
+        $LeafReportSchemaFileName = '_review-findings-report.leaf.schema.json'
+        $RootReportSchemaFileName = '_review-findings-report.root.schema.json'
+        Initialize-FindingsReportRoleSchemas
         Set-Content -LiteralPath (Join-Path $BCQualityRoot 'microsoft/skills/review/al-security-review.md') -Value '# security'
         Set-Content -LiteralPath (Join-Path $BCQualityRoot 'microsoft/skills/review/al-style-review.md') -Value '# style'
 
@@ -1028,6 +1043,45 @@ Describe 'Deterministic leaf orchestration contract' {
         $prompt | Should -Match "Review only the domain defined by BCQuality leaf skill 'al-security-review'"
         $prompt | Should -Match "pinned mechanically to model 'gpt-5\.6-luna'"
         $prompt | Should -Match 'Do not invoke child agents or other review skills'
+        $prompt | Should -Match ([regex]::Escape('./_review-findings-report.leaf.schema.json'))
+        $prompt | Should -Match 'sub-results and skipped-sub-skills are super-skill-only fields and MUST NOT\s+appear, not even as empty arrays'
+        $prompt | Should -Not -Match ([regex]::Escape('schemas/findings-report.schema.json'))
+    }
+
+    It 'writes engine-derived role schemas as run artifacts and copies the leaf contract to each leaf' {
+        $leafPath = Join-Path $AgentWorkDir '_review-findings-report.leaf.schema.json'
+        $rootPath = Join-Path $AgentWorkDir '_review-findings-report.root.schema.json'
+
+        (Get-Content -LiteralPath $leafPath -Raw).TrimEnd() | Should -Be (Get-FindingsReportRoleSchema -Role leaf)
+        (Get-Content -LiteralPath $rootPath -Raw).TrimEnd() | Should -Be (Get-FindingsReportRoleSchema -Role root)
+        (Get-Content -LiteralPath $leafPath -Raw | ConvertFrom-Json).properties.PSObject.Properties.Name |
+            Should -Not -Contain 'sub-results'
+
+        $startCommand = Get-Command Start-LeafCopilotProcess -CommandType Function
+        $startCommand.ScriptBlock.Ast.Extent.Text | Should -Match '\$LeafReportSchemaFileName'
+    }
+
+    It 'validates against the engine-held contract rather than the model-writable schema file' {
+        Set-Content -LiteralPath (Join-Path $AgentWorkDir '_review-findings-report.leaf.schema.json') -Value '{}'
+        $plan = @(Get-ReviewLeafPlan)
+        $script:TestLeafReports['al-security-review'] = @{
+            skill = @{ id = 'al-security-review' }
+            findings = @()
+            suppressed = @()
+            unexpected = $true
+        }
+
+        $results = @(Invoke-DeterministicLeafReviews -Plan @($plan[0]))
+
+        $results.Count | Should -Be 0
+        $script:FailedLeafReviews[0].Reason | Should -Match 'false schema at ''/unexpected'''
+    }
+
+    It 'refuses to validate before role-specific schemas are initialized' {
+        $script:FindingsReportRoleSchemas = $null
+
+        { Get-FindingsReportRoleSchema -Role leaf } |
+            Should -Throw '*schemas were not initialized*'
     }
 
     It 'repairs an omitted suppressed array without inventing suppressed items' {
@@ -1077,6 +1131,72 @@ Describe 'Deterministic leaf orchestration contract' {
         $script:FailedLeafReviews[0].Leaf.id | Should -Be 'al-security-review'
         $script:FailedLeafReviews[0].Reason |
             Should -Match 'super-skill-only field'
+    }
+
+    It 'marks a completed leaf with only <Field> failed during orchestration' -ForEach @(
+        @{ Field = 'sub-results' },
+        @{ Field = 'skipped-sub-skills' }
+    ) {
+        $plan = @(Get-ReviewLeafPlan)
+        $script:TestLeafReports['al-security-review'] = @{
+            skill = @{ id = 'al-security-review' }
+            outcome = 'completed'
+            findings = @(@{ id = 'agent:x' })
+            suppressed = @()
+            $Field = @()
+        }
+
+        $results = @(Invoke-DeterministicLeafReviews -Plan @($plan[0]))
+
+        $results.Count | Should -Be 0
+        $script:FailedLeafReviews[0].Reason |
+            Should -Match "super-skill-only field\(s\): $Field\."
+    }
+
+    It 'rejects a consolidated report whose sub-result carries <Field>' -ForEach @(
+        @{ Field = 'sub-results' },
+        @{ Field = 'skipped-sub-skills' }
+    ) {
+        $plan = @(Get-ReviewLeafPlan)
+        $nested = @{ skill = @{ id = 'al-security-review'; version = 1 }; outcome = 'not-applicable'; findings = @(); suppressed = @() }
+        $nested[$Field] = @()
+        $report = @{
+            skill = @{ id = 'al-code-review'; version = 1 }
+            outcome = 'completed'
+            findings = @()
+            suppressed = @()
+            'sub-results' = @(
+                $nested,
+                @{ skill = @{ id = 'al-style-review'; version = 1 }; outcome = 'completed'; findings = @(); suppressed = @() }
+            )
+            'skipped-sub-skills' = @()
+        } | ConvertTo-Json -Depth 10
+
+        { Assert-ConsolidatedReport -ReportText $report -Plan $plan } |
+            Should -Throw "*false schema at '/sub-results/0/$Field'*"
+    }
+
+    It 'rejects a consolidated report without sub-results' {
+        $report = @{
+            skill = @{ id = 'al-code-review'; version = 1 }
+            outcome = 'completed'
+            findings = @()
+            suppressed = @()
+        } | ConvertTo-Json -Depth 10
+
+        { Assert-ConsolidatedReport -ReportText $report -Plan @(Get-ReviewLeafPlan) } |
+            Should -Throw '*Required properties `["sub-results"`] are not present*'
+    }
+
+    It 'points root consolidation at the root role schema' {
+        $AnalysisWorkspace = 'C:\review-target'
+        $DiffRange = 'origin/main...HEAD'
+        $leafResults = @([pscustomobject]@{ ReportPath = 'C:\out\01-security\_review-report.json' })
+
+        $prompt = Build-ConsolidationPrompt -LeafResults $leafResults
+
+        $prompt | Should -Match ([regex]::Escape('./_review-findings-report.root.schema.json'))
+        $prompt | Should -Match 'every\s+sub-result is a leaf report that MUST NOT contain sub-results or\s+skipped-sub-skills'
     }
 
     It 'accepts a normal leaf report without super-skill fields' {
@@ -1466,7 +1586,7 @@ Describe 'Deterministic leaf orchestration contract' {
                 cli_version = '1.0.82'
                 total_tokens = 12
             }
-            ErrorPattern = "*expected Copilot CLI '1.0.83'*"
+            ErrorPattern = "*expected startup-probed Copilot CLI '1.0.83'*"
         }
     ) {
         $plan = @(Get-ReviewLeafPlan)
@@ -1537,7 +1657,70 @@ Describe 'Deterministic leaf orchestration contract' {
         $wrongCli = $valid.PSObject.Copy()
         $wrongCli.cli_version = '1.0.82'
         { Assert-CopilotInvocationMetrics -Metrics $wrongCli -RequestedModel 'gpt-5.4' -InvocationLabel 'leaf' } |
-            Should -Throw "*expected Copilot CLI '1.0.83'*"
+            Should -Throw "*expected startup-probed Copilot CLI '1.0.83'*"
+    }
+
+    It 'requires OTel CLI version for the 1.0.83 compatibility policy' {
+        $metrics = [pscustomobject]@{
+            models = @('gpt-5.4')
+            usage_complete = $true
+            malformed_records = 0
+            cli_version = $null
+        }
+
+        { Assert-CopilotInvocationMetrics -Metrics $metrics -RequestedModel 'gpt-5.4' -InvocationLabel 'leaf' } |
+            Should -Throw "*expected startup-probed Copilot CLI '1.0.83'; telemetry reported '(none)'*"
+    }
+
+    It 'accepts absent OTel CLI version only for the 1.0.88 compatibility policy' {
+        $script:ObservedCopilotCliVersion = '1.0.88'
+        $script:CopilotCliCompatibility = [pscustomobject]@{
+            version = '1.0.88'
+            otel_cli_version = 'optional'
+        }
+        $metrics = [pscustomobject]@{
+            models = @('gpt-5.4')
+            usage_complete = $true
+            malformed_records = 0
+            cli_version = $null
+        }
+
+        { Assert-CopilotInvocationMetrics -Metrics $metrics -RequestedModel 'gpt-5.4' -InvocationLabel 'leaf' } |
+            Should -Not -Throw
+    }
+
+    It 'accepts a matching OTel CLI version for the 1.0.88 compatibility policy' {
+        $script:ObservedCopilotCliVersion = '1.0.88'
+        $script:CopilotCliCompatibility = [pscustomobject]@{
+            version = '1.0.88'
+            otel_cli_version = 'optional'
+        }
+        $metrics = [pscustomobject]@{
+            models = @('gpt-5.4')
+            usage_complete = $true
+            malformed_records = 0
+            cli_version = '1.0.88'
+        }
+
+        { Assert-CopilotInvocationMetrics -Metrics $metrics -RequestedModel 'gpt-5.4' -InvocationLabel 'leaf' } |
+            Should -Not -Throw
+    }
+
+    It 'rejects a mismatched OTel CLI version for the 1.0.88 compatibility policy' {
+        $script:ObservedCopilotCliVersion = '1.0.88'
+        $script:CopilotCliCompatibility = [pscustomobject]@{
+            version = '1.0.88'
+            otel_cli_version = 'optional'
+        }
+        $metrics = [pscustomobject]@{
+            models = @('gpt-5.4')
+            usage_complete = $true
+            malformed_records = 0
+            cli_version = '1.0.83'
+        }
+
+        { Assert-CopilotInvocationMetrics -Metrics $metrics -RequestedModel 'gpt-5.4' -InvocationLabel 'leaf' } |
+            Should -Throw "*expected startup-probed Copilot CLI '1.0.88'; telemetry reported '1.0.83'*"
     }
 
     It 'writes a resolved run manifest with ordered per-process telemetry' {
@@ -1563,12 +1746,67 @@ Describe 'Deterministic leaf orchestration contract' {
         $manifest.schema_version | Should -Be 1
         $manifest.status | Should -Be 'completed'
         $manifest.configuration.copilot_cli_version | Should -Be '1.0.83'
+        $manifest.configuration.PSObject.Properties.Name | Should -Be @(
+            'copilot_cli_version',
+            'root_model',
+            'leaf_model',
+            'leaf_execution',
+            'max_leaf_concurrency',
+            'cli_timeout_minutes',
+            'minimum_severity',
+            'agent_minimum_severity',
+            'review_source'
+        )
+        $manifest.configuration.PSObject.Properties.Match('requested_copilot_cli_version').Count |
+            Should -Be 0
         $manifest.configuration.root_model | Should -Be 'claude-sonnet-5'
         $manifest.configuration.leaf_execution | Should -Be 'serial'
         $manifest.bcquality.commit | Should -Be $BCQualitySha
         $manifest.plan.leaf_ids | Should -Be @('al-security-review')
         $manifest.processes[0].requested_model | Should -Be 'gpt-5.4'
         $manifest.processes[0].report_path | Should -Be 'leaf-results/01-security/_review-report.json'
+    }
+}
+
+Describe 'Copilot sub-agent delegation guard' {
+    It 'applies the guard to every leaf and root Copilot invocation' {
+        $scriptPath = Join-Path (Join-Path (Split-Path -Parent $PSScriptRoot) 'scripts') 'Invoke-CopilotPRReview.ps1'
+        $scriptAst = [System.Management.Automation.Language.Parser]::ParseFile($scriptPath, [ref]$null, [ref]$null)
+        $functions = @($scriptAst.FindAll({
+            param($node)
+            $node -is [System.Management.Automation.Language.FunctionDefinitionAst]
+        }, $true))
+
+        foreach ($name in @('Start-LeafCopilotProcess', 'Invoke-CopilotCli')) {
+            $function = $functions | Where-Object Name -eq $name
+            $function | Should -Not -BeNullOrEmpty
+            $function.Body.Extent.Text | Should -Match 'Get-CopilotSecurityArguments'
+            $function.Body.Extent.Text | Should -Not -Match '--allow-all-tools'
+            $function.Body.Extent.Text | Should -Not -Match '--excluded-tools'
+        }
+
+        $securityFunction = $functions | Where-Object Name -eq 'Get-CopilotSecurityArguments'
+        $securityFunction | Should -Not -BeNullOrEmpty
+        $securityFunction.Body.Extent.Text | Should -Match "'--available-tools', 'view,glob,grep,create'"
+        $securityFunction.Body.Extent.Text | Should -Not -Match '\btask\b'
+    }
+
+    It 'keeps delegated sub-agent chat spans without usage fail-closed' {
+        $records = @(
+            '{"type":"span","attributes":{"gen_ai.operation.name":"chat","gen_ai.request.model":"gpt-5.6-luna","gen_ai.usage.input_tokens":17551,"gen_ai.usage.output_tokens":151,"github.copilot.nano_aiu":125956000.0,"github.copilot.cost":1.0}}',
+            '{"type":"span","attributes":{"gen_ai.operation.name":"execute_tool","gen_ai.tool.name":"task"}}',
+            '{"type":"span","attributes":{"gen_ai.operation.name":"chat","gen_ai.request.model":"gpt-5.6-luna","github.copilot.interaction_id":"sub-agent"}}',
+            '{"type":"span","attributes":{"gen_ai.operation.name":"invoke_agent","gen_ai.agent.name":"security-review"}}'
+        ) | ForEach-Object { $_ | ConvertFrom-Json }
+
+        $metrics = Get-CopilotRunMetrics -Records $records
+
+        $metrics.api_calls | Should -Be 2
+        $metrics.usage_api_calls | Should -Be 1
+        $metrics.usage_complete | Should -BeFalse
+        $metrics.ai_credits | Should -BeNullOrEmpty
+        { Assert-CopilotInvocationMetrics -Metrics $metrics -RequestedModel 'gpt-5.6-luna' -InvocationLabel "Leaf 'al-security-review'" } |
+            Should -Throw "*Leaf 'al-security-review' produced incomplete Copilot usage telemetry*"
     }
 }
 
@@ -1647,17 +1885,97 @@ Describe 'Local review authentication' {
         $CopilotModel = 'claude-sonnet-5'
         $CopilotCliVersion = '1.0.83'
         $LeafModel = 'gpt-5.4'
+        $script:CopilotExecutable = $null
+        $script:ObservedCopilotCliVersion = $null
+        $script:CopilotCliCompatibility = $null
 
-        Mock Get-Command {
-            [pscustomobject]@{ Source = 'copilot' }
-        } -ParameterFilter { $Name -eq 'copilot' }
         Mock Get-Command {
             [pscustomobject]@{ Name = 'Test-Json' }
         } -ParameterFilter { $Name -eq 'Test-Json' }
+        Mock Resolve-CopilotExecutable { 'C:\tools\copilot.exe' }
+        Mock Invoke-CopilotVersionProbe {
+            @(
+                'GitHub Copilot CLI 1.0.83.',
+                "Run 'copilot update' to check for updates."
+            )
+        }
     }
 
     It 'allows local generation without GH_TOKEN' {
         { Assert-Config } | Should -Not -Throw
+    }
+
+    It 'probes the exact child executable and applies the requested pin at startup' {
+        { Assert-Config } | Should -Not -Throw
+
+        $script:CopilotExecutable | Should -Be 'C:\tools\copilot.exe'
+        $script:ObservedCopilotCliVersion | Should -Be '1.0.83'
+        $script:CopilotCliCompatibility.otel_cli_version | Should -Be 'required'
+        Should -Invoke Resolve-CopilotExecutable -Times 1 -Exactly
+        Should -Invoke Invoke-CopilotVersionProbe -Times 1 -Exactly -ParameterFilter {
+            $Executable -eq 'C:\tools\copilot.exe'
+        }
+    }
+
+    It 'accepts a numeric CLI prerelease from the verified multi-line banner' {
+        Mock Invoke-CopilotVersionProbe {
+            @(
+                'GitHub Copilot CLI 1.0.89-1.',
+                "Run 'copilot update' to check for updates."
+            )
+        }
+
+        Get-CopilotExecutableVersion -Executable 'C:\tools\copilot.exe' | Should -Be '1.0.89-1'
+    }
+
+    It 'fails during preflight before an agent process for an unsupported CLI version' {
+        $CopilotCliVersion = '1.0.89'
+        Mock Invoke-CopilotVersionProbe {
+            @(
+                'GitHub Copilot CLI 1.0.89.',
+                "Run 'copilot update' to check for updates."
+            )
+        }
+        Mock Start-LeafCopilotProcess {}
+
+        { Assert-Config } | Should -Throw "*has not been compatibility-validated*"
+        Should -Invoke Start-LeafCopilotProcess -Times 0 -Exactly
+    }
+
+    It 'fails early when the requested CLI pin differs from the startup probe' {
+        Mock Invoke-CopilotVersionProbe {
+            @(
+                'GitHub Copilot CLI 1.0.88.',
+                "Run 'copilot update' to check for updates."
+            )
+        }
+
+        { Assert-Config } |
+            Should -Throw "*COPILOT_REVIEW_CLI_VERSION '1.0.83' does not match startup-probed Copilot CLI version '1.0.88'*"
+    }
+
+    It 'fails early when the executable version output is unparseable' {
+        Mock Invoke-CopilotVersionProbe {
+            @(
+                'GitHub Copilot CLI 1.0.83',
+                "Run 'copilot update' to check for updates."
+            )
+        }
+
+        { Assert-Config } |
+            Should -Throw "*must return exactly one 'GitHub Copilot CLI <semantic-version>.' banner*"
+    }
+
+    It 'fails early when the executable version output has competing CLI banners' {
+        Mock Invoke-CopilotVersionProbe {
+            @(
+                'GitHub Copilot CLI 1.0.83.',
+                'GitHub Copilot CLI 1.0.88.'
+            )
+        }
+
+        { Get-CopilotExecutableVersion -Executable 'C:\tools\copilot.exe' } |
+            Should -Throw "*must return exactly one 'GitHub Copilot CLI <semantic-version>.' banner*"
     }
 
     It 'still requires GH_TOKEN for PR generation' {
@@ -1729,6 +2047,7 @@ Describe 'Local review authentication' {
         $source = Get-Content -LiteralPath $scriptPath -Raw
         $source | Should -Match '\$startInfo\.CreateNoWindow\s*=\s*\$true'
         $source | Should -Match 'Get-Command copilot\.exe'
+        $source | Should -Match '\$startInfo\.FileName\s*=\s*\$script:CopilotExecutable'
     }
 
     It 'does not forward inherited tokens to a local non-CI child process' {
@@ -2057,5 +2376,169 @@ Describe 'Save-ReviewArtifacts' {
         $saved.subResults.Count | Should -Be 1
         $saved.subResults[0].id | Should -Be 'al-performance-review'
         $saved.subResults[0].references[0].path | Should -Be 'microsoft/knowledge/performance/article.md'
+    }
+}
+
+Describe 'Findings-report role contracts derived from the pinned BCQuality schema' {
+    BeforeAll {
+        # The fixture is BCQuality schemas/findings-report.schema.json at the
+        # pinned ref b74967bc (identical at 130d5de6). The leaf-*.json fixtures
+        # are unmodified leaf reports from BC-Bench run 36852068369.
+        $fixtureRoot = Join-Path $PSScriptRoot 'fixtures/findings-report-roles'
+        $sharedSchema = Get-Content -LiteralPath (Join-Path $fixtureRoot 'bcquality-findings-report.b74967bc.schema.json') -Raw
+        $roleSchemas = New-FindingsReportRoleSchemas -SharedSchemaJson $sharedSchema
+        $script:FindingsReportRoleSchemas = $roleSchemas
+
+        function Test-RoleContract {
+            param([string] $Json, [string] $Schema)
+            return [bool]($Json | Test-Json -Schema $Schema -ErrorAction SilentlyContinue)
+        }
+        function New-LeafReport {
+            param([string] $Id, [string] $Outcome = 'not-applicable', [hashtable] $Extra = @{})
+            $report = [ordered]@{
+                skill = [ordered]@{ id = $Id; version = 1 }
+                outcome = $Outcome
+                summary = [ordered]@{
+                    counts = [ordered]@{ blocker = 0; major = 0; minor = 0; info = 0 }
+                    coverage = [ordered]@{ 'worklist-size' = 0; 'items-evaluated' = 0 }
+                }
+                findings = @()
+                suppressed = @()
+            }
+            foreach ($key in $Extra.Keys) { $report[$key] = $Extra[$key] }
+            return $report
+        }
+        function New-RootReport {
+            param([object[]] $SubResults, [hashtable] $Extra = @{})
+            $report = New-LeafReport -Id 'al-code-review' -Outcome 'completed'
+            $report['sub-results'] = $SubResults
+            foreach ($key in $Extra.Keys) { $report[$key] = $Extra[$key] }
+            return $report
+        }
+        $completedLeafJson = Get-Content -LiteralPath (Join-Path $fixtureRoot 'leaf-completed.security-clean-02.al-error-handling-review.json') -Raw
+    }
+
+    It 'rejects the observed malformed leaf <Name> while the shared schema accepts it' -ForEach @(
+        @{ Name = 'privacy-015.al-query-review' },
+        @{ Name = 'http-consumed-false-01.al-finance-review' },
+        @{ Name = 'privacy-015-attempt2.al-finance-review' }
+    ) {
+        $json = Get-Content -LiteralPath (Join-Path $fixtureRoot "leaf-not-applicable-root-fields.$Name.json") -Raw
+        $report = $json | ConvertFrom-Json
+
+        $report.outcome | Should -Be 'not-applicable'
+        Test-RoleContract -Json $json -Schema $sharedSchema | Should -BeTrue
+        Test-RoleContract -Json $json -Schema $roleSchemas.Leaf | Should -BeFalse
+        { Assert-LeafReportRole -ReportObject $report } |
+            Should -Throw '*super-skill-only field(s): sub-results, skipped-sub-skills*'
+    }
+
+    It 'rejects <Field> in a <Outcome> leaf even when empty' -ForEach @(
+        @{ Field = 'sub-results'; Outcome = 'not-applicable' },
+        @{ Field = 'skipped-sub-skills'; Outcome = 'not-applicable' },
+        @{ Field = 'sub-results'; Outcome = 'completed' },
+        @{ Field = 'skipped-sub-skills'; Outcome = 'completed' }
+    ) {
+        $json = New-LeafReport -Id 'al-query-review' -Outcome $Outcome -Extra @{ $Field = @() } |
+            ConvertTo-Json -Depth 20
+
+        Test-RoleContract -Json $json -Schema $sharedSchema | Should -BeTrue
+        Test-RoleContract -Json $json -Schema $roleSchemas.Leaf | Should -BeFalse
+    }
+
+    It 'keeps valid real and synthetic leaf reports valid' {
+        Test-RoleContract -Json $completedLeafJson -Schema $roleSchemas.Leaf | Should -BeTrue
+        $notApplicable = New-LeafReport -Id 'al-query-review' -Extra @{ 'outcome-reason' = 'No query objects changed.' } |
+            ConvertTo-Json -Depth 20
+        Test-RoleContract -Json $notApplicable -Schema $roleSchemas.Leaf | Should -BeTrue
+    }
+
+    It 'preserves shared constraints in the leaf contract' {
+        $failedWithoutReason = New-LeafReport -Id 'al-query-review' -Outcome 'failed' | ConvertTo-Json -Depth 20
+        $notApplicableWithFinding = ($completedLeafJson | ConvertFrom-Json -AsHashtable)
+        $notApplicableWithFinding['outcome'] = 'not-applicable'
+        $unknownField = New-LeafReport -Id 'al-query-review' -Extra @{ provenance = 'x' } | ConvertTo-Json -Depth 20
+
+        Test-RoleContract -Json $failedWithoutReason -Schema $roleSchemas.Leaf | Should -BeFalse
+        Test-RoleContract -Json ($notApplicableWithFinding | ConvertTo-Json -Depth 20) -Schema $roleSchemas.Leaf | Should -BeFalse
+        Test-RoleContract -Json $unknownField -Schema $roleSchemas.Leaf | Should -BeFalse
+    }
+
+    It 'accepts root-only fields at the root with valid leaf sub-results' {
+        $root = New-RootReport -SubResults @(
+            ($completedLeafJson | ConvertFrom-Json -AsHashtable),
+            (New-LeafReport -Id 'al-query-review'),
+            (New-LeafReport -Id 'al-finance-review' -Outcome 'failed' -Extra @{ 'outcome-reason' = 'Leaf report was unusable.' })
+        ) -Extra @{ 'skipped-sub-skills' = @(@{ skill = @{ id = 'al-testing-review'; version = 1 }; reason = 'configuration' }) }
+        $json = $root | ConvertTo-Json -Depth 20
+
+        Test-RoleContract -Json $json -Schema $roleSchemas.Root | Should -BeTrue
+    }
+
+    It 'does not require root-only fields in nested leaves' {
+        $json = New-RootReport -SubResults @(New-LeafReport -Id 'al-query-review') | ConvertTo-Json -Depth 20
+
+        Test-RoleContract -Json $json -Schema $roleSchemas.Root | Should -BeTrue
+    }
+
+    It 'requires sub-results at the root' {
+        $json = New-LeafReport -Id 'al-code-review' -Outcome 'completed' | ConvertTo-Json -Depth 20
+
+        Test-RoleContract -Json $json -Schema $sharedSchema | Should -BeTrue
+        Test-RoleContract -Json $json -Schema $roleSchemas.Root | Should -BeFalse
+    }
+
+    It 'rejects an observed malformed leaf nested in a root report' {
+        $nested = Get-Content -LiteralPath (Join-Path $fixtureRoot 'leaf-not-applicable-root-fields.privacy-015.al-query-review.json') -Raw |
+            ConvertFrom-Json -AsHashtable
+        $json = New-RootReport -SubResults @($nested) | ConvertTo-Json -Depth 20
+
+        Test-RoleContract -Json $json -Schema $sharedSchema | Should -BeTrue
+        Test-RoleContract -Json $json -Schema $roleSchemas.Root | Should -BeFalse
+    }
+
+    It 'still validates nested leaf content against shared definitions' {
+        $badLeaf = New-LeafReport -Id 'al-query-review' -Outcome 'failed'
+        $json = New-RootReport -SubResults @($badLeaf) | ConvertTo-Json -Depth 20
+
+        Test-RoleContract -Json $json -Schema $roleSchemas.Root | Should -BeFalse
+    }
+
+    It 'accepts the local not-applicable root shape written without leaf execution' {
+        $json = New-RootReport -SubResults @() -Extra @{ outcome = 'not-applicable'; 'skipped-sub-skills' = @() } |
+            ConvertTo-Json -Depth 20
+
+        Test-RoleContract -Json $json -Schema $roleSchemas.Root | Should -BeTrue
+    }
+
+    It 'derives the leaf contract by removal only and identifies its source' {
+        $shared = $sharedSchema | ConvertFrom-Json -AsHashtable
+        $leaf = $roleSchemas.Leaf | ConvertFrom-Json -AsHashtable
+        $root = $roleSchemas.Root | ConvertFrom-Json -AsHashtable
+
+        $leaf.properties.Keys | Sort-Object |
+            Should -Be (@($shared.properties.Keys | Where-Object { $_ -notin 'sub-results', 'skipped-sub-skills' }) | Sort-Object)
+        $leaf.required | Should -Be $shared.required
+        $leaf.additionalProperties | Should -BeFalse
+        $leaf['$comment'] | Should -Match ([regex]::Escape([string]$shared['$id']))
+        $root.required | Should -Contain 'sub-results'
+        $root.properties['sub-results'].items['$ref'] | Should -Be '#/definitions/leafReport'
+        $root.definitions.leafReport.properties.Keys | Sort-Object | Should -Be ($leaf.properties.Keys | Sort-Object)
+    }
+
+    It 'fails closed when the shared schema <Name>' -ForEach @(
+        @{ Name = 'allows additional properties'; Mutate = { param($s) $s.Remove('additionalProperties') } },
+        @{ Name = 'drops sub-results'; Mutate = { param($s) $s.properties.Remove('sub-results') } },
+        @{ Name = 'drops skipped-sub-skills'; Mutate = { param($s) $s.properties.Remove('skipped-sub-skills') } },
+        @{ Name = 'stops recursing sub-results'; Mutate = { param($s) $s.properties['sub-results'].items = @{ '$ref' = '#/definitions/finding' } } },
+        @{ Name = 'requires sub-results'; Mutate = { param($s) $s.required = @($s.required) + 'sub-results' } },
+        @{ Name = 'already defines leafReport'; Mutate = { param($s) $s.definitions['leafReport'] = @{} } },
+        @{ Name = 'references a root-only field elsewhere'; Mutate = { param($s) $s.definitions.finding.properties['sub-results'] = @{ type = 'array' } } }
+    ) {
+        $shared = $sharedSchema | ConvertFrom-Json -AsHashtable
+        & $Mutate $shared
+
+        { New-FindingsReportRoleSchemas -SharedSchemaJson ($shared | ConvertTo-Json -Depth 100) } |
+            Should -Throw '*Cannot derive role-specific findings-report schemas*'
     }
 }

@@ -22,6 +22,7 @@ Consumer repo (policy)  ──uses──▶  this engine (mechanism)  ──clon
 | `agents/ALReviewAgent/scripts/Get-BCQualityConfig.ps1` | Loads `bcquality.config.yaml` and applies environment-variable overrides. |
 | `agents/ALReviewAgent/scripts/Invoke-BCQualityFilter.ps1` | Prunes a BCQuality clone on disk per the resolved allow/deny/layers policy. |
 | `agents/ALReviewAgent/bcquality.config.yaml` | Default policy baseline. Consumers point at their own copy instead. |
+| `agents/ALReviewAgent/copilot-cli-compatibility.psd1` | Exact Copilot CLI releases the engine has compatibility-validated, including their OTel CLI-version behavior. |
 | `.github/workflows/review.yml` | Reusable (`workflow_call`) workflow that wires the whole thing together. |
 | `Online Evals/` | Pull-based scoring pipeline for evaluating review quality. |
 
@@ -123,7 +124,27 @@ Deterministic leaf execution requires BCQuality commit
 `b74967bc5b7a454eae19d6a1250199afd869f064` or a newer ref. This is the merge
 commit for [BCQuality#182](https://github.com/microsoft/BCQuality/pull/182),
 which introduced the findings-report and skill-index schemas used by the
-orchestrator. A leaf that produces malformed or schema-invalid JSON is recorded
+orchestrator. BCQuality ships one findings-report schema for both roles, so
+`sub-results` and `skipped-sub-skills` are optional there and nested
+`sub-results` recurse into the whole report. Before running leaves, the
+orchestrator derives two role contracts from that pinned schema, writes them as
+`_review-findings-report.leaf.schema.json` and
+`_review-findings-report.root.schema.json`, and points each process at its own
+contract:
+
+- The **leaf** contract removes the super-skill-only `sub-results` and
+  `skipped-sub-skills` properties. The shared `additionalProperties: false`
+  then rejects them, even as empty arrays.
+- The **root** contract requires `sub-results` and validates each entry
+  against the embedded leaf contract instead of recursing into the root
+  contract.
+
+Both are mechanical transforms of the pinned schema, not copies. If a BCQuality
+schema change removes the shape the transforms depend on, the run fails closed.
+The engine validates reports against its in-memory copies, not the files that
+review processes can write. It never strips or rewrites role-violating fields,
+and a separate role assertion still names any super-skill-only field found in a
+leaf or nested sub-result. A leaf that produces malformed or schema-invalid JSON is recorded
 as failed and the remaining leaves continue; model-substitution and telemetry
 integrity failures remain fail-closed. `_run-manifest.json` records leaf and
 consolidated-report coverage with a top-level `partial` status when any usable
@@ -198,6 +219,39 @@ In the reusable two-job workflow, `BCQUALITY_ROOT` is required only by the
 checkout-free `post` phase as `BCQUALITY_SHA`; post requires that value and
 publishes only the generated artifact.
 
+### Copilot CLI compatibility
+
+The reusable workflow installs the exact `copilot_cli_version` input (default:
+`1.0.88`), never `latest`. Direct callers must continue to set
+`COPILOT_REVIEW_CLI_VERSION` explicitly. Before any model process starts, the
+engine resolves the same executable used for leaf and root processes, runs
+`copilot --version`, and extracts a strict semantic version from exactly one
+official `GitHub Copilot CLI <version>.` banner. The requested pin must exactly
+equal that startup probe and must have an explicit entry in
+[`copilot-cli-compatibility.psd1`](agents/ALReviewAgent/copilot-cli-compatibility.psd1).
+
+| Exact startup version | OTel `cli_version` contract |
+| --- | --- |
+| `1.0.83` | Required and must exactly equal the startup probe. |
+| `1.0.88` | May be absent; when present, it must exactly equal the startup probe. |
+| Any other version | Rejected before model invocation as not compatibility-validated. |
+
+Model identity, complete token usage, valid telemetry records, and each
+process's requested-model contract remain strict for every supported release.
+`_run-manifest.json` remains schema version `1`:
+`configuration.copilot_cli_version` is the startup-probed authoritative runtime
+version. The caller/workflow pin is validated as exactly equal to that value
+before any model process starts, so the existing v1 manifest shape needs no
+second requested-version property.
+
+To adopt a new CLI release, run the candidate exact version in a
+non-production compatibility canary; verify the executable probe and root/leaf
+model, usage, and telemetry contracts; then add an exact policy entry with its
+tested OTel behavior. Only after that change is reviewed and released should
+the reusable-workflow default be bumped. Production callers must remain pinned
+to a released engine SHA and an exact validated CLI version; no scheduled
+workflow moves either pin automatically.
+
 Each generate/all run also writes `_run-metrics.json` to `REVIEW_OUTPUT_DIR`.
 Schema version `1` has one 18-field shape and two `metrics_source` values:
 `copilot-cli-otel` for executed reviews and `not-applicable` when the local
@@ -215,6 +269,10 @@ the provider does not expose them. `ai_credits` is the exact sum of
 exact sum of the legacy premium-request multiplier in `github.copilot.cost`;
 either total is null unless every counted span exposes its source attribute.
 `usage_complete` is false when any counted request lacks input/output usage.
+Copilot CLI sub-agents launched through the `task` tool emit `chat` spans
+without usage attributes, so every leaf and root review process runs with
+`--excluded-tools task`; delegation would otherwise leave usage incomplete and
+fail the review closed.
 Invalid JSON lines and `chat` spans with invalid numeric/status attributes are
 ignored independently and counted in `malformed_records`.
 

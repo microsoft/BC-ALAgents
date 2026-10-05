@@ -55,7 +55,7 @@
         "review_source"
       ],
       "properties": {
-        "copilot_cli_version": { "type": "string", "pattern": "^\\d+\\.\\d+\\.\\d+(?:-\\d+)?$" },
+        "copilot_cli_version": { "type": "string", "pattern": "^(?:0|[1-9]\\d*)\\.(?:0|[1-9]\\d*)\\.(?:0|[1-9]\\d*)(?:-(?:0|[1-9]\\d*))?$" },
         "root_model": { "type": "string", "minLength": 1 },
         "leaf_model": { "type": "string", "minLength": 1 },
         "leaf_execution": { "enum": ["serial", "parallel"] },
