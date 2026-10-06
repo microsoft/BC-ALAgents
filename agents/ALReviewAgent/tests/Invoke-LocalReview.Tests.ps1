@@ -174,9 +174,10 @@ Describe 'Hidden local Windows review execution' {
         $localScriptPath = Join-Path (Join-Path (Split-Path -Parent $PSScriptRoot) 'scripts') 'Invoke-LocalReview.ps1'
         $localSource = Get-Content -LiteralPath $localScriptPath -Raw
 
-        $source | Should -Match "'--available-tools', 'view,glob,grep,create'"
-        $source | Should -Match "'--deny-tool', 'shell\(\*\)'"
-        $source | Should -Match "'--deny-tool', 'url\(\*\)'"
+        $source | Should -Match "'--available-tools', 'view', 'glob', 'rg', 'apply_patch'"
+        $source | Should -Match "'--deny-tool', 'shell'"
+        $source | Should -Match "'--deny-tool', 'url'"
+        $source | Should -Not -Match 'write\([^)]*/\*\*\)'
         $source | Should -Not -Match "'--allow-all-paths'"
         $source | Should -Not -Match "'--allow-all-tools'"
         $localSource | Should -Not -Match "COPILOT_ALLOW_ALL_PATHS\s*=\s*'true'"

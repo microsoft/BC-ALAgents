@@ -184,9 +184,10 @@ $ReviewApplyTo    = $env:REVIEW_APPLY_TO ?? '**'
 # Used by local wrappers to review a subfolder without shadowing the diff at
 # post-processing time. Empty = review the full diff.
 $ReviewPathSpec   = ($env:REVIEW_PATH_SPEC ?? '').Trim()
-$ReviewOutputDir  = $env:REVIEW_OUTPUT_DIR ?? (Join-Path ([IO.Path]::GetTempPath()) (
+$ReviewOutputDirRaw = $env:REVIEW_OUTPUT_DIR ?? (Join-Path ([IO.Path]::GetTempPath()) (
     'bc-review-output-{0}' -f [guid]::NewGuid().ToString('N')
 ))
+$ReviewOutputDir  = [IO.Path]::GetFullPath($ReviewOutputDirRaw)
 $BaseBranch       = $env:BASE_BRANCH ?? 'main'
 $AgentLabelRaw    = ($env:COPILOT_REVIEW_AGENT_LABEL ?? '').Trim()
 $AgentSemVerRaw   = ($env:COPILOT_REVIEW_AGENT_VERSION ?? '').Trim()
@@ -723,6 +724,90 @@ function Invoke-GitCommand {
     return $output
 }
 
+function New-GitProcess {
+    param([Parameter(Mandatory)][string[]] $Arguments)
+
+    $startInfo = [System.Diagnostics.ProcessStartInfo]::new()
+    $startInfo.FileName = 'git'
+    $startInfo.UseShellExecute = $false
+    $startInfo.CreateNoWindow = $true
+    $startInfo.RedirectStandardInput = $true
+    $startInfo.RedirectStandardOutput = $true
+    $startInfo.RedirectStandardError = $true
+    foreach ($argument in $Arguments) {
+        $startInfo.ArgumentList.Add($argument)
+    }
+
+    $process = [System.Diagnostics.Process]::new()
+    $process.StartInfo = $startInfo
+    if (-not $process.Start()) {
+        $process.Dispose()
+        throw "Failed to start git $($Arguments -join ' ')."
+    }
+    return $process
+}
+
+function Invoke-GitCommandBytes {
+    param([Parameter(Mandatory)][string[]] $Arguments)
+
+    $process = New-GitProcess -Arguments $Arguments
+    try {
+        $process.StandardInput.Close()
+        $errorTask = $process.StandardError.ReadToEndAsync()
+        $output = [IO.MemoryStream]::new()
+        try {
+            $process.StandardOutput.BaseStream.CopyTo($output)
+            $process.WaitForExit()
+            $details = $errorTask.GetAwaiter().GetResult()
+            if ($process.ExitCode -ne 0) {
+                throw "git command failed (exit $($process.ExitCode)): git $($Arguments -join ' ')`n$details"
+            }
+            return ,$output.ToArray()
+        }
+        finally {
+            $output.Dispose()
+        }
+    }
+    finally {
+        $process.Dispose()
+    }
+}
+
+function Read-GitProtocolLine {
+    param([Parameter(Mandatory)][IO.Stream] $Stream)
+
+    $bytes = [System.Collections.Generic.List[byte]]::new()
+    while ($true) {
+        $value = $Stream.ReadByte()
+        if ($value -lt 0) {
+            throw 'Unexpected end of output from git cat-file.'
+        }
+        if ($value -eq 10) {
+            return [Text.Encoding]::ASCII.GetString($bytes.ToArray())
+        }
+        $bytes.Add([byte]$value)
+    }
+}
+
+function Copy-StreamBytes {
+    param(
+        [Parameter(Mandatory)][IO.Stream] $InputStream,
+        [Parameter(Mandatory)][IO.Stream] $OutputStream,
+        [Parameter(Mandatory)][long] $Count
+    )
+
+    $buffer = [byte[]]::new(81920)
+    $remaining = $Count
+    while ($remaining -gt 0) {
+        $read = $InputStream.Read($buffer, 0, [Math]::Min($buffer.Length, $remaining))
+        if ($read -le 0) {
+            throw "Unexpected end of git blob after $($Count - $remaining) of $Count bytes."
+        }
+        $OutputStream.Write($buffer, 0, $read)
+        $remaining -= $read
+    }
+}
+
 # Runs a git command with an ephemeral, host-scoped credential so that fetches
 # against a PRIVATE target repo succeed. The workflow checks out the target with
 # persist-credentials:false (no token in .git/config, where an injected Copilot
@@ -779,18 +864,106 @@ function New-ReviewDataProjection {
     }
     New-Item -ItemType Directory -Path $ReviewDataRoot -Force | Out-Null
 
-    $archivePath = Join-Path ([System.IO.Path]::GetTempPath()) (
-        'bc-al-review-data-{0}.zip' -f [guid]::NewGuid().ToString('N')
+    # Read blobs directly from Git's object database. Unlike git archive or a
+    # checkout, cat-file does not honor PR-controlled attributes such as
+    # export-ignore, export-subst, or content filters.
+    $listingBytes = Invoke-GitCommandBytes -Arguments @(
+        '-C', $AnalysisWorkspace, 'ls-tree', '-r', '-z', '--full-tree', 'HEAD'
     )
-    try {
-        $null = Invoke-GitCommand -Arguments @(
-            '-C', $AnalysisWorkspace, 'archive', '--format=zip',
-            "--output=$archivePath", 'HEAD'
-        )
-        Expand-Archive -LiteralPath $archivePath -DestinationPath $ReviewDataRoot -Force
+    $entries = [Text.Encoding]::UTF8.GetString($listingBytes).Split(
+        [char]0,
+        [StringSplitOptions]::RemoveEmptyEntries
+    )
+    $blobEntries = [System.Collections.Generic.List[object]]::new()
+    $projectionRoot = [IO.Path]::GetFullPath($ReviewDataRoot).TrimEnd(
+        [IO.Path]::DirectorySeparatorChar,
+        [IO.Path]::AltDirectorySeparatorChar
+    )
+    $projectionPrefix = $projectionRoot + [IO.Path]::DirectorySeparatorChar
+    $pathComparison = if ($IsWindows) {
+        [StringComparison]::OrdinalIgnoreCase
+    } else {
+        [StringComparison]::Ordinal
     }
-    finally {
-        Remove-Item -LiteralPath $archivePath -Force -ErrorAction SilentlyContinue
+
+    foreach ($entry in $entries) {
+        $tabIndex = $entry.IndexOf("`t", [StringComparison]::Ordinal)
+        if ($tabIndex -lt 0) {
+            throw "Unexpected git ls-tree entry: '$entry'."
+        }
+        $metadata = $entry.Substring(0, $tabIndex).Split(' ')
+        if ($metadata.Count -ne 3) {
+            throw "Unexpected git ls-tree metadata: '$($entry.Substring(0, $tabIndex))'."
+        }
+        if ($metadata[1] -ne 'blob') {
+            continue
+        }
+
+        $relativePath = $entry.Substring($tabIndex + 1)
+        $destination = [IO.Path]::GetFullPath(
+            (Join-Path $projectionRoot ($relativePath -replace '/', [IO.Path]::DirectorySeparatorChar))
+        )
+        if (-not $destination.StartsWith($projectionPrefix, $pathComparison)) {
+            throw "Refusing to project Git path outside the review data root: '$relativePath'."
+        }
+        $blobEntries.Add([pscustomobject]@{
+            ObjectId = $metadata[2]
+            Path = $destination
+        })
+    }
+
+    if ($blobEntries.Count -gt 0) {
+        $process = New-GitProcess -Arguments @('-C', $AnalysisWorkspace, 'cat-file', '--batch')
+        try {
+            $errorTask = $process.StandardError.ReadToEndAsync()
+            foreach ($blob in $blobEntries) {
+                $process.StandardInput.WriteLine($blob.ObjectId)
+                $process.StandardInput.Flush()
+
+                $header = Read-GitProtocolLine -Stream $process.StandardOutput.BaseStream
+                if ($header -notmatch '\A(?<oid>[0-9a-f]+) blob (?<size>\d+)\z' -or
+                    $Matches.oid -ne $blob.ObjectId) {
+                    throw "Unexpected git cat-file response for '$($blob.ObjectId)': '$header'."
+                }
+
+                $parent = Split-Path -Parent $blob.Path
+                if (-not (Test-Path -LiteralPath $parent)) {
+                    New-Item -ItemType Directory -Path $parent -Force | Out-Null
+                }
+                $output = [IO.File]::Open(
+                    $blob.Path,
+                    [IO.FileMode]::CreateNew,
+                    [IO.FileAccess]::Write,
+                    [IO.FileShare]::None
+                )
+                try {
+                    Copy-StreamBytes `
+                        -InputStream $process.StandardOutput.BaseStream `
+                        -OutputStream $output `
+                        -Count ([long]$Matches.size)
+                }
+                finally {
+                    $output.Dispose()
+                }
+                if ($process.StandardOutput.BaseStream.ReadByte() -ne 10) {
+                    throw "Missing delimiter after Git blob '$($blob.ObjectId)'."
+                }
+            }
+
+            $process.StandardInput.Close()
+            $process.WaitForExit()
+            $details = $errorTask.GetAwaiter().GetResult()
+            if ($process.ExitCode -ne 0) {
+                throw "git cat-file failed (exit $($process.ExitCode)):`n$details"
+            }
+        }
+        finally {
+            if (-not $process.HasExited) {
+                $process.Kill($true)
+                $process.WaitForExit()
+            }
+            $process.Dispose()
+        }
     }
 
     $trustedConfigurationPaths = @(
@@ -821,22 +994,18 @@ function Save-ReviewDiff {
 }
 
 function Get-CopilotSecurityArguments {
-    param([Parameter(Mandatory)][string] $WritableRoot)
+    param([Parameter(Mandatory)][string] $WritablePath)
 
-    $writable = (($WritableRoot -replace '\\', '/').TrimEnd('/'))
-    $reviewData = (($ReviewDataRoot -replace '\\', '/').TrimEnd('/'))
-    $bcquality = (($BCQualityRoot -replace '\\', '/').TrimEnd('/'))
+    $writable = ($WritablePath -replace '\\', '/')
     return @(
-        '--available-tools', 'view,glob,grep,create',
+        '--available-tools', 'view', 'glob', 'rg', 'apply_patch',
         '--disallow-temp-dir',
         '--allow-tool', 'view',
         '--allow-tool', 'glob',
-        '--allow-tool', 'grep',
-        '--allow-tool', "write($writable/**)",
-        '--deny-tool', 'shell(*)',
-        '--deny-tool', 'url(*)',
-        '--deny-tool', "write($reviewData/**)",
-        '--deny-tool', "write($bcquality/**)",
+        '--allow-tool', 'rg',
+        '--allow-tool', "write($writable)",
+        '--deny-tool', 'shell',
+        '--deny-tool', 'url',
         '--secret-env-vars', 'GH_TOKEN,GITHUB_TOKEN,COPILOT_GITHUB_TOKEN'
     )
 }
@@ -2047,7 +2216,9 @@ function Start-LeafCopilotProcess {
         '-p', $Prompt,
         "--model=$LeafModel"
     )
-    $copilotArgs = @(Get-CopilotSecurityArguments -WritableRoot $WorkDir) + $copilotArgs
+    $copilotArgs = @(
+        Get-CopilotSecurityArguments -WritablePath (Join-Path $WorkDir $ReportFileName)
+    ) + $copilotArgs
     if (Test-GitHubEnterpriseHost -ServerUrl $GitHubServerUrl) {
         $copilotArgs = @('--host', $GitHubServerUrl) + $copilotArgs
     }
@@ -2653,7 +2824,9 @@ function Invoke-CopilotCli {
         '--add-dir', $ReviewOutputDir,
         '-p', $Prompt
     )
-    $copilotArgs = @(Get-CopilotSecurityArguments -WritableRoot $AgentWorkDir) + $copilotArgs
+    $copilotArgs = @(
+        Get-CopilotSecurityArguments -WritablePath (Join-Path $AgentWorkDir $ReportFileName)
+    ) + $copilotArgs
     # On GitHub Enterprise the CLI must be pointed at the host that issued the
     # token; github.com stays the CLI default and gets no flag.
     if (Test-GitHubEnterpriseHost -ServerUrl $GitHubServerUrl) {

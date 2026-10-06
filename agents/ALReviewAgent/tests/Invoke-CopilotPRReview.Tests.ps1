@@ -1787,7 +1787,7 @@ Describe 'Copilot sub-agent delegation guard' {
 
         $securityFunction = $functions | Where-Object Name -eq 'Get-CopilotSecurityArguments'
         $securityFunction | Should -Not -BeNullOrEmpty
-        $securityFunction.Body.Extent.Text | Should -Match "'--available-tools', 'view,glob,grep,create'"
+        $securityFunction.Body.Extent.Text | Should -Match "'--available-tools', 'view', 'glob', 'rg', 'apply_patch'"
         $securityFunction.Body.Extent.Text | Should -Not -Match '\btask\b'
     }
 
@@ -2108,20 +2108,16 @@ Describe 'Local review authentication' {
     }
 
     It 'constrains reviewer tools and token propagation for every platform' {
-        $ReviewDataRoot = 'C:\review-data'
-        $BCQualityRoot = 'C:\bcquality'
-
-        $arguments = @(Get-CopilotSecurityArguments -WritableRoot 'C:\review-output\leaf')
+        $arguments = @(Get-CopilotSecurityArguments -WritablePath 'C:\review-output\leaf\_review-report.json')
         $joined = $arguments -join ' '
 
-        $joined | Should -Match '--available-tools view,glob,grep,create'
+        $joined | Should -Match '--available-tools view glob rg apply_patch'
         $joined | Should -Match '--disallow-temp-dir'
-        $joined | Should -Match '--allow-tool write\(C:/review-output/leaf/\*\*\)'
-        $joined | Should -Match '--deny-tool shell\(\*\)'
-        $joined | Should -Match '--deny-tool url\(\*\)'
-        $joined | Should -Match '--deny-tool write\(C:/review-data/\*\*\)'
-        $joined | Should -Match '--deny-tool write\(C:/bcquality/\*\*\)'
+        $joined | Should -Match '--allow-tool write\(C:/review-output/leaf/_review-report\.json\)'
+        $joined | Should -Match '--deny-tool shell'
+        $joined | Should -Match '--deny-tool url'
         $joined | Should -Match '--secret-env-vars GH_TOKEN,GITHUB_TOKEN,COPILOT_GITHUB_TOKEN'
+        $joined | Should -Not -Match '/\*\*'
         $joined | Should -Not -Match 'allow-all-paths'
         $joined | Should -Not -Match 'allow-all-tools'
     }
@@ -2175,6 +2171,48 @@ Describe 'Sanitized review data projection' {
         Test-Path -LiteralPath (Join-Path $ReviewDataRoot '.agents/skills') | Should -BeFalse
         Test-Path -LiteralPath (Join-Path $ReviewDataRoot 'AGENTS.md') | Should -BeFalse
         Test-Path -LiteralPath (Join-Path $AnalysisWorkspace '.github/skills/hostile/SKILL.md') | Should -BeTrue
+    }
+
+    It 'does not let export-ignore omit reviewed files' {
+        Set-Content -LiteralPath (Join-Path $AnalysisWorkspace '.gitattributes') `
+            -Value 'src/code.al export-ignore'
+        & git -C $AnalysisWorkspace add .gitattributes
+        & git -C $AnalysisWorkspace commit -qm 'add hostile export-ignore'
+
+        New-ReviewDataProjection
+
+        $committedContent = [Text.Encoding]::UTF8.GetString(
+            (Invoke-GitCommandBytes -Arguments @(
+                '-C', $AnalysisWorkspace, 'cat-file', 'blob', 'HEAD:src/code.al'
+            ))
+        )
+        Get-Content -LiteralPath (Join-Path $ReviewDataRoot 'src/code.al') -Raw |
+            Should -BeExactly $committedContent
+    }
+
+    It 'does not let export-subst mutate reviewed files' {
+        $substitutionMarker = '$Format:%H$'
+        Set-Content -LiteralPath (Join-Path $AnalysisWorkspace 'src/substituted.txt') `
+            -Value $substitutionMarker -NoNewline
+        Set-Content -LiteralPath (Join-Path $AnalysisWorkspace '.gitattributes') `
+            -Value 'src/substituted.txt export-subst'
+        & git -C $AnalysisWorkspace add .gitattributes src/substituted.txt
+        & git -C $AnalysisWorkspace commit -qm 'add hostile export-subst'
+
+        New-ReviewDataProjection
+
+        Get-Content -LiteralPath (Join-Path $ReviewDataRoot 'src/substituted.txt') -Raw |
+            Should -BeExactly $substitutionMarker
+    }
+}
+
+Describe 'Review output path isolation' {
+    It 'canonicalizes REVIEW_OUTPUT_DIR before deriving the Copilot working directory' {
+        $source = Get-Content -LiteralPath $scriptPath -Raw
+
+        $source | Should -Match '\$ReviewOutputDir\s*=\s*\[IO\.Path\]::GetFullPath\(\$ReviewOutputDirRaw\)'
+        $source.IndexOf('$ReviewOutputDir  = [IO.Path]::GetFullPath($ReviewOutputDirRaw)') |
+            Should -BeLessThan $source.IndexOf('$AgentWorkDir = $ReviewOutputDir')
     }
 }
 
