@@ -2,7 +2,10 @@
 
 An open-source, forkable engine that runs a tool-enabled GitHub Copilot CLI
 review over the diff of a Business Central (AL) pull request and posts
-structured findings as inline PR comments.
+structured findings as inline PR comments. Inline findings are submitted as a
+single pull request review, so a PR author gets one notification per run rather
+than one per finding; if GitHub rejects the batched review the engine falls back
+to posting the comments individually.
 
 The engine is **mechanism only**. All review *knowledge* — the skills that
 decide what to look for and how to report it — lives in

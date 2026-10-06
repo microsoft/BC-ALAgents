@@ -2510,3 +2510,59 @@ Describe 'Findings-report role contracts derived from the pinned BCQuality schem
             Should -Throw '*Cannot derive role-specific findings-report schemas*'
     }
 }
+
+Describe 'Submit-ReviewBatch' {
+    BeforeEach {
+        $script:PrNumber = 7
+        $script:PrHeadSha = 'abc123'
+        $script:CommentDelay = 0
+        $script:batch = [System.Collections.Generic.List[object]]::new()
+        $script:batch.Add([pscustomobject]@{ body = 'one'; path = 'a.al'; line = 10; side = 'RIGHT'; startLine = 0; startSide = '' })
+        $script:batch.Add([pscustomobject]@{ body = 'two'; path = 'b.al'; line = 20; side = 'RIGHT'; startLine = 18; startSide = 'RIGHT' })
+        Mock Add-CommentNotice { "$Body $Notice" }
+    }
+
+    It 'does nothing for an empty batch' {
+        Mock Invoke-GitHubApi {}
+        $result = Submit-ReviewBatch -Batch ([System.Collections.Generic.List[object]]::new())
+        $result.batched | Should -Be 0
+        Should -Invoke Invoke-GitHubApi -Times 0
+    }
+
+    It 'submits all comments as one COMMENT review' {
+        Mock Invoke-GitHubApi {}
+        Mock New-ReviewComment {}
+        $result = Submit-ReviewBatch -Batch $script:batch
+
+        $result.batched | Should -Be 2
+        Should -Invoke Invoke-GitHubApi -Times 1 -Exactly -ParameterFilter {
+            $Method -eq 'POST' -and $Endpoint -eq '/pulls/7/reviews' -and
+            $Body.event -eq 'COMMENT' -and $Body.commit_id -eq 'abc123' -and
+            @($Body.comments).Count -eq 2 -and
+            -not $Body.comments[0].ContainsKey('start_line') -and
+            $Body.comments[1].start_line -eq 18 -and $Body.comments[1].start_side -eq 'RIGHT'
+        }
+        Should -Invoke New-ReviewComment -Times 0
+    }
+
+    It 'falls back to individual comments when the review is rejected' {
+        Mock Invoke-GitHubApi { throw '422 Unprocessable' }
+        Mock New-ReviewComment {}
+        $result = Submit-ReviewBatch -Batch $script:batch
+
+        $result.batched | Should -Be 0
+        $result.individual | Should -Be 2
+        Should -Invoke New-ReviewComment -Times 2 -Exactly
+    }
+
+    It 'posts an issue comment when an individual comment also fails' {
+        Mock Invoke-GitHubApi { throw '422 Unprocessable' }
+        Mock New-ReviewComment { if ($Path -eq 'b.al') { throw 'bad anchor' } }
+        Mock New-IssueComment {}
+        $result = Submit-ReviewBatch -Batch $script:batch
+
+        $result.individual | Should -Be 1
+        $result.fallback | Should -Be 1
+        Should -Invoke New-IssueComment -Times 1 -Exactly
+    }
+}
