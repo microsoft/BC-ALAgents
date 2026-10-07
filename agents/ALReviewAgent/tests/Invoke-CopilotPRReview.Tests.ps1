@@ -884,6 +884,9 @@ Describe 'Deterministic leaf orchestration contract' {
         $CopilotCliVersion = '1.0.83'
         $CopilotModel = 'claude-sonnet-5'
         $LeafModel = 'gpt-5.4'
+        $CopilotLogLevel = 'info'
+        $GitHubServerUrl = 'https://github.com'
+        $script:CopilotExecutable = 'C:\tools\copilot.exe'
         $LeafExecution = 'serial'
         $MaxLeafConcurrency = 4
         $CopilotCliTimeoutMinutes = 30
@@ -925,7 +928,7 @@ Describe 'Deterministic leaf orchestration contract' {
     "outcome": { "type": "string" },
     "outcome-reason": { "type": "string" },
     "summary": { "type": "object" },
-    "findings": { "type": "array" },
+    "findings": { "type": "array", "items": { "$ref": "#/definitions/finding" } },
     "references": { "type": "array" },
     "suppressed": {
       "type": "array",
@@ -937,13 +940,32 @@ Describe 'Deterministic leaf orchestration contract' {
     },
     "sub-results": { "type": "array", "items": { "$ref": "#" } },
     "skipped-sub-skills": { "type": "array" }
+  },
+  "definitions": {
+    "finding": { "type": "object", "properties": { "location": { "$ref": "#/definitions/location" } } },
+    "location": {
+      "type": "object",
+      "required": ["file", "line"],
+      "properties": {
+        "file": { "type": "string" },
+        "line": { "type": "integer", "minimum": 1 },
+        "range": {
+          "type": "object",
+          "required": ["start-line", "end-line"],
+          "properties": {
+            "start-line": { "type": "integer", "minimum": 1 },
+            "end-line": { "type": "integer", "minimum": 1 }
+          }
+        }
+      }
+    }
   }
 }
 '@ | Set-Content -LiteralPath (Join-Path $BCQualityRoot 'schemas/findings-report.schema.json')
         $LeafReportSchemaFileName = '_review-findings-report.leaf.schema.json'
         $RootReportSchemaFileName = '_review-findings-report.root.schema.json'
-        Initialize-FindingsReportRoleSchemas
         Initialize-FindingsConsumerContext -SourcePaths @()
+        Initialize-FindingsReportRoleSchemas
         Set-Content -LiteralPath (Join-Path $BCQualityRoot 'microsoft/skills/review/al-security-review.md') -Value '# security'
         Set-Content -LiteralPath (Join-Path $BCQualityRoot 'microsoft/skills/review/al-style-review.md') -Value '# style'
 
@@ -1653,6 +1675,7 @@ Describe 'Deterministic leaf orchestration contract' {
         @{ Stage = 'JSON'; Payload = "{`r`ninvalid"; Valid = $false },
         @{ Stage = 'role'; Payload = '{"skill":{"id":"al-security-review"},"findings":[],"suppressed":[],"sub-results":[]}'; Valid = $false },
         @{ Stage = 'schema'; Payload = '{"skill":{"id":"al-security-review"},"findings":[],"suppressed":[{}]}'; Valid = $false },
+        @{ Stage = 'source bounds'; Payload = '{"skill":{"id":"al-security-review"},"findings":[{"id":"agent:test","references":[],"confidence":"medium","severity":"minor","location":{"file":"src/Unknown.al","line":58}}],"suppressed":[]}'; Valid = $false },
         @{ Stage = 'consumer'; Payload = '{"skill":{"id":"al-security-review"},"findings":[{"id":"agent:test","references":[],"confidence":"high","severity":"minor"}],"suppressed":[]}'; Valid = $false },
         @{ Stage = 'accepted'; Payload = '{"skill":{"id":"al-security-review"},"findings":[],"suppressed":[]}'; Valid = $true }
     ) {
@@ -1926,7 +1949,7 @@ Describe 'Copilot sub-agent delegation guard' {
             $node -is [System.Management.Automation.Language.FunctionDefinitionAst]
         }, $true))
 
-        foreach ($name in @('Start-LeafCopilotProcess', 'Invoke-CopilotCli')) {
+        foreach ($name in @('Get-LeafCopilotArguments', 'Invoke-CopilotCli')) {
             $function = $functions | Where-Object Name -eq $name
             $function | Should -Not -BeNullOrEmpty
             $function.Body.Extent.Text | Should -Match '--allow-all-tools'
@@ -1936,7 +1959,9 @@ Describe 'Copilot sub-agent delegation guard' {
             $_.Name -ne 'Get-CopilotExcludedToolArguments' -and
             $_.Body.Extent.Text -match "'--allow-all-tools'"
         } | ForEach-Object Name)
-        $allowAllToolFunctions | Sort-Object | Should -Be @('Invoke-CopilotCli', 'Start-LeafCopilotProcess')
+        $allowAllToolFunctions | Sort-Object | Should -Be @('Get-LeafCopilotArguments', 'Invoke-CopilotCli')
+        ($functions | Where-Object Name -eq 'Start-LeafCopilotProcess').Body.Extent.Text |
+            Should -Match 'Get-LeafCopilotArguments -Prompt \$Prompt'
         $excludedToolFunctions = @($functions | Where-Object {
             $_.Body.Extent.Text -match "'--excluded-tools'"
         } | ForEach-Object Name)
@@ -2937,6 +2962,226 @@ Describe 'Bounded leaf accepted-copy normalization' {
         finally {
             $null = $normalizationContext.KnowledgePaths.Remove($path)
         }
+    }
+}
+
+Describe 'Runtime leaf source-bound schemas and prompt' {
+    BeforeAll {
+        $boundedShared = Get-Content -LiteralPath $NormalizationSchemaPath -Raw
+        $cumulativeFixture = Join-Path $PSScriptRoot 'fixtures/findings-consumer/privacy-015-cumulative-lines.json'
+        $cumulativeRaw = Get-Content -LiteralPath $cumulativeFixture -Raw
+        # V4 run 37586436198, privacy-015/al-error-handling-review:
+        # original SHA256 e91576b806136b17aa7ef02a30a0b827973506cb49757ac1e1226e53e2eec06d.
+        # stdout records one `nl -ba` invocation with these four files in order.
+        $v4Counts = [ordered]@{
+            'src/AIContextBuilder.Codeunit.al' = 34
+            'src/CustomerDataExporter.Codeunit.al' = 29
+            'src/ExternalCRMSync.Codeunit.al' = 42
+            'src/OutboxEmailDispatcher.Codeunit.al' = 57
+        }
+    }
+    BeforeEach {
+        $boundedSources = Get-OrdinalDictionary
+        foreach ($entry in $v4Counts.GetEnumerator()) {
+            $boundedSources[$entry.Key] = @{ path = $entry.Key; exists = $true; line_count = $entry.Value }
+        }
+        $boundedSchemas = New-FindingsReportRoleSchemas -SharedSchemaJson $boundedShared -SourceFiles $boundedSources
+        $boundedReport = $cumulativeRaw | ConvertFrom-Json -AsHashtable
+        $boundedReport.findings[0].location.line = 24
+        $boundedReport.findings[1].location.line = 35
+        $boundedReport.findings[1].location.range.'start-line' = 35
+        $boundedReport.findings[1].location.range.'end-line' = 36
+        $script:FindingsConsumerContext = [pscustomobject]@{ SourceFiles = $boundedSources }
+        $script:CopilotExecutable = 'C:\tools\copilot.exe'
+        $AnalysisWorkspace = 'C:\review-target'
+        $BCQualityRoot = 'C:\bcquality'
+        $DiffRange = 'origin/main...HEAD'
+        $ReviewPathSpec = ''
+        $ReviewSource = 'local'
+        $GitHubServerUrl = 'https://github.com'
+        $LeafModel = 'gpt-5.6-luna'
+        $CopilotLogLevel = 'info'
+        $LeafReportSchemaFileName = '_review-findings-report.leaf.schema.json'
+        $ReportFileName = '_review-report.json'
+        $promptLeaf = [pscustomobject]@{ id = 'al-error-handling-review'; version = 1; path = 'microsoft/skills/review/al-error-handling-review.md' }
+    }
+
+    It 'rejects the exact V4 coordinates that unbounded role schemas admitted' {
+        $base = New-FindingsReportRoleSchemas -SharedSchemaJson $boundedShared
+        ($cumulativeRaw | Test-Json -Schema $base.Leaf) | Should -BeTrue
+        ($cumulativeRaw | Test-Json -Schema $boundedSchemas.Leaf -ErrorAction SilentlyContinue) | Should -BeFalse
+        $location = ($boundedSchemas.Leaf | ConvertFrom-Json -AsHashtable).definitions.location
+        $exporter = @($location.allOf | Where-Object { $_.Contains('if') -and $_.if.properties.file.const -ceq 'src/CustomerDataExporter.Codeunit.al' })[0]
+        $exporter.then.properties.line.maximum | Should -Be 29
+        $crm = @($location.allOf | Where-Object { $_.Contains('if') -and $_.if.properties.file.const -ceq 'src/ExternalCRMSync.Codeunit.al' })[0]
+        $crm.then.properties.line.maximum | Should -Be 42
+        $crm.then.properties.range.properties.'start-line'.maximum | Should -Be 42
+        $crm.then.properties.range.properties.'end-line'.maximum | Should -Be 42
+    }
+
+    It 'explains every V4 bad coordinate by multi-file nl accumulation rather than patch offsets' {
+        $original = $cumulativeRaw | ConvertFrom-Json
+        $original.findings[0].location.line | Should -Be (34 + 24)
+        $original.findings[1].location.line | Should -Be (34 + 29 + 35)
+        $original.findings[1].location.range.'start-line' | Should -Be (34 + 29 + 24)
+        $original.findings[1].location.range.'end-line' | Should -Be (34 + 29 + 36)
+        # Native git diff positions reconstructed from the same new-file source.
+        $original.findings[0].location.line | Should -Not -Be 70
+        $original.findings[1].location.line | Should -Not -Be 116
+    }
+
+    It 'enforces structural source bounds for <Name>' -ForEach @(
+        @{ Name = 'first line'; Valid = $true; Mutate = { $boundedReport.findings[0].location.line = 1 } },
+        @{ Name = 'last line'; Valid = $true; Mutate = { $boundedReport.findings[0].location.line = 29 } },
+        @{ Name = 'no locations'; Valid = $true; Mutate = { foreach ($finding in $boundedReport.findings) { $finding.Remove('location') } } },
+        @{ Name = 'no range'; Valid = $true; Mutate = { $boundedReport.findings[1].location.Remove('range') } },
+        @{ Name = 'exporter overflow'; Valid = $false; Mutate = { $boundedReport.findings[0].location.line = 58 } },
+        @{ Name = 'CRM overflow'; Valid = $false; Mutate = { $boundedReport.findings[1].location.line = 98 } },
+        @{ Name = 'range start overflow'; Valid = $false; Mutate = { $boundedReport.findings[1].location.range.'start-line' = 87 } },
+        @{ Name = 'range end overflow'; Valid = $false; Mutate = { $boundedReport.findings[1].location.range.'end-line' = 99 } },
+        @{ Name = 'unknown path'; Valid = $false; Mutate = { $boundedReport.findings[0].location.file = 'src/Unknown.al' } },
+        @{ Name = 'path case'; Valid = $false; Mutate = { $boundedReport.findings[0].location.file = 'src/customerdataexporter.Codeunit.al' } },
+        @{ Name = 'absolute path'; Valid = $false; Mutate = { $boundedReport.findings[0].location.file = '/src/CustomerDataExporter.Codeunit.al' } },
+        @{ Name = 'backslash path'; Valid = $false; Mutate = { $boundedReport.findings[0].location.file = 'src\CustomerDataExporter.Codeunit.al' } },
+        @{ Name = 'null location'; Valid = $false; Mutate = { $boundedReport.findings[0].location = $null } },
+        @{ Name = 'zero line'; Valid = $false; Mutate = { $boundedReport.findings[0].location.line = 0 } },
+        @{ Name = 'fractional line'; Valid = $false; Mutate = { $boundedReport.findings[0].location.line = 24.5 } },
+        @{ Name = 'string line'; Valid = $false; Mutate = { $boundedReport.findings[0].location.line = '24' } },
+        @{ Name = 'missing line'; Valid = $false; Mutate = { $boundedReport.findings[0].location.Remove('line') } },
+        @{ Name = 'extra field'; Valid = $false; Mutate = { $boundedReport.findings[0].location['extra'] = $true } },
+        @{ Name = 'range relation stays semantic'; Valid = $true; Mutate = { $boundedReport.findings[1].location.range.'start-line' = 24 } }
+    ) {
+        & $Mutate
+        [bool](($boundedReport | ConvertTo-Json -Depth 40) | Test-Json -Schema $boundedSchemas.Leaf -ErrorAction SilentlyContinue) |
+            Should -Be $Valid
+    }
+
+    It 'rejects any present location with only empty or deleted source files while keeping omission valid' {
+        $none = Get-OrdinalDictionary
+        $none['src/Empty.al'] = @{ exists = $true; line_count = 0 }
+        $none['src/Deleted.al'] = @{ exists = $false; line_count = $null }
+        foreach ($scope in @($none, (Get-OrdinalDictionary))) {
+            $schemas = New-FindingsReportRoleSchemas -SharedSchemaJson $boundedShared -SourceFiles $scope
+            (($boundedReport | ConvertTo-Json -Depth 40) | Test-Json -Schema $schemas.Leaf -ErrorAction SilentlyContinue) | Should -BeFalse
+            $without = $boundedReport | ConvertTo-Json -Depth 40 | ConvertFrom-Json -AsHashtable
+            foreach ($finding in $without.findings) { $finding.Remove('location') }
+            (($without | ConvertTo-Json -Depth 40) | Test-Json -Schema $schemas.Leaf) | Should -BeTrue
+        }
+    }
+
+    It 'appends source constraints without replacing existing location restrictions' {
+        $shared = $boundedShared | ConvertFrom-Json -AsHashtable
+        $shared.definitions.location['allOf'] = @(@{ properties = @{ line = @{ maximum = 10 } } })
+        $schemas = New-FindingsReportRoleSchemas -SharedSchemaJson ($shared | ConvertTo-Json -Depth 100) -SourceFiles $boundedSources
+        ($schemas.Leaf | ConvertFrom-Json -AsHashtable).definitions.location.allOf[0].properties.line.maximum | Should -Be 10
+        (($boundedReport | ConvertTo-Json -Depth 40) | Test-Json -Schema $schemas.Leaf -ErrorAction SilentlyContinue) | Should -BeFalse
+    }
+
+    It 'keeps schema output identical under reordered source input' {
+        $reversed = Get-OrdinalDictionary
+        $keys = @($v4Counts.Keys)
+        [array]::Reverse($keys)
+        foreach ($key in $keys) { $reversed[$key] = $boundedSources[$key] }
+        $schemas = New-FindingsReportRoleSchemas -SharedSchemaJson $boundedShared -SourceFiles $reversed
+        $schemas.Leaf | Should -BeExactly $boundedSchemas.Leaf
+        $schemas.Root | Should -BeExactly $boundedSchemas.Root
+    }
+
+    It 'constrains nested leaves without changing root self-review locations or PR79 roles' {
+        $root = $boundedReport | ConvertTo-Json -Depth 40 | ConvertFrom-Json -AsHashtable
+        $root.skill.id = 'al-code-review'
+        $root['sub-results'] = @($boundedReport)
+        $root.findings[0].location.line = 58
+        (($root | ConvertTo-Json -Depth 40) | Test-Json -Schema $boundedSchemas.Root) | Should -BeTrue
+        $root.'sub-results'[0].findings[0].location.line = 58
+        (($root | ConvertTo-Json -Depth 40) | Test-Json -Schema $boundedSchemas.Root -ErrorAction SilentlyContinue) | Should -BeFalse
+        $root.'sub-results'[0].findings[0].location.line = 24
+        $root.'sub-results'[0]['sub-results'] = @()
+        (($root | ConvertTo-Json -Depth 40) | Test-Json -Schema $boundedSchemas.Root -ErrorAction SilentlyContinue) | Should -BeFalse
+    }
+
+    It 'fails closed when the pinned location definition can no longer be safely intersected' {
+        $shared = $boundedShared | ConvertFrom-Json -AsHashtable
+        $shared.definitions.finding.properties.location.'$ref' = '#/definitions/newLocation'
+        { New-FindingsReportRoleSchemas -SharedSchemaJson ($shared | ConvertTo-Json -Depth 100) -SourceFiles $boundedSources } |
+            Should -Throw '*location/finding definition shape*'
+    }
+
+    It 'uses the captured snapshot despite tampered bounds, schema and expanded source files' {
+        $AnalysisWorkspace = Join-Path $TestDrive 'bounded-target'
+        $BCQualityRoot = Join-Path $TestDrive 'bounded-knowledge'
+        $AgentWorkDir = $BCQualityRoot
+        $RootReportSchemaFileName = '_review-findings-report.root.schema.json'
+        New-Item -ItemType Directory -Path (Join-Path $AnalysisWorkspace 'src'), (Join-Path $BCQualityRoot 'schemas') -Force | Out-Null
+        Set-Content (Join-Path $BCQualityRoot 'schemas/findings-report.schema.json') -Value $boundedShared
+        foreach ($entry in $v4Counts.GetEnumerator()) {
+            [IO.File]::WriteAllText((Join-Path $AnalysisWorkspace $entry.Key), ("source`n" * $entry.Value))
+        }
+        Initialize-FindingsConsumerContext -SourcePaths @($v4Counts.Keys)
+        $before = $script:FindingsConsumerContext.SourceFiles | ConvertTo-Json -Depth 10
+        Set-Content (Join-Path $AgentWorkDir '_review-source-bounds.json') -Value '{"files":[]}'
+        [IO.File]::AppendAllText((Join-Path $AnalysisWorkspace 'src/CustomerDataExporter.Codeunit.al'), ("new`n" * 100))
+        Initialize-FindingsReportRoleSchemas
+        (Get-Content (Join-Path $AgentWorkDir $LeafReportSchemaFileName) -Raw).TrimEnd() | Should -BeExactly (Get-FindingsReportRoleSchema -Role leaf)
+        Set-Content (Join-Path $AgentWorkDir $LeafReportSchemaFileName) -Value '{}'
+        Set-Content (Join-Path $AgentWorkDir $RootReportSchemaFileName) -Value '{}'
+        ($cumulativeRaw | Test-Json -Schema (Get-FindingsReportRoleSchema -Role leaf) -ErrorAction SilentlyContinue) | Should -BeFalse
+        ($script:FindingsConsumerContext.SourceFiles | ConvertTo-Json -Depth 10) | Should -BeExactly $before
+    }
+
+    It 'requires source capture before runtime schema initialization' {
+        $script:FindingsConsumerContext = $null
+        { Initialize-FindingsReportRoleSchemas } | Should -Throw '*Source snapshot must be captured*'
+    }
+
+    It 'inlines the complete small scope with file-local viewing and self-validation instructions' {
+        $prompt = New-LeafReviewPrompt -Leaf $promptLeaf -WorkDir $TestDrive
+        foreach ($entry in $v4Counts.GetEnumerator()) {
+            $prompt | Should -Match ([regex]::Escape(('"{0}": 1..{1}' -f $entry.Key, $entry.Value)))
+        }
+        $prompt | Should -Match 'Line numbering restarts at 1 for every file'
+        $prompt | Should -Match 'Never use multi-operand nl -ba'
+        $prompt | Should -Match 'separate per-file line viewer'
+        $prompt | Should -Match 'Self-validate the complete final JSON against the supplied leaf'
+        $prompt | Should -Not -Match 'No truncated inline list'
+        (Get-CommandLineCharacterUpperBound -Arguments (@($script:CopilotExecutable) + (Get-LeafCopilotArguments -Prompt $prompt))) |
+            Should -BeLessOrEqual 24576
+    }
+
+    It 'JSON-quotes paths and describes every empty or deleted file in a small scope' {
+        $boundedSources['src/A "quoted".al'] = @{ exists = $true; line_count = 2 }
+        $boundedSources['src/Empty.al'] = @{ exists = $true; line_count = 0 }
+        $boundedSources['src/Deleted.al'] = @{ exists = $false; line_count = $null }
+        $prompt = New-LeafReviewPrompt -Leaf $promptLeaf -WorkDir $TestDrive
+        $prompt | Should -Match ([regex]::Escape('"src/A \"quoted\".al": 1..2'))
+        $prompt | Should -Match ([regex]::Escape('"src/Empty.al": no valid final-source lines'))
+        $prompt | Should -Match ([regex]::Escape('"src/Deleted.al": no valid final-source lines'))
+    }
+
+    It 'omits the entire inline list for a large scope without weakening the complete schema' {
+        foreach ($i in 1..150) { $boundedSources["src/AdditionalLongRepresentativeFile$i.Codeunit.al"] = @{ exists = $true; line_count = 100 } }
+        $prompt = New-LeafReviewPrompt -Leaf $promptLeaf -WorkDir $TestDrive
+        $prompt | Should -Match 'complete 154-entry line-limit list'
+        $prompt | Should -Match 'read it in full. No truncated inline list'
+        $prompt | Should -Not -Match 'Complete final-source line limits'
+        $prompt | Should -Not -Match '"src/.*": 1\.\.'
+        $schema = (New-FindingsReportRoleSchemas -SharedSchemaJson $boundedShared -SourceFiles $boundedSources).Leaf | ConvertFrom-Json -AsHashtable
+        $schema.definitions.location.allOf[0].properties.file.enum.Count | Should -Be 154
+        (Get-CommandLineCharacterUpperBound -Arguments (@($script:CopilotExecutable) + (Get-LeafCopilotArguments -Prompt $prompt))) |
+            Should -BeLessOrEqual 24576
+    }
+
+    It 'accounts for executable and non-prompt arguments before admitting a small inline list' {
+        $inline = New-LeafReviewPrompt -Leaf $promptLeaf -WorkDir $TestDrive
+        $initialBound = Get-CommandLineCharacterUpperBound -Arguments (@($script:CopilotExecutable) + (Get-LeafCopilotArguments -Prompt $inline))
+        $extraCharacters = [int][Math]::Ceiling((24576 + 50 - $initialBound) / 2)
+        $script:CopilotExecutable += 'x' * $extraCharacters
+        $prompt = New-LeafReviewPrompt -Leaf $promptLeaf -WorkDir $TestDrive
+        $prompt | Should -Match 'No truncated inline list'
+        (Get-CommandLineCharacterUpperBound -Arguments (@($script:CopilotExecutable) + (Get-LeafCopilotArguments -Prompt $prompt))) |
+            Should -BeLessOrEqual 24576
+        (Get-CommandLineCharacterUpperBound -Arguments @('', 'a"b\', 'path with space', ([string][char]0x4e2d))) |
+            Should -Be (1 + 3 + (2 * 4 + 3) + (2 * 15 + 3) + 5)
     }
 }
 

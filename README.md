@@ -162,6 +162,34 @@ repo-relative paths, file existence, and line counts (zero for empty files,
 null for missing/deleted or linked files). Locations use final-source lines,
 not patch lines; location-less findings remain permitted.
 
+The runtime leaf schema also intersects the pinned `location` definition with
+an exact file enum and draft-07 conditional maxima for `line`, `start-line` and
+`end-line`, derived from the same engine-held snapshot in ordinal path order.
+Only existing regular files with at least one final-source line can be located.
+With no eligible files, a boolean-false constraint rejects any present location
+while omission remains valid. Existing types, minima, required fields and
+additional-property restrictions are retained. Root `sub-results` use the same
+bounded leaf locations; root self-review findings retain their existing contract.
+The final semantic gate still enforces range relationships and all other rules.
+
+The leaf prompt explicitly resets numbering per file and forbids multi-operand
+`nl -ba`, whose counter continues across files. This caused the cumulative
+58/98/87-99 coordinates in [BC-Bench run 37586436198](https://github.com/microsoft/BC-Bench/actions/runs/37586436198)
+despite correct 29/42-line source bounds. Small scopes include the **complete**
+JSON-quoted `path: 1..N` list (with empty/missing files identified). The list must
+fit 4,096 conservatively encoded UTF-16 characters, and the complete executable
+plus argument list must fit 24,576. The estimate allows two characters per input
+character plus quotes/separators, leaving headroom below Windows' 32,767-character
+process command-line limit. Larger scopes include no partial list: the prompt
+states the full count and requires reading the complete bounds artifact. Schema
+restrictions are never truncated. The same guard is used on every platform.
+
+These schemas are model-readable inputs, **not constrained decoding**. The prompt
+requires final schema self-validation within the existing invocation, but this
+does not guarantee valid generation, correct in-range anchors, or a 7/7 smoke.
+No cumulative/patch-coordinate conversion, line clamping, location deletion or
+model retry is performed; invalid reports still fail closed.
+
 After JSON, role, and schema checks, deterministic consumer acceptance requires
 each citation-based finding ID to exactly equal its primary reference path,
 every reference to be a safe existing knowledge path, and each location to name
