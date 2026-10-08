@@ -118,8 +118,60 @@
           "exit_code": { "type": ["integer", "null"] },
           "report_path": { "type": ["string", "null"], "pattern": "^[^\\\\]+$" },
           "failure_reason": { "type": ["string", "null"] },
-          "metrics": { "type": ["object", "null"] }
-        }
+          "metrics": { "type": ["object", "null"] },
+          "normalization": {
+            "type": "object",
+            "additionalProperties": false,
+            "required": ["raw_report_path", "raw_report_sha256", "changes"],
+            "properties": {
+              "raw_report_path": { "type": "string", "minLength": 1, "pattern": "^[^\\\\]+$" },
+              "raw_report_sha256": { "type": "string", "pattern": "^[a-f0-9]{64}$" },
+              "changes": {
+                "type": "array",
+                "minItems": 1,
+                "items": {
+                  "oneOf": [
+                    {
+                      "type": "object",
+                      "additionalProperties": false,
+                      "required": ["kind", "finding_index", "original_id", "canonical_id"],
+                      "properties": {
+                        "kind": { "const": "finding-id" },
+                        "finding_index": { "type": "integer", "minimum": 0 },
+                        "original_id": { "type": "string", "minLength": 1 },
+                        "canonical_id": { "type": "string", "minLength": 1 }
+                      }
+                    },
+                    {
+                      "type": "object",
+                      "additionalProperties": false,
+                      "required": ["kind", "finding_index", "file", "line", "original_range"],
+                      "properties": {
+                        "kind": { "const": "location-range" },
+                        "finding_index": { "type": "integer", "minimum": 0 },
+                        "file": { "type": "string", "minLength": 1 },
+                        "line": { "type": "integer", "minimum": 1 },
+                        "original_range": {
+                          "type": "object",
+                          "additionalProperties": false,
+                          "required": ["start-line", "end-line"],
+                          "properties": {
+                            "start-line": { "type": "integer", "minimum": 1 },
+                            "end-line": { "type": "integer", "minimum": 1 }
+                          }
+                        }
+                      }
+                    }
+                  ]
+                }
+              }
+            }
+          }
+        },
+        "allOf": [{
+          "if": { "required": ["normalization"] },
+          "then": { "properties": { "role": { "const": "leaf" }, "status": { "const": "completed" } } }
+        }]
       }
     }
   }

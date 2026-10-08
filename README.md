@@ -155,6 +155,79 @@ publishing a zero-coverage review. When summary posting is enabled, failed
 sub-skills also appear in a distinct incomplete-coverage section rather than
 being presented as skipped or as successful zero-finding reviews.
 
+Before launching leaves, the engine captures the changed-file scope, actual
+final-source line counts, and knowledge paths in the pinned, filtered BCQuality
+checkout. Each leaf receives `_review-source-bounds.json` with exact
+repo-relative paths, file existence, and line counts (zero for empty files,
+null for missing/deleted or linked files). Locations use final-source lines,
+not patch lines; location-less findings remain permitted.
+
+The runtime leaf schema also intersects the pinned `location` definition with
+an exact file enum and draft-07 conditional maxima for `line`, `start-line` and
+`end-line`, derived from the same engine-held snapshot in ordinal path order.
+Only existing regular files with at least one final-source line can be located.
+With no eligible files, a boolean-false constraint rejects any present location
+while omission remains valid. Existing types, minima, required fields and
+additional-property restrictions are retained. Root `sub-results` use the same
+bounded leaf locations; root self-review findings retain their existing contract.
+The final semantic gate still enforces range relationships and all other rules.
+
+The leaf prompt explicitly resets numbering per file and forbids multi-operand
+`nl -ba`, whose counter continues across files. This caused the cumulative
+58/98/87-99 coordinates in [BC-Bench run 37586436198](https://github.com/microsoft/BC-Bench/actions/runs/37586436198)
+despite correct 29/42-line source bounds. Small scopes include the **complete**
+JSON-quoted `path: 1..N` list (with empty/missing files identified). The list must
+fit 4,096 conservatively encoded UTF-16 characters, and the complete executable
+plus argument list must fit 24,576. The estimate allows two characters per input
+character plus quotes/separators, leaving headroom below Windows' 32,767-character
+process command-line limit. Larger scopes include no partial list: the prompt
+states the full count and requires reading the complete bounds artifact. Schema
+restrictions are never truncated. The same guard is used on every platform.
+
+These schemas are model-readable inputs, **not constrained decoding**. The prompt
+requires final schema self-validation within the existing invocation, but this
+does not guarantee valid generation, correct in-range anchors, or a 7/7 smoke.
+No cumulative/patch-coordinate conversion, line clamping, location deletion or
+model retry is performed; invalid reports still fail closed.
+
+After JSON, role, and schema checks, deterministic consumer acceptance requires
+each citation-based finding ID to exactly equal its primary reference path,
+every reference to be a safe existing knowledge path, and each location to name
+an exact in-scope existing file with valid inclusive line bounds. Range starts
+must equal the anchor line. Uncited confidence/severity caps follow the pinned
+DO contract, including pins whose schema does not yet express those caps.
+Validation uses engine-held pre-run inventories, never the model-writable
+bounds artifact. It rejects the whole leaf without clamping or retrying, and
+records the precise reason in `_run-manifest.json`.
+`leaf-results/*/_review-report.raw.json` preserves the original report bytes,
+including when the existing omitted-`suppressed` compatibility repair produces
+an accepted derived report. Invalid originals are never rewritten. Bounds and
+raw reports follow the existing `_review-*`/`leaf-results` cleanup lifecycle.
+Article retrieval proof and review knowledge remain BCQuality responsibilities;
+this gate does not claim that an existing cited article was read in full.
+
+The consumer may accept a **bounded normalized copy**, never a modified raw
+payload. The original must pass JSON/role/schema validation and all mechanical
+semantic checks except citation-ID equality and an eligible range-start mismatch.
+For cited, non-agent findings whose every reference is safe and present in the
+captured inventory, only `id` is canonicalized to `references[0].path`. A range
+may be removed only when its positive integer endpoints contain the anchor,
+`start-line != line`, all original endpoints are within the final source, and
+the finding has no `suggested-code` field. This range-only exception also applies
+to otherwise-valid uncited agent findings; their IDs and confidence/severity caps
+never change. The two operations may be combined in one deep-copied candidate.
+
+The entire candidate must pass role/schema/semantic acceptance again before
+the accepted `_review-report.json` is written and offered to root consolidation.
+Any other defect rejects the whole return, with no partial candidate or salvaged
+findings. Summary counts/coverage and leaf producer ownership are also checked.
+Normalized leaf process records in `_run-manifest.json` include `normalization`
+with the raw artifact path/SHA256 and per-finding original/canonical ID or removed
+range values. This optional audit field does not add processes or alter model,
+usage, ordering, or coverage accounting. Canonical reports remain byte-identical
+and have no normalization record. Diagnostics uploaders must retain both
+`_review-report.raw.json` and the accepted report to audit the two transports.
+
 1. A caller-provided `config_path`, resolved from the target repository.
 2. Individual workflow inputs such as `bcquality_repo` and `bcquality_ref`,
    which override the selected config through environment variables.

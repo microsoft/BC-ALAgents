@@ -8,7 +8,9 @@
     '',
     Justification = 'The test intentionally covers Unicode domain labels and rendered Unicode output.'
 )]
-param()
+param(
+    [string] $NormalizationSchemaPath = (Join-Path $PSScriptRoot 'fixtures/findings-report-roles/bcquality-findings-report.b74967bc.schema.json')
+)
 
 BeforeAll {
     $scriptPath = Join-Path (Join-Path (Split-Path -Parent $PSScriptRoot) 'scripts') 'Invoke-CopilotPRReview.ps1'
@@ -882,6 +884,9 @@ Describe 'Deterministic leaf orchestration contract' {
         $CopilotCliVersion = '1.0.83'
         $CopilotModel = 'claude-sonnet-5'
         $LeafModel = 'gpt-5.4'
+        $CopilotLogLevel = 'info'
+        $GitHubServerUrl = 'https://github.com'
+        $script:CopilotExecutable = 'C:\tools\copilot.exe'
         $LeafExecution = 'serial'
         $MaxLeafConcurrency = 4
         $CopilotCliTimeoutMinutes = 30
@@ -892,7 +897,8 @@ Describe 'Deterministic leaf orchestration contract' {
         $AgentVersion = '1.0.0'
         $ReportFileName = '_review-report.json'
         $AgentWorkDir = $BCQualityRoot
-        $AnalysisWorkspace = 'C:\review-target'
+        $AnalysisWorkspace = Join-Path $TestDrive 'source-snapshot'
+        New-Item -ItemType Directory -Path $AnalysisWorkspace -Force | Out-Null
         $DiffRange = 'origin/main...HEAD'
         $script:AgentTranscript = ''
         $script:CopilotOtelRecords = @()
@@ -922,7 +928,7 @@ Describe 'Deterministic leaf orchestration contract' {
     "outcome": { "type": "string" },
     "outcome-reason": { "type": "string" },
     "summary": { "type": "object" },
-    "findings": { "type": "array" },
+    "findings": { "type": "array", "items": { "$ref": "#/definitions/finding" } },
     "references": { "type": "array" },
     "suppressed": {
       "type": "array",
@@ -934,11 +940,31 @@ Describe 'Deterministic leaf orchestration contract' {
     },
     "sub-results": { "type": "array", "items": { "$ref": "#" } },
     "skipped-sub-skills": { "type": "array" }
+  },
+  "definitions": {
+    "finding": { "type": "object", "properties": { "location": { "$ref": "#/definitions/location" } } },
+    "location": {
+      "type": "object",
+      "required": ["file", "line"],
+      "properties": {
+        "file": { "type": "string" },
+        "line": { "type": "integer", "minimum": 1 },
+        "range": {
+          "type": "object",
+          "required": ["start-line", "end-line"],
+          "properties": {
+            "start-line": { "type": "integer", "minimum": 1 },
+            "end-line": { "type": "integer", "minimum": 1 }
+          }
+        }
+      }
+    }
   }
 }
 '@ | Set-Content -LiteralPath (Join-Path $BCQualityRoot 'schemas/findings-report.schema.json')
         $LeafReportSchemaFileName = '_review-findings-report.leaf.schema.json'
         $RootReportSchemaFileName = '_review-findings-report.root.schema.json'
+        Initialize-FindingsConsumerContext -SourcePaths @()
         Initialize-FindingsReportRoleSchemas
         Set-Content -LiteralPath (Join-Path $BCQualityRoot 'microsoft/skills/review/al-security-review.md') -Value '# security'
         Set-Content -LiteralPath (Join-Path $BCQualityRoot 'microsoft/skills/review/al-style-review.md') -Value '# style'
@@ -1044,6 +1070,9 @@ Describe 'Deterministic leaf orchestration contract' {
         $prompt | Should -Match "pinned mechanically to model 'gpt-5\.6-luna'"
         $prompt | Should -Match 'Do not invoke child agents or other review skills'
         $prompt | Should -Match ([regex]::Escape('./_review-findings-report.leaf.schema.json'))
+        $prompt | Should -Match ([regex]::Escape('./_review-source-bounds.json'))
+        $prompt | Should -Match 'final source file, NOT\s+patch/diff lines'
+        $prompt | Should -Match 'Findings without location remain permitted'
         $prompt | Should -Match 'sub-results and skipped-sub-skills are super-skill-only fields and MUST NOT\s+appear, not even as empty arrays'
         $prompt | Should -Not -Match ([regex]::Escape('schemas/findings-report.schema.json'))
     }
@@ -1059,6 +1088,7 @@ Describe 'Deterministic leaf orchestration contract' {
 
         $startCommand = Get-Command Start-LeafCopilotProcess -CommandType Function
         $startCommand.ScriptBlock.Ast.Extent.Text | Should -Match '\$LeafReportSchemaFileName'
+        $startCommand.ScriptBlock.Ast.Extent.Text | Should -Match '_review-source-bounds.json'
     }
 
     It 'validates against the engine-held contract rather than the model-writable schema file' {
@@ -1507,6 +1537,8 @@ Describe 'Deterministic leaf orchestration contract' {
         $repaired = Get-Content -LiteralPath $results[0].ReportPath -Raw | ConvertFrom-Json
         $repaired.PSObject.Properties.Match('suppressed').Count | Should -Be 1
         @($repaired.suppressed).Count | Should -Be 0
+        $original = Get-Content (Join-Path (Split-Path $results[0].ReportPath) '_review-report.raw.json') -Raw | ConvertFrom-Json
+        $original.PSObject.Properties.Match('suppressed').Count | Should -Be 0
         $script:TestLeafReports['al-style-review'].suppressed[0].ContainsKey('reference') | Should -BeFalse
 
         $manifest = Get-Content -LiteralPath (Join-Path $ReviewOutputDir '_run-manifest.json') -Raw |
@@ -1541,6 +1573,125 @@ Describe 'Deterministic leaf orchestration contract' {
         @($manifest.processes | Where-Object status -eq 'failed').Count | Should -Be 2
         @($manifest.processes | Where-Object status -eq 'failed').skill_id |
             Should -Be @('al-security-review', 'al-style-review')
+    }
+
+    It 'rejects a consumer-invalid leaf before consolidation without salvaging findings or changing raw bytes' {
+        $plan = @(Get-ReviewLeafPlan)
+        $script:TestLeafReports['al-security-review'] = @{
+            skill = @{ id = 'al-security-review' }
+            findings = @(
+                @{ id = 'agent:valid'; references = @(); confidence = 'medium'; severity = 'minor' },
+                @{ id = 'agent:invalid'; references = @(); confidence = 'high'; severity = 'minor' }
+            )
+            # Deliberately omit suppressed: failed candidates must not be rewritten.
+        }
+        $script:TestLeafReports['al-style-review'] = @{
+            skill = @{ id = 'al-style-review' }; findings = @(); suppressed = @()
+        }
+        $expectedBytes = [Text.Encoding]::UTF8.GetBytes(
+            ($script:TestLeafReports['al-security-review'] | ConvertTo-Json -Depth 20) + [Environment]::NewLine
+        )
+
+        $results = @(Invoke-DeterministicLeafReviews -Plan $plan)
+        $results.Count | Should -Be 1
+        $results[0].Leaf.id | Should -Be 'al-style-review'
+        $script:FailedLeafReviews.Count | Should -Be 1
+        $script:FailedLeafReviews[0].Reason | Should -Match 'findings\[1\]\.confidence.*medium'
+        $failedPath = Join-Path $ReviewOutputDir 'leaf-results/01-al-security-review'
+        foreach ($name in @('_review-report.json', '_review-report.raw.json')) {
+            [Convert]::ToBase64String([IO.File]::ReadAllBytes((Join-Path $failedPath $name))) |
+                Should -Be ([Convert]::ToBase64String($expectedBytes))
+        }
+        $prompt = Build-ConsolidationPrompt -LeafResults $results -FailedLeaves $script:FailedLeafReviews
+        $prompt | Should -Match 'al-security-review: failed before a usable findings-report was available'
+        $prompt | Should -Not -Match '01-al-security-review/_review-report.json'
+        (Assert-UsableLeafReviewCoverage -Plan $plan -LeafResults $results) | Should -Be 'partial'
+        $manifest = Get-Content (Join-Path $ReviewOutputDir '_run-manifest.json') -Raw | ConvertFrom-Json
+        $manifest.processes[0].status | Should -Be 'failed'
+        $manifest.processes[0].failure_reason | Should -Match 'findings\[1\]\.confidence'
+        Should -Invoke Start-LeafCopilotProcess -Times 2 -Exactly
+    }
+
+    It 'retains raw BOM/CRLF bytes and records only fully accepted normalization: <Valid>' -ForEach @(
+        @{ Valid = $true }, @{ Valid = $false }
+    ) {
+        $fixture = Join-Path $PSScriptRoot 'fixtures/findings-consumer/privacy-015-normalization.json'
+        $report = Get-Content $fixture -Raw | ConvertFrom-Json
+        if (-not $Valid) { $report.findings[3].location.range.'end-line' = 58 }
+        $script:FindingsReportRoleSchemas = New-FindingsReportRoleSchemas -SharedSchemaJson (
+            Get-Content -LiteralPath $NormalizationSchemaPath -Raw
+        )
+        $sourceCounts = @(34, 29, 42, 57)
+        for ($index = 0; $index -lt 4; $index++) {
+            $script:FindingsConsumerContext.SourceFiles[$report.findings[$index].location.file] = @{
+                exists = $true; line_count = $sourceCounts[$index]
+            }
+            $null = $script:FindingsConsumerContext.KnowledgePaths.Add($report.findings[$index].references[0].path)
+        }
+        $leaf = [pscustomobject]@{ id = 'al-privacy-review'; version = 1; ordinal = 1 }
+        $script:ReviewPlanIds = @($leaf.id)
+        $state = Start-LeafCopilotProcess -Leaf $leaf -WorkDir (Join-Path $ReviewOutputDir 'leaf-results/03-al-privacy-review') -Prompt 'unused'
+        $path = Join-Path $state.WorkDir $ReportFileName
+        $text = ($report | ConvertTo-Json -Depth 40) -replace '\r?\n', "`r`n"
+        $bytes = [byte[]](@(0xef, 0xbb, 0xbf) + [Text.Encoding]::UTF8.GetBytes(" `r`n$text`r`n`t"))
+        [IO.File]::WriteAllBytes($path, $bytes)
+        $rawHash = (Get-FileHash $path).Hash
+
+        $result = Receive-LeafCopilotProcess -State $state
+
+        ($null -ne $result) | Should -Be $Valid
+        $rawPath = Join-Path $state.WorkDir '_review-report.raw.json'
+        [Convert]::ToBase64String([IO.File]::ReadAllBytes($rawPath)) |
+            Should -Be ([Convert]::ToBase64String($bytes))
+        $manifest = Get-Content (Join-Path $ReviewOutputDir '_run-manifest.json') -Raw | ConvertFrom-Json
+        $manifest.schema_version | Should -Be 1
+        $manifest.processes.Count | Should -Be 1
+        $manifest.processes[0].requested_model | Should -Be $LeafModel
+        $manifest.processes[0].metrics.total_tokens | Should -Be 12
+        $manifest.processes[0].report_path | Should -Be 'leaf-results/03-al-privacy-review/_review-report.json'
+        if ($Valid) {
+            $manifest.processes[0].status | Should -Be 'completed'
+            $manifest.processes[0].normalization.raw_report_path | Should -Be 'leaf-results/03-al-privacy-review/_review-report.raw.json'
+            $manifest.processes[0].normalization.raw_report_sha256 | Should -BeExactly $rawHash.ToLowerInvariant()
+            $manifest.processes[0].normalization.changes.Count | Should -Be 8
+            $acceptedText = Get-Content $result.ReportPath -Raw
+            ($acceptedText | ConvertFrom-Json | ConvertTo-Json -Depth 40) | Should -Be ($result.Report | ConvertTo-Json -Depth 40)
+            $result.Report.findings[3].id | Should -Be $report.findings[3].references[0].path
+            $result.Report.findings[3].location.PSObject.Properties.Match('range').Count | Should -Be 0
+            $prompt = Build-ConsolidationPrompt -LeafResults @($result)
+            $prompt | Should -Match ([regex]::Escape(($result.ReportPath -replace '\\', '/')))
+            $prompt | Should -Not -Match '_review-report.raw.json'
+            $manifest.processes[0].normalization.changes = @()
+            ($manifest | ConvertTo-Json -Depth 40 | Test-Json -SchemaFile (Join-Path $EngineRoot 'agents/ALReviewAgent/schemas/run-manifest.schema.json') -ErrorAction SilentlyContinue) | Should -BeFalse
+        } else {
+            $manifest.processes[0].status | Should -Be 'failed'
+            $manifest.processes[0].failure_reason | Should -Match 'findings\[3\]\.location.range.end-line'
+            $manifest.processes[0].PSObject.Properties.Match('normalization').Count | Should -Be 0
+            (Get-FileHash $path).Hash | Should -Be $rawHash
+        }
+    }
+
+    It 'preserves exact raw bytes through <Stage> validation' -ForEach @(
+        @{ Stage = 'JSON'; Payload = "{`r`ninvalid"; Valid = $false },
+        @{ Stage = 'role'; Payload = '{"skill":{"id":"al-security-review"},"findings":[],"suppressed":[],"sub-results":[]}'; Valid = $false },
+        @{ Stage = 'schema'; Payload = '{"skill":{"id":"al-security-review"},"findings":[],"suppressed":[{}]}'; Valid = $false },
+        @{ Stage = 'source bounds'; Payload = '{"skill":{"id":"al-security-review"},"findings":[{"id":"agent:test","references":[],"confidence":"medium","severity":"minor","location":{"file":"src/Unknown.al","line":58}}],"suppressed":[]}'; Valid = $false },
+        @{ Stage = 'consumer'; Payload = '{"skill":{"id":"al-security-review"},"findings":[{"id":"agent:test","references":[],"confidence":"high","severity":"minor"}],"suppressed":[]}'; Valid = $false },
+        @{ Stage = 'accepted'; Payload = '{"skill":{"id":"al-security-review"},"findings":[],"suppressed":[]}'; Valid = $true }
+    ) {
+        $leaf = @(Get-ReviewLeafPlan)[0]
+        $state = Start-LeafCopilotProcess -Leaf $leaf -WorkDir (Join-Path $TestDrive 'raw-leaf') -Prompt 'unused'
+        $path = Join-Path $state.WorkDir $ReportFileName
+        $bytes = [byte[]](@(0xef, 0xbb, 0xbf) + [Text.Encoding]::UTF8.GetBytes(" `r`n$Payload`r`n`t"))
+        [IO.File]::WriteAllBytes($path, $bytes)
+
+        $result = Receive-LeafCopilotProcess -State $state
+
+        ($null -ne $result) | Should -Be $Valid
+        foreach ($name in @($ReportFileName, '_review-report.raw.json')) {
+            [Convert]::ToBase64String([IO.File]::ReadAllBytes((Join-Path $state.WorkDir $name))) |
+                Should -Be ([Convert]::ToBase64String($bytes))
+        }
     }
 
     It 'stops the orchestration immediately on <Name> integrity failure' -ForEach @(
@@ -1798,7 +1949,7 @@ Describe 'Copilot sub-agent delegation guard' {
             $node -is [System.Management.Automation.Language.FunctionDefinitionAst]
         }, $true))
 
-        foreach ($name in @('Start-LeafCopilotProcess', 'Invoke-CopilotCli')) {
+        foreach ($name in @('Get-LeafCopilotArguments', 'Invoke-CopilotCli')) {
             $function = $functions | Where-Object Name -eq $name
             $function | Should -Not -BeNullOrEmpty
             $function.Body.Extent.Text | Should -Match '--allow-all-tools'
@@ -1808,7 +1959,9 @@ Describe 'Copilot sub-agent delegation guard' {
             $_.Name -ne 'Get-CopilotExcludedToolArguments' -and
             $_.Body.Extent.Text -match "'--allow-all-tools'"
         } | ForEach-Object Name)
-        $allowAllToolFunctions | Sort-Object | Should -Be @('Invoke-CopilotCli', 'Start-LeafCopilotProcess')
+        $allowAllToolFunctions | Sort-Object | Should -Be @('Get-LeafCopilotArguments', 'Invoke-CopilotCli')
+        ($functions | Where-Object Name -eq 'Start-LeafCopilotProcess').Body.Extent.Text |
+            Should -Match 'Get-LeafCopilotArguments -Prompt \$Prompt'
         $excludedToolFunctions = @($functions | Where-Object {
             $_.Body.Extent.Text -match "'--excluded-tools'"
         } | ForEach-Object Name)
@@ -2344,6 +2497,691 @@ Describe 'Save-ReviewArtifacts' {
         $saved.subResults.Count | Should -Be 1
         $saved.subResults[0].id | Should -Be 'al-performance-review'
         $saved.subResults[0].references[0].path | Should -Be 'microsoft/knowledge/performance/article.md'
+    }
+}
+
+Describe 'Deterministic findings consumer acceptance' {
+    BeforeAll {
+        # Minimal source-faithful fixtures from BC-Bench run 37293252219:
+        # privacy-008 / al-privacy-review, privacy-015 / al-performance-review,
+        # http-consumed-false-01 / al-error-handling-review. Only prose and
+        # optional suggestions were removed; all failing fields are unchanged.
+        # Original report SHA256s, respectively:
+        # dd43b71d5f4cc80eacbabfcbfb88462edee926e128102cab6eaf23b9e133ce78
+        # cabc94d1352c8d4e62218aa3f4949f404014dd2db7e4b6c0efe6200b858b9e1e
+        # b71268431d53548bad0cd1677c5ea7e4be02b329e8d96beb2c0ae1d92cf613c4
+        $consumerFixtures = Join-Path $PSScriptRoot 'fixtures/findings-consumer'
+        $sharedSchema = Get-Content (Join-Path $PSScriptRoot 'fixtures/findings-report-roles/bcquality-findings-report.b74967bc.schema.json') -Raw
+        $consumerLeafSchema = (New-FindingsReportRoleSchemas -SharedSchemaJson $sharedSchema).Leaf
+    }
+
+    BeforeEach {
+        $AnalysisWorkspace = Join-Path $TestDrive 'consumer-source'
+        $BCQualityRoot = Join-Path $TestDrive 'consumer-knowledge'
+        $AgentWorkDir = $BCQualityRoot
+        New-Item -ItemType Directory -Path (Join-Path $AnalysisWorkspace 'src'), $BCQualityRoot -Force | Out-Null
+        $reports = @{}
+        foreach ($fixtureName in @('privacy-008', 'privacy-015', 'http-consumed-false-01')) {
+            $reports[$fixtureName] = Get-Content (Join-Path $consumerFixtures "$fixtureName.json") -Raw | ConvertFrom-Json
+            foreach ($reference in $reports[$fixtureName].findings.references) {
+                if (-not $reference) { continue }
+                $fullPath = Join-Path $BCQualityRoot $reference.path
+                New-Item -ItemType Directory -Path (Split-Path $fullPath) -Force | Out-Null
+                Set-Content -LiteralPath $fullPath -Value '# Synthetic knowledge inventory entry'
+            }
+        }
+        # The privacy evidence has exactly 22 final-source lines. Other files
+        # are synthetic bounds-only stubs, not copies of the benchmark source.
+        $sourceCounts = [ordered]@{
+            'src/CustomerSyncDispatcher.Codeunit.al' = 22
+            'src/ExternalCRMSync.Codeunit.al' = 40
+            'src/OutboxEmailDispatcher.Codeunit.al' = 40
+            'src/BCBHttpDelivery.Codeunit.al' = 16
+            'src/Empty.al' = 0
+        }
+        foreach ($entry in $sourceCounts.GetEnumerator()) {
+            [IO.File]::WriteAllText((Join-Path $AnalysisWorkspace $entry.Key), ("source line`n" * $entry.Value))
+        }
+        $sourcePaths = @($sourceCounts.Keys) + 'src/Deleted.al'
+        $context = New-FindingsConsumerContext -SourceRoot $AnalysisWorkspace -SourcePaths $sourcePaths -KnowledgeRoot $BCQualityRoot
+        $valid = $reports['privacy-008']
+        $valid.findings[0].location.line = 22
+        $valid.findings[0].location.range.'start-line' = 22
+        $valid.findings[0].location.range.'end-line' = 22
+        $primary = $valid.findings[0].references[0].path
+    }
+
+    It 'rejects the schema-valid original <Name> failure deterministically' -ForEach @(
+        @{ Name = 'privacy-008'; Failure = '*line 44*22 final-source lines*' },
+        @{ Name = 'privacy-015'; Failure = '*.id*must exactly equal primary reference*' },
+        @{ Name = 'http-consumed-false-01'; Failure = '*.confidence*medium*' }
+    ) {
+        $path = Join-Path $consumerFixtures "$Name.json"
+        $before = (Get-FileHash $path).Hash
+        $raw = Get-Content $path -Raw
+        ($raw | Test-Json -Schema $consumerLeafSchema -ErrorAction Stop) | Should -BeTrue
+        $report = $raw | ConvertFrom-Json
+        { Assert-LeafConsumerAcceptance -ReportObject $report -Context $context } | Should -Throw $Failure
+        (Get-FileHash $path).Hash | Should -Be $before
+        ($report | ConvertTo-Json -Depth 20) | Should -Be (($raw | ConvertFrom-Json) | ConvertTo-Json -Depth 20)
+    }
+
+    It 'accepts citation-backed final-line and inclusive-range findings without changing them' {
+        $valid.findings[0].location.line = 1
+        $valid.findings[0].location.range.'start-line' = 1
+        $valid.findings[0].references[0] | Add-Member -NotePropertyName sha -NotePropertyValue ('a' * 40)
+        $before = $valid | ConvertTo-Json -Depth 20
+        { Assert-LeafConsumerAcceptance -ReportObject $valid -Context $context } | Should -Not -Throw
+        ($valid | ConvertTo-Json -Depth 20) | Should -Be $before
+    }
+
+    It 'permits findings without location and locations without range under StrictMode' {
+        $valid.findings[0].location.PSObject.Properties.Remove('range')
+        & {
+            Set-StrictMode -Version Latest
+            Assert-LeafConsumerAcceptance -ReportObject $valid -Context $context
+            $valid.findings[0].PSObject.Properties.Remove('location')
+            Assert-LeafConsumerAcceptance -ReportObject $valid -Context $context
+            $valid.findings[0].references = @()
+            $valid.findings[0].id = 'agent:repository-wide'
+            $valid.findings[0].confidence = 'medium'
+            $valid.findings[0].severity = 'minor'
+            $valid.summary.counts.major = 0
+            $valid.summary.counts.minor = 1
+            Assert-LeafConsumerAcceptance -ReportObject $valid -Context $context
+        }
+    }
+
+    It 'does not impose findings citation existence on configuration-suppressed references' {
+        $valid.suppressed = @([pscustomobject]@{
+            reference = [pscustomobject]@{ path = 'community/knowledge/disabled/article.md' }
+            reason = 'configuration'
+        })
+        { Assert-LeafConsumerAcceptance -ReportObject $valid -Context $context } | Should -Not -Throw
+    }
+
+    It 'rejects unsafe knowledge reference <_>' -ForEach @(
+        '../outside.md', '/absolute.md', 'C:/outside.md', 'C:relative.md', '\\server\share\article.md',
+        'microsoft\knowledge\privacy\article.md', 'microsoft/knowledge/../outside.md',
+        'microsoft/knowledge/privacy/./article.md', 'microsoft//knowledge/privacy/article.md',
+        'microsoft/knowledge/privacy/article.md:stream', 'https://example.test/article.md',
+        'microsoft/knowledge/privacy/article.md#fragment', 'microsoft/knowledge/privacy/article.md ',
+        'microsoft/knowledge/privacy/../privacy/article.md'
+    ) {
+        $valid.findings[0].id = $_
+        $valid.findings[0].references[0].path = $_
+        { Assert-LeafConsumerAcceptance -ReportObject $valid -Context $context } |
+            Should -Throw '*not a safe repo-relative knowledge path*'
+    }
+
+    It 'rejects unknown or differently cased knowledge paths including secondary references' -ForEach @(
+        'microsoft/knowledge/privacy/unknown.md',
+        'microsoft/knowledge/Privacy/privacy-notice-consent-for-external-data-transfer.md'
+    ) {
+        $valid.findings[0].references += [pscustomobject]@{ path = $_ }
+        { Assert-LeafConsumerAcceptance -ReportObject $valid -Context $context } |
+            Should -Throw '*references[[]1[]].path*does not exist*'
+    }
+
+    It 'requires ordinal exact citation equality for <Suffix>' -ForEach @(
+        @{ Suffix = '#location' }, @{ Suffix = ' ' }, @{ Suffix = 'case' }
+    ) {
+        $valid.findings[0].id = if ($Suffix -eq 'case') { $primary.ToUpperInvariant() } else { "$primary$Suffix" }
+        { Assert-LeafConsumerAcceptance -ReportObject $valid -Context $context } |
+            Should -Throw '*must exactly equal primary reference*'
+    }
+
+    It 'allows the same citation ID at distinct valid source locations' {
+        $second = $valid.findings[0] | ConvertTo-Json -Depth 10 | ConvertFrom-Json
+        $second.location.file = 'src/OutboxEmailDispatcher.Codeunit.al'
+        $valid.findings += $second
+        $valid.summary.counts.major = 2
+        { Assert-LeafConsumerAcceptance -ReportObject $valid -Context $context } | Should -Not -Throw
+    }
+
+    It 'rejects locations outside the exact changed-file scope: <_>' -ForEach @(
+        'src/Unchanged.al', 'src/customersyncdispatcher.Codeunit.al',
+        'src\CustomerSyncDispatcher.Codeunit.al', '/src/CustomerSyncDispatcher.Codeunit.al',
+        '../src/CustomerSyncDispatcher.Codeunit.al', 'src/./CustomerSyncDispatcher.Codeunit.al'
+    ) {
+        Set-Content (Join-Path $AnalysisWorkspace 'src/Unchanged.al') -Value 'exists but not changed'
+        $valid.findings[0].location.file = $_
+        { Assert-LeafConsumerAcceptance -ReportObject $valid -Context $context } |
+            Should -Throw '*not an exact in-scope source path*'
+    }
+
+    It 'rejects missing/deleted in-scope files and empty-file line anchors' -ForEach @(
+        @{ Path = 'src/Deleted.al'; Failure = '*not an existing regular file*' },
+        @{ Path = 'src/Empty.al'; Failure = '*0 final-source lines*' }
+    ) {
+        $valid.findings[0].location.file = $Path
+        $valid.findings[0].location.line = 1
+        { Assert-LeafConsumerAcceptance -ReportObject $valid -Context $context } | Should -Throw $Failure
+    }
+
+    It 'rejects invalid final-source bounds: <Label>' -ForEach @(
+        @{ Label = 'zero line'; Line = 0; Start = 1; End = 1; Failure = '*.location.line*' },
+        @{ Label = 'past EOF'; Line = 23; Start = 23; End = 23; Failure = '*.location.line*' },
+        @{ Label = 'mismatched start'; Line = 20; Start = 19; End = 22; Failure = '*.range.start-line*' },
+        @{ Label = 'reversed range'; Line = 20; Start = 20; End = 19; Failure = '*.range.end-line*' },
+        @{ Label = 'end past EOF'; Line = 20; Start = 20; End = 23; Failure = '*.range.end-line*' }
+    ) {
+        $valid.findings[0].location.line = $Line
+        $valid.findings[0].location.range.'start-line' = $Start
+        $valid.findings[0].location.range.'end-line' = $End
+        { Assert-LeafConsumerAcceptance -ReportObject $valid -Context $context } | Should -Throw $Failure
+    }
+
+    It 'rejects uncited <_> severity without downgrading it' -ForEach @('major', 'blocker') {
+        $valid.findings[0].references = @()
+        $valid.findings[0].id = 'agent:test'
+        $valid.findings[0].confidence = 'medium'
+        $valid.findings[0].severity = $_
+        { Assert-LeafConsumerAcceptance -ReportObject $valid -Context $context } |
+            Should -Throw '*uncited findings cannot exceed minor severity*'
+        $valid.findings[0].severity | Should -Be $_
+    }
+
+    It 'uses the pre-model snapshot rather than tampered bounds, knowledge or source files' {
+        Initialize-FindingsConsumerContext -SourcePaths $sourcePaths
+        Set-Content (Join-Path $AgentWorkDir '_review-source-bounds.json') -Value '{"files":[]}'
+        [IO.File]::AppendAllText((Join-Path $AnalysisWorkspace 'src/CustomerSyncDispatcher.Codeunit.al'), ("new line`n" * 50))
+        Set-Content (Join-Path $BCQualityRoot 'microsoft/knowledge/privacy/invented.md') -Value '# Invented after capture'
+        $badLine = Get-Content (Join-Path $consumerFixtures 'privacy-008.json') -Raw | ConvertFrom-Json
+        { Assert-LeafConsumerAcceptance -ReportObject $badLine -Context $script:FindingsConsumerContext } |
+            Should -Throw '*line 44*22 final-source lines*'
+        $valid.findings[0].references += [pscustomobject]@{ path = 'microsoft/knowledge/privacy/invented.md' }
+        { Assert-LeafConsumerAcceptance -ReportObject $valid -Context $script:FindingsConsumerContext } |
+            Should -Throw '*does not exist in the pinned filtered BCQuality snapshot*'
+    }
+
+    It 'writes deterministic bounds and clears them with the existing lifecycle in <_> mode' -ForEach @('cwd', 'plugin') {
+        if ($_ -eq 'plugin') {
+            $AgentWorkDir = Join-Path $TestDrive 'plugin-output'
+            New-Item -ItemType Directory -Path $AgentWorkDir -Force | Out-Null
+        }
+        Initialize-FindingsConsumerContext -SourcePaths $sourcePaths
+        $path = Join-Path $AgentWorkDir '_review-source-bounds.json'
+        $before = Get-Content $path -Raw
+        $bounds = $before | ConvertFrom-Json
+        ($bounds.files | Where-Object path -eq 'src/CustomerSyncDispatcher.Codeunit.al').line_count | Should -Be 22
+        ($bounds.files | Where-Object path -eq 'src/Empty.al').line_count | Should -Be 0
+        ($bounds.files | Where-Object path -eq 'src/Deleted.al').exists | Should -BeFalse
+        ($bounds.files | Where-Object path -eq 'src/Deleted.al').line_count | Should -BeNullOrEmpty
+        [array]::Reverse($sourcePaths)
+        Initialize-FindingsConsumerContext -SourcePaths $sourcePaths
+        (Get-Content $path -Raw) | Should -Be $before
+        Clear-BCQualityRunArtifacts
+        Test-Path $path | Should -BeFalse
+    }
+
+    It 'counts real final lines with LF, CRLF, BOM and no trailing newline' -ForEach @(
+        @{ Content = "first`nsecond`n"; Bom = $false },
+        @{ Content = "first`r`nsecond"; Bom = $true },
+        @{ Content = "first`nsecond"; Bom = $false }
+    ) {
+        [IO.File]::WriteAllText((Join-Path $AnalysisWorkspace 'src/Empty.al'), $Content, [Text.UTF8Encoding]::new($Bom))
+        $captured = New-FindingsConsumerContext -SourceRoot $AnalysisWorkspace -SourcePaths @('src/Empty.al') -KnowledgeRoot $BCQualityRoot
+        $captured.SourceFiles['src/Empty.al'].line_count | Should -Be 2
+    }
+
+    It 'rejects unsafe scope before reading source files' {
+        { New-FindingsConsumerContext -SourceRoot $AnalysisWorkspace -SourcePaths @('../outside.al') -KnowledgeRoot $BCQualityRoot } |
+            Should -Throw '*unsafe source path*'
+    }
+
+    It 'excludes linked directories from source and knowledge snapshots' {
+        $outside = Join-Path $TestDrive 'outside-snapshot'
+        New-Item -ItemType Directory -Path $outside -Force | Out-Null
+        Set-Content (Join-Path $outside 'article.md') -Value '# Outside snapshot'
+        $linkType = if ($IsWindows) { 'Junction' } else { 'SymbolicLink' }
+        New-Item -ItemType $linkType -Path (Join-Path $AnalysisWorkspace 'linked') -Target $outside | Out-Null
+        New-Item -ItemType $linkType -Path (Join-Path $BCQualityRoot 'microsoft/knowledge/linked') -Target $outside | Out-Null
+        $captured = New-FindingsConsumerContext -SourceRoot $AnalysisWorkspace -SourcePaths @('linked/article.md') -KnowledgeRoot $BCQualityRoot
+        $captured.SourceFiles['linked/article.md'].exists | Should -BeFalse
+        $captured.KnowledgePaths.Contains('microsoft/knowledge/linked/article.md') | Should -BeFalse
+    }
+
+    It 'discovers exact unquoted git paths before capturing bounds' {
+        $ReviewPathSpec = 'src'
+        $DiffRange = '--cached'
+        $null = Invoke-GitCommand -Arguments @('-C', $AnalysisWorkspace, 'init', '--quiet')
+        $paths = @('src/Bracket[1].al', "src/Caf$([char]0xe9).al", 'src/With space.al')
+        foreach ($path in $paths) {
+            Set-Content -LiteralPath (Join-Path $AnalysisWorkspace $path) -Value 'final line'
+        }
+        $null = Invoke-GitCommand -Arguments (@('-C', $AnalysisWorkspace, 'add', '--') + $paths)
+        $changed = @(Get-GitChangedFiles)
+        $changed | Should -Be $paths
+        $captured = New-FindingsConsumerContext -SourceRoot $AnalysisWorkspace -SourcePaths $changed -KnowledgeRoot $BCQualityRoot
+        foreach ($path in $paths) {
+            $captured.SourceFiles[$path].exists | Should -BeTrue
+            $captured.SourceFiles[$path].line_count | Should -Be 1
+        }
+    }
+
+    It 'copies authoritative run inputs into an isolated leaf before launching in <_> mode' -ForEach @('cwd', 'plugin') {
+        if ($_ -eq 'plugin') {
+            $AgentWorkDir = Join-Path $TestDrive 'copy-plugin-output'
+            New-Item -ItemType Directory -Path $AgentWorkDir -Force | Out-Null
+        }
+        $LeafReportSchemaFileName = '_review-findings-report.leaf.schema.json'
+        $inputNames = @('_task-context.json', '_review-changed-files.txt', '_review-object-index.txt', $LeafReportSchemaFileName)
+        foreach ($inputName in $inputNames) {
+            Set-Content -LiteralPath (Join-Path $AgentWorkDir $inputName) -Value '{}'
+        }
+        Initialize-FindingsConsumerContext -SourcePaths $sourcePaths
+        $workDir = Join-Path $TestDrive 'copied-leaf'
+        $CopilotLogLevel = 'info'
+        $LeafModel = 'test-model'
+        $GitHubServerUrl = 'https://github.com'
+        $ReviewSource = 'local'
+        $CopilotToken = ''
+        $CopilotGithubToken = ''
+        Mock New-CopilotChildEnvironment { throw 'Stopped before any model process could launch' }
+
+        { Start-LeafCopilotProcess -Leaf ([pscustomobject]@{ id = 'test-leaf' }) -WorkDir $workDir -Prompt 'test' } |
+            Should -Throw '*Stopped before any model process could launch*'
+
+        foreach ($inputName in @($inputNames) + '_review-source-bounds.json') {
+            (Get-FileHash (Join-Path $workDir $inputName)).Hash |
+                Should -Be (Get-FileHash (Join-Path $AgentWorkDir $inputName)).Hash
+        }
+        Set-Content (Join-Path $workDir '_review-source-bounds.json') -Value '{"files":[{"path":"src/CustomerSyncDispatcher.Codeunit.al","exists":true,"line_count":999}]}'
+        $bad = Get-Content (Join-Path $consumerFixtures 'privacy-008.json') -Raw | ConvertFrom-Json
+        { Assert-LeafConsumerAcceptance -ReportObject $bad -Context $script:FindingsConsumerContext } |
+            Should -Throw '*line 44*22 final-source lines*'
+    }
+}
+
+Describe 'Bounded leaf accepted-copy normalization' {
+    BeforeAll {
+        # Four findings from privacy-015/al-privacy-review in run 37310924454.
+        # IDs, references, source locations, ranges and counts are unchanged.
+        # Original SHA256: 26aead0958e6ffe60c947f740b95ecf016783116a88d1254e87cea5c54c10107.
+        $normalizationFixture = Join-Path $PSScriptRoot 'fixtures/findings-consumer/privacy-015-normalization.json'
+        $normalizationRaw = Get-Content -LiteralPath $normalizationFixture -Raw
+        $normalizationSchema = (New-FindingsReportRoleSchemas -SharedSchemaJson (
+            Get-Content -LiteralPath $NormalizationSchemaPath -Raw
+        )).Leaf
+        $normalizationSources = Get-OrdinalDictionary
+        foreach ($pair in @(
+            @('src/AIContextBuilder.Codeunit.al', 34),
+            @('src/CustomerDataExporter.Codeunit.al', 29),
+            @('src/ExternalCRMSync.Codeunit.al', 42),
+            @('src/OutboxEmailDispatcher.Codeunit.al', 57)
+        )) {
+            $normalizationSources[$pair[0]] = @{ exists = $true; line_count = $pair[1] }
+        }
+        $normalizationKnowledge = [Collections.Generic.HashSet[string]]::new([StringComparer]::Ordinal)
+        $normalizationPrimary = 'microsoft/knowledge/privacy/privacy-notice-consent-for-external-data-transfer.md'
+        $null = $normalizationKnowledge.Add($normalizationPrimary)
+        $normalizationContext = [pscustomobject]@{
+            SourceFiles = $normalizationSources
+            KnowledgePaths = $normalizationKnowledge
+        }
+    }
+
+    BeforeEach {
+        $normalizationReport = $normalizationRaw | ConvertFrom-Json
+    }
+
+    It 'normalizes all four IDs and ranges in one private candidate without changing any other value' {
+        $before = (Get-FileHash $normalizationFixture).Hash
+        $accepted = New-AcceptedLeafReport -ReportText $normalizationRaw -Schema $normalizationSchema -Context $normalizationContext
+        $accepted.Changes.Count | Should -Be 8
+        @($accepted.Report.findings).Count | Should -Be 4
+        $accepted.Report.findings.id | Should -Be (@($normalizationPrimary) * 4)
+        for ($index = 0; $index -lt 4; $index++) {
+            $accepted.Report.findings[$index].location.PSObject.Properties.Match('range').Count | Should -Be 0
+            $idChange = $accepted.Changes[$index]
+            $idChange.kind | Should -Be 'finding-id'
+            $idChange.finding_index | Should -Be $index
+            $idChange.original_id | Should -Be $normalizationReport.findings[$index].id
+            $idChange.canonical_id | Should -Be $normalizationPrimary
+            $rangeChange = $accepted.Changes[$index + 4]
+            $rangeChange.kind | Should -Be 'location-range'
+            $rangeChange.finding_index | Should -Be $index
+            $rangeChange.line | Should -Be $normalizationReport.findings[$index].location.line
+            ($rangeChange.original_range | ConvertTo-Json) |
+                Should -Be ($normalizationReport.findings[$index].location.range | ConvertTo-Json)
+            $normalizationReport.findings[$index].id = $normalizationPrimary
+            $normalizationReport.findings[$index].location.PSObject.Properties.Remove('range')
+        }
+        ($accepted.Report | ConvertTo-Json -Depth 40) | Should -Be ($normalizationReport | ConvertTo-Json -Depth 40)
+        ($accepted.Text | Test-Json -Schema $normalizationSchema) | Should -BeTrue
+        (Get-FileHash $normalizationFixture).Hash | Should -Be $before
+    }
+
+    It 'leaves canonical reports and telemetry unchanged on repeated acceptance' {
+        $accepted = New-AcceptedLeafReport -ReportText $normalizationRaw -Schema $normalizationSchema -Context $normalizationContext
+        $canonical = " `r`n$($accepted.Text)`r`n`t"
+        $again = New-AcceptedLeafReport -ReportText $canonical -Schema $normalizationSchema -Context $normalizationContext
+        $again.Text | Should -BeExactly $canonical
+        $again.Changes.Count | Should -Be 0
+        ($again.Report | ConvertTo-Json -Depth 40) | Should -Be ($accepted.Report | ConvertTo-Json -Depth 40)
+    }
+
+    It 'preserves untouched timestamp-shaped strings instead of applying PowerShell date conversion' {
+        $text = $normalizationRaw.Replace('Synthetic AI request privacy finding.', '2026-10-05T13:00:00+05:30')
+        $accepted = New-AcceptedLeafReport -ReportText $text -Schema $normalizationSchema -Context $normalizationContext
+        $accepted.Text | Should -Match ([regex]::Escape('"2026-10-05T13:00:00+05:30"'))
+        $accepted.Changes.Count | Should -Be 8
+    }
+
+    It 'canonicalizes cited IDs without requiring a location or removing a valid range' {
+        $normalizationReport.findings[0].PSObject.Properties.Remove('location')
+        $normalizationReport.findings[1].location.range.'start-line' = $normalizationReport.findings[1].location.line
+        $normalizationReport.findings[1] | Add-Member -NotePropertyName 'suggested-code' -NotePropertyValue 'SafeReplacement();'
+        $accepted = New-AcceptedLeafReport -ReportText ($normalizationReport | ConvertTo-Json -Depth 40) -Schema $normalizationSchema -Context $normalizationContext
+        $accepted.Changes.Count | Should -Be 6
+        $accepted.Report.findings[0].PSObject.Properties.Match('location').Count | Should -Be 0
+        $accepted.Report.findings[1].location.range.'start-line' | Should -Be 24
+        $accepted.Report.findings[1].'suggested-code' | Should -Be 'SafeReplacement();'
+    }
+
+    It 'permits existing range-only normalization for valid uncited agent findings without changing their IDs' {
+        foreach ($finding in $normalizationReport.findings) {
+            $finding.references = @()
+            $finding.id = 'agent:valid-concern'
+            $finding.severity = 'minor'
+            $finding.confidence = 'medium'
+        }
+        $normalizationReport.summary.counts.major = 0
+        $normalizationReport.summary.counts.minor = 4
+        $accepted = New-AcceptedLeafReport -ReportText ($normalizationReport | ConvertTo-Json -Depth 40) -Schema $normalizationSchema -Context $normalizationContext
+        $accepted.Changes.Count | Should -Be 4
+        @($accepted.Changes | Where-Object kind -eq 'finding-id').Count | Should -Be 0
+        $accepted.Report.findings.id | Should -Be (@('agent:valid-concern') * 4)
+        $accepted.Report.findings.confidence | Should -Be (@('medium') * 4)
+    }
+
+    It 'rejects the whole candidate for an unrelated defect: <Name>' -ForEach @(
+        @{ Name = 'unsafe reference'; Mutate = { $normalizationReport.findings[3].references[0].path = '../outside.md' } },
+        @{ Name = 'unknown reference'; Mutate = { $normalizationReport.findings[3].references[0].path = 'microsoft/knowledge/privacy/unknown.md' } },
+        @{ Name = 'unknown supporting reference'; Mutate = { $normalizationReport.findings[3].references += [pscustomobject]@{ path = 'microsoft/knowledge/privacy/unknown.md' } } },
+        @{ Name = 'wrong reference case'; Mutate = { $normalizationReport.findings[3].references[0].path = $normalizationPrimary.ToUpperInvariant() } },
+        @{ Name = 'malformed reference object'; Mutate = { $normalizationReport.findings[3].references[0] | Add-Member -NotePropertyName extra -NotePropertyValue $true } },
+        @{ Name = 'cited agent ID'; Mutate = { $normalizationReport.findings[3].id = 'agent:cited' } },
+        @{ Name = 'qualified cited agent ID'; Mutate = { $normalizationReport.findings[3].id = 'al-privacy-review:agent:cited' } },
+        @{ Name = 'leaf producer'; Mutate = { $normalizationReport.findings[3] | Add-Member -NotePropertyName 'from-sub-skill' -NotePropertyValue 'agent' } },
+        @{ Name = 'uncited nonagent ID'; Mutate = { $normalizationReport.findings[3].references = @() } },
+        @{ Name = 'high confidence agent'; Mutate = { $normalizationReport.findings[3].references = @(); $normalizationReport.findings[3].id = 'agent:uncited' } },
+        @{ Name = 'high severity agent'; Mutate = { $normalizationReport.findings[3].references = @(); $normalizationReport.findings[3].id = 'agent:uncited'; $normalizationReport.findings[3].confidence = 'medium' } },
+        @{ Name = 'blank ID'; Mutate = { $normalizationReport.findings[3].id = '' } },
+        @{ Name = 'null ID'; Mutate = { $normalizationReport.findings[3].id = $null } },
+        @{ Name = 'integer ID'; Mutate = { $normalizationReport.findings[3].id = 1 } },
+        @{ Name = 'missing ID'; Mutate = { $normalizationReport.findings[3].PSObject.Properties.Remove('id') } },
+        @{ Name = 'zero start'; Mutate = { $normalizationReport.findings[3].location.range.'start-line' = 0 } },
+        @{ Name = 'string start'; Mutate = { $normalizationReport.findings[3].location.range.'start-line' = '18' } },
+        @{ Name = 'fractional start'; Mutate = { $normalizationReport.findings[3].location.range.'start-line' = 18.5 } },
+        @{ Name = 'extra range property'; Mutate = { $normalizationReport.findings[3].location.range | Add-Member -NotePropertyName extra -NotePropertyValue $true } },
+        @{ Name = 'anchor outside range'; Mutate = { $normalizationReport.findings[3].location.range.'end-line' = 22 } },
+        @{ Name = 'start after anchor'; Mutate = { $normalizationReport.findings[3].location.range.'start-line' = 24; $normalizationReport.findings[3].location.range.'end-line' = 25 } },
+        @{ Name = 'reversed range'; Mutate = { $normalizationReport.findings[3].location.range.'end-line' = 17 } },
+        @{ Name = 'out of bounds end'; Mutate = { $normalizationReport.findings[3].location.range.'end-line' = 58 } },
+        @{ Name = 'out of bounds line'; Mutate = { $normalizationReport.findings[3].location.line = 58; $normalizationReport.findings[3].location.range.'end-line' = 58 } },
+        @{ Name = 'out of scope source'; Mutate = { $normalizationReport.findings[3].location.file = 'src/unknown.al' } },
+        @{ Name = 'suggested-code range'; Mutate = { $normalizationReport.findings[3] | Add-Member -NotePropertyName 'suggested-code' -NotePropertyValue 'Replacement();' } },
+        @{ Name = 'empty suggested-code'; Mutate = { $normalizationReport.findings[3] | Add-Member -NotePropertyName 'suggested-code' -NotePropertyValue '' } },
+        @{ Name = 'null suggested-code'; Mutate = { $normalizationReport.findings[3] | Add-Member -NotePropertyName 'suggested-code' -NotePropertyValue $null } },
+        @{ Name = 'incorrect counts'; Mutate = { $normalizationReport.summary.counts.major = 3 } },
+        @{ Name = 'incomplete completed coverage'; Mutate = { $normalizationReport.summary.coverage.'items-evaluated' = 1 } },
+        @{ Name = 'leaf role'; Mutate = { $normalizationReport | Add-Member -NotePropertyName 'sub-results' -NotePropertyValue @() } }
+    ) {
+        & $Mutate
+        $raw = $normalizationReport | ConvertTo-Json -Depth 40
+        $acceptedOutput = [Collections.Generic.List[object]]::new()
+        {
+            New-AcceptedLeafReport -ReportText $raw -Schema $normalizationSchema -Context $normalizationContext |
+                ForEach-Object { $acceptedOutput.Add($_) }
+        } | Should -Throw
+        $acceptedOutput.Count | Should -Be 0
+        ($normalizationReport | ConvertTo-Json -Depth 40) | Should -BeExactly $raw
+    }
+
+    It 'rejects non-JSON output instead of normalizing it' {
+        { New-AcceptedLeafReport -ReportText "prefix $normalizationRaw" -Schema $normalizationSchema -Context $normalizationContext } |
+            Should -Throw
+    }
+
+    It 'rejects URI and wildcard metacharacters even in inventoried reference paths: <_>' -ForEach @(
+        'microsoft/knowledge/privacy/encoded%20article.md',
+        'microsoft/knowledge/privacy/article#fragment.md',
+        'microsoft/knowledge/privacy/article?query.md',
+        'microsoft/knowledge/privacy/wildcard*.md',
+        "microsoft/knowledge/privacy/control$([char]0x7f).md"
+    ) {
+        $path = $_
+        $null = $normalizationContext.KnowledgePaths.Add($path)
+        try {
+            $normalizationReport.findings[3].references[0].path = $path
+            { New-AcceptedLeafReport -ReportText ($normalizationReport | ConvertTo-Json -Depth 40) -Schema $normalizationSchema -Context $normalizationContext } |
+                Should -Throw '*not a safe repo-relative knowledge path*'
+        }
+        finally {
+            $null = $normalizationContext.KnowledgePaths.Remove($path)
+        }
+    }
+}
+
+Describe 'Runtime leaf source-bound schemas and prompt' {
+    BeforeAll {
+        $boundedShared = Get-Content -LiteralPath $NormalizationSchemaPath -Raw
+        $cumulativeFixture = Join-Path $PSScriptRoot 'fixtures/findings-consumer/privacy-015-cumulative-lines.json'
+        $cumulativeRaw = Get-Content -LiteralPath $cumulativeFixture -Raw
+        # V4 run 37586436198, privacy-015/al-error-handling-review:
+        # original SHA256 e91576b806136b17aa7ef02a30a0b827973506cb49757ac1e1226e53e2eec06d.
+        # stdout records one `nl -ba` invocation with these four files in order.
+        $v4Counts = [ordered]@{
+            'src/AIContextBuilder.Codeunit.al' = 34
+            'src/CustomerDataExporter.Codeunit.al' = 29
+            'src/ExternalCRMSync.Codeunit.al' = 42
+            'src/OutboxEmailDispatcher.Codeunit.al' = 57
+        }
+    }
+    BeforeEach {
+        $boundedSources = Get-OrdinalDictionary
+        foreach ($entry in $v4Counts.GetEnumerator()) {
+            $boundedSources[$entry.Key] = @{ path = $entry.Key; exists = $true; line_count = $entry.Value }
+        }
+        $boundedSchemas = New-FindingsReportRoleSchemas -SharedSchemaJson $boundedShared -SourceFiles $boundedSources
+        $boundedReport = $cumulativeRaw | ConvertFrom-Json -AsHashtable
+        $boundedReport.findings[0].location.line = 24
+        $boundedReport.findings[1].location.line = 35
+        $boundedReport.findings[1].location.range.'start-line' = 35
+        $boundedReport.findings[1].location.range.'end-line' = 36
+        $script:FindingsConsumerContext = [pscustomobject]@{ SourceFiles = $boundedSources }
+        $script:CopilotExecutable = 'C:\tools\copilot.exe'
+        $AnalysisWorkspace = 'C:\review-target'
+        $BCQualityRoot = 'C:\bcquality'
+        $DiffRange = 'origin/main...HEAD'
+        $ReviewPathSpec = ''
+        $ReviewSource = 'local'
+        $GitHubServerUrl = 'https://github.com'
+        $LeafModel = 'gpt-5.6-luna'
+        $CopilotLogLevel = 'info'
+        $LeafReportSchemaFileName = '_review-findings-report.leaf.schema.json'
+        $ReportFileName = '_review-report.json'
+        $promptLeaf = [pscustomobject]@{ id = 'al-error-handling-review'; version = 1; path = 'microsoft/skills/review/al-error-handling-review.md' }
+    }
+
+    It 'rejects the exact V4 coordinates that unbounded role schemas admitted' {
+        $base = New-FindingsReportRoleSchemas -SharedSchemaJson $boundedShared
+        ($cumulativeRaw | Test-Json -Schema $base.Leaf) | Should -BeTrue
+        ($cumulativeRaw | Test-Json -Schema $boundedSchemas.Leaf -ErrorAction SilentlyContinue) | Should -BeFalse
+        $location = ($boundedSchemas.Leaf | ConvertFrom-Json -AsHashtable).definitions.location
+        $exporter = @($location.allOf | Where-Object { $_.Contains('if') -and $_.if.properties.file.const -ceq 'src/CustomerDataExporter.Codeunit.al' })[0]
+        $exporter.then.properties.line.maximum | Should -Be 29
+        $crm = @($location.allOf | Where-Object { $_.Contains('if') -and $_.if.properties.file.const -ceq 'src/ExternalCRMSync.Codeunit.al' })[0]
+        $crm.then.properties.line.maximum | Should -Be 42
+        $crm.then.properties.range.properties.'start-line'.maximum | Should -Be 42
+        $crm.then.properties.range.properties.'end-line'.maximum | Should -Be 42
+    }
+
+    It 'explains every V4 bad coordinate by multi-file nl accumulation rather than patch offsets' {
+        $original = $cumulativeRaw | ConvertFrom-Json
+        $original.findings[0].location.line | Should -Be (34 + 24)
+        $original.findings[1].location.line | Should -Be (34 + 29 + 35)
+        $original.findings[1].location.range.'start-line' | Should -Be (34 + 29 + 24)
+        $original.findings[1].location.range.'end-line' | Should -Be (34 + 29 + 36)
+        # Native git diff positions reconstructed from the same new-file source.
+        $original.findings[0].location.line | Should -Not -Be 70
+        $original.findings[1].location.line | Should -Not -Be 116
+    }
+
+    It 'enforces structural source bounds for <Name>' -ForEach @(
+        @{ Name = 'first line'; Valid = $true; Mutate = { $boundedReport.findings[0].location.line = 1 } },
+        @{ Name = 'last line'; Valid = $true; Mutate = { $boundedReport.findings[0].location.line = 29 } },
+        @{ Name = 'no locations'; Valid = $true; Mutate = { foreach ($finding in $boundedReport.findings) { $finding.Remove('location') } } },
+        @{ Name = 'no range'; Valid = $true; Mutate = { $boundedReport.findings[1].location.Remove('range') } },
+        @{ Name = 'exporter overflow'; Valid = $false; Mutate = { $boundedReport.findings[0].location.line = 58 } },
+        @{ Name = 'CRM overflow'; Valid = $false; Mutate = { $boundedReport.findings[1].location.line = 98 } },
+        @{ Name = 'range start overflow'; Valid = $false; Mutate = { $boundedReport.findings[1].location.range.'start-line' = 87 } },
+        @{ Name = 'range end overflow'; Valid = $false; Mutate = { $boundedReport.findings[1].location.range.'end-line' = 99 } },
+        @{ Name = 'unknown path'; Valid = $false; Mutate = { $boundedReport.findings[0].location.file = 'src/Unknown.al' } },
+        @{ Name = 'path case'; Valid = $false; Mutate = { $boundedReport.findings[0].location.file = 'src/customerdataexporter.Codeunit.al' } },
+        @{ Name = 'absolute path'; Valid = $false; Mutate = { $boundedReport.findings[0].location.file = '/src/CustomerDataExporter.Codeunit.al' } },
+        @{ Name = 'backslash path'; Valid = $false; Mutate = { $boundedReport.findings[0].location.file = 'src\CustomerDataExporter.Codeunit.al' } },
+        @{ Name = 'null location'; Valid = $false; Mutate = { $boundedReport.findings[0].location = $null } },
+        @{ Name = 'zero line'; Valid = $false; Mutate = { $boundedReport.findings[0].location.line = 0 } },
+        @{ Name = 'fractional line'; Valid = $false; Mutate = { $boundedReport.findings[0].location.line = 24.5 } },
+        @{ Name = 'string line'; Valid = $false; Mutate = { $boundedReport.findings[0].location.line = '24' } },
+        @{ Name = 'missing line'; Valid = $false; Mutate = { $boundedReport.findings[0].location.Remove('line') } },
+        @{ Name = 'extra field'; Valid = $false; Mutate = { $boundedReport.findings[0].location['extra'] = $true } },
+        @{ Name = 'range relation stays semantic'; Valid = $true; Mutate = { $boundedReport.findings[1].location.range.'start-line' = 24 } }
+    ) {
+        & $Mutate
+        [bool](($boundedReport | ConvertTo-Json -Depth 40) | Test-Json -Schema $boundedSchemas.Leaf -ErrorAction SilentlyContinue) |
+            Should -Be $Valid
+    }
+
+    It 'rejects any present location with only empty or deleted source files while keeping omission valid' {
+        $none = Get-OrdinalDictionary
+        $none['src/Empty.al'] = @{ exists = $true; line_count = 0 }
+        $none['src/Deleted.al'] = @{ exists = $false; line_count = $null }
+        foreach ($scope in @($none, (Get-OrdinalDictionary))) {
+            $schemas = New-FindingsReportRoleSchemas -SharedSchemaJson $boundedShared -SourceFiles $scope
+            (($boundedReport | ConvertTo-Json -Depth 40) | Test-Json -Schema $schemas.Leaf -ErrorAction SilentlyContinue) | Should -BeFalse
+            $without = $boundedReport | ConvertTo-Json -Depth 40 | ConvertFrom-Json -AsHashtable
+            foreach ($finding in $without.findings) { $finding.Remove('location') }
+            (($without | ConvertTo-Json -Depth 40) | Test-Json -Schema $schemas.Leaf) | Should -BeTrue
+        }
+    }
+
+    It 'appends source constraints without replacing existing location restrictions' {
+        $shared = $boundedShared | ConvertFrom-Json -AsHashtable
+        $shared.definitions.location['allOf'] = @(@{ properties = @{ line = @{ maximum = 10 } } })
+        $schemas = New-FindingsReportRoleSchemas -SharedSchemaJson ($shared | ConvertTo-Json -Depth 100) -SourceFiles $boundedSources
+        ($schemas.Leaf | ConvertFrom-Json -AsHashtable).definitions.location.allOf[0].properties.line.maximum | Should -Be 10
+        (($boundedReport | ConvertTo-Json -Depth 40) | Test-Json -Schema $schemas.Leaf -ErrorAction SilentlyContinue) | Should -BeFalse
+    }
+
+    It 'keeps schema output identical under reordered source input' {
+        $reversed = Get-OrdinalDictionary
+        $keys = @($v4Counts.Keys)
+        [array]::Reverse($keys)
+        foreach ($key in $keys) { $reversed[$key] = $boundedSources[$key] }
+        $schemas = New-FindingsReportRoleSchemas -SharedSchemaJson $boundedShared -SourceFiles $reversed
+        $schemas.Leaf | Should -BeExactly $boundedSchemas.Leaf
+        $schemas.Root | Should -BeExactly $boundedSchemas.Root
+    }
+
+    It 'constrains nested leaves without changing root self-review locations or PR79 roles' {
+        $root = $boundedReport | ConvertTo-Json -Depth 40 | ConvertFrom-Json -AsHashtable
+        $root.skill.id = 'al-code-review'
+        $root['sub-results'] = @($boundedReport)
+        $root.findings[0].location.line = 58
+        (($root | ConvertTo-Json -Depth 40) | Test-Json -Schema $boundedSchemas.Root) | Should -BeTrue
+        $root.'sub-results'[0].findings[0].location.line = 58
+        (($root | ConvertTo-Json -Depth 40) | Test-Json -Schema $boundedSchemas.Root -ErrorAction SilentlyContinue) | Should -BeFalse
+        $root.'sub-results'[0].findings[0].location.line = 24
+        $root.'sub-results'[0]['sub-results'] = @()
+        (($root | ConvertTo-Json -Depth 40) | Test-Json -Schema $boundedSchemas.Root -ErrorAction SilentlyContinue) | Should -BeFalse
+    }
+
+    It 'fails closed when the pinned location definition can no longer be safely intersected' {
+        $shared = $boundedShared | ConvertFrom-Json -AsHashtable
+        $shared.definitions.finding.properties.location.'$ref' = '#/definitions/newLocation'
+        { New-FindingsReportRoleSchemas -SharedSchemaJson ($shared | ConvertTo-Json -Depth 100) -SourceFiles $boundedSources } |
+            Should -Throw '*location/finding definition shape*'
+    }
+
+    It 'uses the captured snapshot despite tampered bounds, schema and expanded source files' {
+        $AnalysisWorkspace = Join-Path $TestDrive 'bounded-target'
+        $BCQualityRoot = Join-Path $TestDrive 'bounded-knowledge'
+        $AgentWorkDir = $BCQualityRoot
+        $RootReportSchemaFileName = '_review-findings-report.root.schema.json'
+        New-Item -ItemType Directory -Path (Join-Path $AnalysisWorkspace 'src'), (Join-Path $BCQualityRoot 'schemas') -Force | Out-Null
+        Set-Content (Join-Path $BCQualityRoot 'schemas/findings-report.schema.json') -Value $boundedShared
+        foreach ($entry in $v4Counts.GetEnumerator()) {
+            [IO.File]::WriteAllText((Join-Path $AnalysisWorkspace $entry.Key), ("source`n" * $entry.Value))
+        }
+        Initialize-FindingsConsumerContext -SourcePaths @($v4Counts.Keys)
+        $before = $script:FindingsConsumerContext.SourceFiles | ConvertTo-Json -Depth 10
+        Set-Content (Join-Path $AgentWorkDir '_review-source-bounds.json') -Value '{"files":[]}'
+        [IO.File]::AppendAllText((Join-Path $AnalysisWorkspace 'src/CustomerDataExporter.Codeunit.al'), ("new`n" * 100))
+        Initialize-FindingsReportRoleSchemas
+        (Get-Content (Join-Path $AgentWorkDir $LeafReportSchemaFileName) -Raw).TrimEnd() | Should -BeExactly (Get-FindingsReportRoleSchema -Role leaf)
+        Set-Content (Join-Path $AgentWorkDir $LeafReportSchemaFileName) -Value '{}'
+        Set-Content (Join-Path $AgentWorkDir $RootReportSchemaFileName) -Value '{}'
+        ($cumulativeRaw | Test-Json -Schema (Get-FindingsReportRoleSchema -Role leaf) -ErrorAction SilentlyContinue) | Should -BeFalse
+        ($script:FindingsConsumerContext.SourceFiles | ConvertTo-Json -Depth 10) | Should -BeExactly $before
+    }
+
+    It 'requires source capture before runtime schema initialization' {
+        $script:FindingsConsumerContext = $null
+        { Initialize-FindingsReportRoleSchemas } | Should -Throw '*Source snapshot must be captured*'
+    }
+
+    It 'inlines the complete small scope with file-local viewing and self-validation instructions' {
+        $prompt = New-LeafReviewPrompt -Leaf $promptLeaf -WorkDir $TestDrive
+        foreach ($entry in $v4Counts.GetEnumerator()) {
+            $prompt | Should -Match ([regex]::Escape(('"{0}": 1..{1}' -f $entry.Key, $entry.Value)))
+        }
+        $prompt | Should -Match 'Line numbering restarts at 1 for every file'
+        $prompt | Should -Match 'Never use multi-operand nl -ba'
+        $prompt | Should -Match 'separate per-file line viewer'
+        $prompt | Should -Match 'Self-validate the complete final JSON against the supplied leaf'
+        $prompt | Should -Not -Match 'No truncated inline list'
+        (Get-CommandLineCharacterUpperBound -Arguments (@($script:CopilotExecutable) + (Get-LeafCopilotArguments -Prompt $prompt))) |
+            Should -BeLessOrEqual 24576
+    }
+
+    It 'JSON-quotes paths and describes every empty or deleted file in a small scope' {
+        $boundedSources['src/A "quoted".al'] = @{ exists = $true; line_count = 2 }
+        $boundedSources['src/Empty.al'] = @{ exists = $true; line_count = 0 }
+        $boundedSources['src/Deleted.al'] = @{ exists = $false; line_count = $null }
+        $prompt = New-LeafReviewPrompt -Leaf $promptLeaf -WorkDir $TestDrive
+        $prompt | Should -Match ([regex]::Escape('"src/A \"quoted\".al": 1..2'))
+        $prompt | Should -Match ([regex]::Escape('"src/Empty.al": no valid final-source lines'))
+        $prompt | Should -Match ([regex]::Escape('"src/Deleted.al": no valid final-source lines'))
+    }
+
+    It 'omits the entire inline list for a large scope without weakening the complete schema' {
+        foreach ($i in 1..150) { $boundedSources["src/AdditionalLongRepresentativeFile$i.Codeunit.al"] = @{ exists = $true; line_count = 100 } }
+        $prompt = New-LeafReviewPrompt -Leaf $promptLeaf -WorkDir $TestDrive
+        $prompt | Should -Match 'complete 154-entry line-limit list'
+        $prompt | Should -Match 'read it in full. No truncated inline list'
+        $prompt | Should -Not -Match 'Complete final-source line limits'
+        $prompt | Should -Not -Match '"src/.*": 1\.\.'
+        $schema = (New-FindingsReportRoleSchemas -SharedSchemaJson $boundedShared -SourceFiles $boundedSources).Leaf | ConvertFrom-Json -AsHashtable
+        $schema.definitions.location.allOf[0].properties.file.enum.Count | Should -Be 154
+        (Get-CommandLineCharacterUpperBound -Arguments (@($script:CopilotExecutable) + (Get-LeafCopilotArguments -Prompt $prompt))) |
+            Should -BeLessOrEqual 24576
+    }
+
+    It 'accounts for executable and non-prompt arguments before admitting a small inline list' {
+        $inline = New-LeafReviewPrompt -Leaf $promptLeaf -WorkDir $TestDrive
+        $initialBound = Get-CommandLineCharacterUpperBound -Arguments (@($script:CopilotExecutable) + (Get-LeafCopilotArguments -Prompt $inline))
+        $extraCharacters = [int][Math]::Ceiling((24576 + 50 - $initialBound) / 2)
+        $script:CopilotExecutable += 'x' * $extraCharacters
+        $prompt = New-LeafReviewPrompt -Leaf $promptLeaf -WorkDir $TestDrive
+        $prompt | Should -Match 'No truncated inline list'
+        (Get-CommandLineCharacterUpperBound -Arguments (@($script:CopilotExecutable) + (Get-LeafCopilotArguments -Prompt $prompt))) |
+            Should -BeLessOrEqual 24576
+        (Get-CommandLineCharacterUpperBound -Arguments @('', 'a"b\', 'path with space', ([string][char]0x4e2d))) |
+            Should -Be (1 + 3 + (2 * 4 + 3) + (2 * 15 + 3) + 5)
     }
 }
 
