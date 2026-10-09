@@ -43,13 +43,12 @@
     path (e.g. from CI or BC-Bench) to use a checkout you already manage.
 
 .PARAMETER MaxAgeDays
-    Only used when -BCQualityRoot is omitted. If the cached BCQuality clone's
-    HEAD is older than this many days, it is fast-forwarded. Default 7. Set to
-    a negative value to never auto-update the cache.
+    Retained for command-line compatibility. Managed BCQuality checkouts are
+    recreated for every run so persistent Git metadata is never trusted.
 
 .PARAMETER RefreshBCQuality
-    Only used when -BCQualityRoot is omitted. Force a fetch + reset of the
-    cached BCQuality clone regardless of age (e.g. "use the latest rules").
+    Retained for command-line compatibility. Managed BCQuality checkouts are
+    always cloned from the latest default-branch commit.
 
 .PARAMETER ConfigPath
     Path to a bcquality.config.yaml. Defaults to agents/ALReviewAgent/bcquality.config.yaml
@@ -173,11 +172,11 @@ $EmptyTreeSha = '4b825dc642cb6eb9a060e54bf8d69288fbee4904'
 
 # ---------------------------------------------------------------------------
 # BCQuality knowledge base. It is NOT bundled with the reviewer engine, so
-# when the caller does not pass -BCQualityRoot we clone/refresh it into a
-# local cache (~/.copilot/cache/bc-review/BCQuality) here. Age-gated by
-# -MaxAgeDays (default 7; <0 disables auto-update); -RefreshBCQuality forces
-# a fetch. Callers that already have a checkout (CI, BC-Bench) pass
-# -BCQualityRoot and this is skipped entirely.
+# When the caller does not pass -BCQualityRoot, recreate the managed checkout
+# at ~/.copilot/cache/bc-review/BCQuality. Never run Git inside an existing
+# managed checkout because older reviewer versions exposed its .git metadata
+# to untrusted writes. Callers that already have a trusted checkout (CI,
+# BC-Bench) pass -BCQualityRoot and this is skipped entirely.
 # ---------------------------------------------------------------------------
 function Resolve-BCQualityRoot {
     param([int] $MaxAgeDays = 7, [switch] $Force)
@@ -192,38 +191,14 @@ function Resolve-BCQualityRoot {
     $bcqPath = Join-Path $cacheDir 'BCQuality'
     $bcqUrl  = 'https://github.com/microsoft/BCQuality.git'
 
-    if (-not (Test-Path (Join-Path $bcqPath '.git'))) {
-        Write-Host "[local-review] Cloning BCQuality into $bcqPath"
-        & git clone --depth 1 $bcqUrl $bcqPath 2>&1 | ForEach-Object { Write-Host "[local-review] $_" }
-        if ($LASTEXITCODE -ne 0) { throw "git clone of $bcqUrl failed" }
-        return $bcqPath
+    if (Test-Path -LiteralPath $bcqPath) {
+        Write-Host "[local-review] Removing the previous managed BCQuality checkout."
+        Remove-Item -LiteralPath $bcqPath -Recurse -Force
     }
 
-    if ($MaxAgeDays -lt 0 -and -not $Force) {
-        Write-Host "[local-review] BCQuality: update skipped (MaxAgeDays=$MaxAgeDays)."
-        return $bcqPath
-    }
-
-    $headEpoch = & git -C $bcqPath log -1 --format=%ct 2>$null
-    $ageDays = if ($headEpoch) {
-        [int](([DateTimeOffset]::UtcNow.ToUnixTimeSeconds() - [int64]$headEpoch) / 86400)
-    } else { 9999 }
-
-    if ($Force -or $ageDays -ge $MaxAgeDays) {
-        Write-Host "[local-review] BCQuality: HEAD is $ageDays day(s) old, updating."
-        # Refetch + reset is robust for a shallow read-only cache mirror
-        # (a plain ff-only pull fails on divergent shallow history).
-        & git -C $bcqPath fetch --depth 1 origin HEAD 2>&1 | ForEach-Object { Write-Host "[local-review] $_" }
-        if ($LASTEXITCODE -eq 0) {
-            & git -C $bcqPath reset --hard FETCH_HEAD 2>&1 | Out-Null
-        }
-        else {
-            Write-Host "[local-review] BCQuality: fetch failed, using existing clone."
-        }
-    }
-    else {
-        Write-Host "[local-review] BCQuality: up to date ($ageDays day(s) old)."
-    }
+    Write-Host "[local-review] Cloning BCQuality into $bcqPath"
+    & git clone --depth 1 $bcqUrl $bcqPath 2>&1 | ForEach-Object { Write-Host "[local-review] $_" }
+    if ($LASTEXITCODE -ne 0) { throw "git clone of $bcqUrl failed" }
     return $bcqPath
 }
 
@@ -234,27 +209,23 @@ $filterScript = Join-Path $agentRoot 'scripts/Invoke-BCQualityFilter.ps1'
 if (-not $ConfigPath) { $ConfigPath = Join-Path $agentRoot 'bcquality.config.yaml' }
 
 $RepoPath      = (Resolve-Path $RepoPath).Path
+$usesManagedBCQualityCache = -not $BCQualityRoot
 if (-not $BCQualityRoot) {
     $BCQualityRoot = Resolve-BCQualityRoot -MaxAgeDays $MaxAgeDays -Force:$RefreshBCQuality
 }
 $BCQualityRoot = (Resolve-Path $BCQualityRoot).Path
 $ConfigPath    = (Resolve-Path $ConfigPath).Path
 
-# Best-effort: exclude the BCQuality cache from Windows Defender real-time
-# scanning. The reviewer touches thousands of small files under the cache and
-# the per-tool-call Defender hooks (12s timeout) add measurable drag to every
-# leaf. Requires elevation; failure is non-fatal and silently tolerated.
-if (Get-Command Add-MpPreference -ErrorAction SilentlyContinue) {
-    $defenderPaths = @($BCQualityRoot, (Split-Path -Parent $BCQualityRoot)) |
-        Where-Object { $_ } | Select-Object -Unique
-    foreach ($dp in $defenderPaths) {
-        try {
-            Add-MpPreference -ExclusionPath $dp -ErrorAction Stop
-            Write-Host "[local-review] Defender exclusion added: $dp"
-        }
-        catch {
-            Write-Host "[local-review] Defender exclusion skipped ($dp): $($_.Exception.Message)"
-        }
+if ($usesManagedBCQualityCache) {
+    # The checkout was freshly cloned above. Normalize it before filtering so
+    # generated files from clone-time filters cannot survive into execution.
+    & git -C $BCQualityRoot reset --hard HEAD 2>&1 | Out-Null
+    if ($LASTEXITCODE -ne 0) {
+        throw "Could not reset managed BCQuality cache at $BCQualityRoot"
+    }
+    & git -C $BCQualityRoot clean -ffdx 2>&1 | Out-Null
+    if ($LASTEXITCODE -ne 0) {
+        throw "Could not clean managed BCQuality cache at $BCQualityRoot"
     }
 }
 
@@ -313,6 +284,9 @@ if (-not $isGitRepo) {
 if (-not $OutputDir) { $OutputDir = Join-Path $sourceForOutput '.bc-review' }
 New-Item -ItemType Directory -Force -Path $OutputDir | Out-Null
 $OutputDir = (Resolve-Path $OutputDir).Path
+$modelOutputDir = Join-Path ([IO.Path]::GetTempPath()) (
+    'bc-review-output-{0}' -f [guid]::NewGuid().ToString('N')
+)
 
 function Invoke-Git {
     param([string[]] $GitArgs, [switch] $AllowFail)
@@ -557,6 +531,9 @@ try {
     # -----------------------------------------------------------------------
     # Optional: filter BCQuality per config (matches the CI workflow)
     # -----------------------------------------------------------------------
+    if ($usesManagedBCQualityCache -and $SkipBCQualityFilter) {
+        throw '-SkipBCQualityFilter cannot be used with the managed BCQuality cache because the clean cache has no generated skill index.'
+    }
     if (-not $SkipBCQualityFilter) {
         Write-Host "[local-review] Filtering BCQuality per $ConfigPath"
         $env:BCQUALITY_CONFIG_PATH = $ConfigPath
@@ -571,15 +548,15 @@ try {
     $env:REVIEW_PHASE            = 'all'
     $env:REVIEW_TARGET_WORKSPACE = $RepoPath
     $env:REVIEW_WORKSPACE        = $RepoPath
-    $env:REVIEW_OUTPUT_DIR       = $OutputDir
+    New-Item -ItemType Directory -Path $modelOutputDir -Force | Out-Null
+    $env:REVIEW_OUTPUT_DIR       = $modelOutputDir
     $env:BASE_REF                = $effectiveBase
     $env:BCQUALITY_ROOT          = $BCQualityRoot
     $env:BCQUALITY_CONFIG_PATH   = $ConfigPath
     $env:GITHUB_REPOSITORY       = 'local/local'    # placeholder, unused in local mode
     $env:MINIMUM_SEVERITY        = $MinimumSeverity
-    # Local runs commonly need the agent to touch git.exe / pwsh.exe outside
-    # the target folder. Broaden the CLI sandbox for the local path only.
-    $env:COPILOT_ALLOW_ALL_PATHS = 'true'
+    $env:BCQUALITY_CONSUME        = 'plugin'
+    Remove-Item Env:COPILOT_ALLOW_ALL_PATHS -ErrorAction SilentlyContinue
     # Existing mode's base is a parent-less synthesized commit → no merge-base
     # exists, so we must use direct `A..B` diff instead of `A...B`.
     if ($Mode -eq 'Existing') { $env:REVIEW_DIFF_STYLE = 'direct' }
@@ -621,17 +598,22 @@ try {
     }
 
     Write-Host "[local-review] Invoking $reviewScript"
-    $sourceReportPath = Join-Path $BCQualityRoot '_review-report.json'
+    $sourceReportPath = Join-Path $modelOutputDir '_review-report.json'
     $reportPath = Join-Path $OutputDir '_review-report.json'
     Remove-Item -LiteralPath $sourceReportPath -Force -ErrorAction SilentlyContinue
     Remove-Item -LiteralPath $reportPath -Force -ErrorAction SilentlyContinue
     & $reviewScript
-    if ($LASTEXITCODE -ne 0) {
-        throw "Reviewer script failed (exit $LASTEXITCODE)"
-    }
+    $reviewExitCode = $LASTEXITCODE
 
-    if (Test-Path -LiteralPath $sourceReportPath) {
-        Copy-Item -LiteralPath $sourceReportPath -Destination $reportPath -Force
+    foreach ($artifact in @(Get-ChildItem -LiteralPath $modelOutputDir -Force)) {
+        $destination = Join-Path $OutputDir $artifact.Name
+        if ($artifact.PSIsContainer -and (Test-Path -LiteralPath $destination)) {
+            Remove-Item -LiteralPath $destination -Recurse -Force
+        }
+        Copy-Item -LiteralPath $artifact.FullName -Destination $destination -Recurse -Force
+    }
+    if ($reviewExitCode -ne 0) {
+        throw "Reviewer script failed (exit $reviewExitCode)"
     }
     $reportPresent = Test-Path $reportPath
     if (-not $reportPresent) {
@@ -655,6 +637,11 @@ finally {
         & git -C $RepoPath reset --soft HEAD~1 | Out-Null
     }
     Restore-LocalGitConfig -Snapshots $pagerConfigSnapshots
+    Remove-Item -LiteralPath $modelOutputDir -Recurse -Force -ErrorAction SilentlyContinue
+    if ($shadowRepo -and (Test-Path -LiteralPath $shadowRepo)) {
+        Write-Host "[local-review] Removing shadow repo: $shadowRepo"
+        Remove-Item -LiteralPath $shadowRepo -Recurse -Force -ErrorAction SilentlyContinue
+    }
 }
 
 # ---------------------------------------------------------------------------
@@ -688,11 +675,6 @@ if ($Fix) {
         Write-Warning "AI fix pass failed (review results remain valid): $_"
     }
     Write-Host "[local-review] Fix pass complete. Changes are in: $sourceForOutput"
-}
-
-if ($shadowRepo -and (Test-Path $shadowRepo)) {
-    Write-Host "[local-review] Removing shadow repo: $shadowRepo"
-    Remove-Item -Recurse -Force $shadowRepo -ErrorAction SilentlyContinue
 }
 
 Write-Host "[local-review] Done."

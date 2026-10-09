@@ -1920,27 +1920,6 @@ Describe 'Deterministic leaf orchestration contract' {
 }
 
 Describe 'Copilot sub-agent delegation guard' {
-    It 'excludes the task tool for CI reviews' {
-        $arguments = @(Get-CopilotExcludedToolArguments -ReviewSource 'pr' -IsWindowsHost $false)
-
-        $arguments | Should -Be @('--excluded-tools', 'task')
-    }
-
-    It 'excludes the task tool for local non-Windows reviews' {
-        $arguments = @(Get-CopilotExcludedToolArguments -ReviewSource 'local' -IsWindowsHost $false)
-
-        $arguments | Should -Be @('--excluded-tools', 'task')
-    }
-
-    It 'combines the task tool with PowerShell tools in one flag for local Windows reviews' {
-        $arguments = @(Get-CopilotExcludedToolArguments -ReviewSource 'local' -IsWindowsHost $true)
-
-        $arguments | Should -Be @(
-            '--excluded-tools',
-            'task,powershell,read_powershell,write_powershell,stop_powershell,list_powershell'
-        )
-    }
-
     It 'applies the guard to every leaf and root Copilot invocation' {
         $scriptPath = Join-Path (Join-Path (Split-Path -Parent $PSScriptRoot) 'scripts') 'Invoke-CopilotPRReview.ps1'
         $scriptAst = [System.Management.Automation.Language.Parser]::ParseFile($scriptPath, [ref]$null, [ref]$null)
@@ -1952,20 +1931,16 @@ Describe 'Copilot sub-agent delegation guard' {
         foreach ($name in @('Get-LeafCopilotArguments', 'Invoke-CopilotCli')) {
             $function = $functions | Where-Object Name -eq $name
             $function | Should -Not -BeNullOrEmpty
-            $function.Body.Extent.Text | Should -Match '--allow-all-tools'
-            $function.Body.Extent.Text | Should -Match 'Get-CopilotExcludedToolArguments'
+            $function.Body.Extent.Text | Should -Match 'Get-CopilotSecurityArguments'
+            $function.Body.Extent.Text | Should -Not -Match '--allow-all-tools'
+            $function.Body.Extent.Text | Should -Not -Match '--excluded-tools'
         }
-        $allowAllToolFunctions = @($functions | Where-Object {
-            $_.Name -ne 'Get-CopilotExcludedToolArguments' -and
-            $_.Body.Extent.Text -match "'--allow-all-tools'"
-        } | ForEach-Object Name)
-        $allowAllToolFunctions | Sort-Object | Should -Be @('Get-LeafCopilotArguments', 'Invoke-CopilotCli')
+        $securityFunction = $functions | Where-Object Name -eq 'Get-CopilotSecurityArguments'
+        $securityFunction | Should -Not -BeNullOrEmpty
+        $securityFunction.Body.Extent.Text | Should -Match "'--available-tools', 'view', 'glob', 'rg', 'apply_patch'"
+        $securityFunction.Body.Extent.Text | Should -Not -Match '\btask\b'
         ($functions | Where-Object Name -eq 'Start-LeafCopilotProcess').Body.Extent.Text |
             Should -Match 'Get-LeafCopilotArguments -Prompt \$Prompt'
-        $excludedToolFunctions = @($functions | Where-Object {
-            $_.Body.Extent.Text -match "'--excluded-tools'"
-        } | ForEach-Object Name)
-        $excludedToolFunctions | Should -Be @('Get-CopilotExcludedToolArguments')
     }
 
     It 'keeps delegated sub-agent chat spans without usage fail-closed' {
@@ -2034,6 +2009,7 @@ Describe 'Local review authentication' {
     BeforeAll {
         $script:AuthWorkspace = Join-Path $TestDrive 'workspace'
         $script:AuthBCQuality = Join-Path $TestDrive 'bcquality'
+        $script:AuthOutput = Join-Path $TestDrive 'review-output'
         New-Item -ItemType Directory -Path $script:AuthWorkspace -Force | Out-Null
         New-Item -ItemType Directory -Path (Join-Path $script:AuthBCQuality 'skills') -Force | Out-Null
         New-Item -ItemType Directory -Path (Join-Path $script:AuthBCQuality 'schemas') -Force | Out-Null
@@ -2050,6 +2026,7 @@ Describe 'Local review authentication' {
         $BaseRef = 'HEAD'
         $AnalysisWorkspace = $script:AuthWorkspace
         $TrustedWorkspace = $script:AuthWorkspace
+        $ReviewOutputDir = $script:AuthOutput
         $BCQualityRoot = $script:AuthBCQuality
         $BaseBranch = 'main'
         $PrNumber = 0
@@ -2161,6 +2138,12 @@ Describe 'Local review authentication' {
         { Assert-Config } | Should -Throw '*GH_TOKEN is required*'
     }
 
+    It 'rejects a model working directory inside the repository under review' {
+        $ReviewOutputDir = Join-Path $script:AuthWorkspace '.bc-review'
+
+        { Assert-Config } | Should -Throw '*must be disjoint*'
+    }
+
     It 'allows post validation with generated provenance and no BCQuality checkout' {
         $ReviewPhase = 'post'
         $ReviewSource = 'pr'
@@ -2242,15 +2225,15 @@ Describe 'Local review authentication' {
         $environment.ContainsKey('GH_TOKEN') | Should -BeFalse
     }
 
-    It 'keeps forwarding GH_TOKEN to a PR child process' {
+    It 'forwards the PR credential only through the Copilot-specific variable' {
         $environment = New-CopilotChildEnvironment `
             -ReviewSource 'pr' `
             -CopilotToken 'pr-copilot-token' `
             -CopilotGithubToken 'inherited-copilot-token' `
             -CiValue 'true'
 
-        $environment['GH_TOKEN'] | Should -Be 'pr-copilot-token'
-        $environment.ContainsKey('COPILOT_GITHUB_TOKEN') | Should -BeFalse
+        $environment['COPILOT_GITHUB_TOKEN'] | Should -Be 'pr-copilot-token'
+        $environment.ContainsKey('GH_TOKEN') | Should -BeFalse
     }
 
     It 'does not set COPILOT_GH_HOST for github.com' {
@@ -2273,7 +2256,22 @@ Describe 'Local review authentication' {
             -GitHubServerUrl 'https://contoso.ghe.com'
 
         $environment['COPILOT_GH_HOST'] | Should -Be 'https://contoso.ghe.com'
-        $environment['GH_TOKEN'] | Should -Be 'pr-copilot-token'
+        $environment['COPILOT_GITHUB_TOKEN'] | Should -Be 'pr-copilot-token'
+    }
+
+    It 'constrains reviewer tools and token propagation for every platform' {
+        $arguments = @(Get-CopilotSecurityArguments -WritablePath 'C:\review-output\leaf\_review-report.json')
+        $joined = $arguments -join ' '
+
+        $joined | Should -Match '--available-tools view glob rg apply_patch'
+        $joined | Should -Match '--disallow-temp-dir'
+        $joined | Should -Match '--allow-tool write\(C:/review-output/leaf/_review-report\.json\)'
+        $joined | Should -Match '--deny-tool shell'
+        $joined | Should -Match '--deny-tool url'
+        $joined | Should -Match '--secret-env-vars GH_TOKEN,GITHUB_TOKEN,COPILOT_GITHUB_TOKEN'
+        $joined | Should -Not -Match '/\*\*'
+        $joined | Should -Not -Match 'allow-all-paths'
+        $joined | Should -Not -Match 'allow-all-tools'
     }
 }
 
@@ -2296,6 +2294,77 @@ Describe 'Test-GitHubEnterpriseHost' {
         $source | Should -Not -Match "http\.https://github\.com/\.extraheader"
         $source | Should -Match '\$BaseUrl\s*=\s*"\$GitHubApiUrl/repos/\$Repository"'
         $source | Should -Match '\$env:GIT_CONFIG_KEY_0 = "http\.\$GitHubServerUrl/\.extraheader"'
+    }
+}
+
+Describe 'Sanitized review data projection' {
+    BeforeEach {
+        $AnalysisWorkspace = Join-Path $TestDrive 'untrusted-repository'
+        $ReviewDataRoot = Join-Path $TestDrive 'review-data'
+        New-Item -ItemType Directory -Path (Join-Path $AnalysisWorkspace '.github/skills/hostile') -Force | Out-Null
+        New-Item -ItemType Directory -Path (Join-Path $AnalysisWorkspace '.agents/skills/hostile') -Force | Out-Null
+        New-Item -ItemType Directory -Path (Join-Path $AnalysisWorkspace 'src') -Force | Out-Null
+        Set-Content -LiteralPath (Join-Path $AnalysisWorkspace '.github/skills/hostile/SKILL.md') -Value 'hostile'
+        Set-Content -LiteralPath (Join-Path $AnalysisWorkspace '.agents/skills/hostile/SKILL.md') -Value 'hostile'
+        Set-Content -LiteralPath (Join-Path $AnalysisWorkspace 'AGENTS.md') -Value 'hostile'
+        Set-Content -LiteralPath (Join-Path $AnalysisWorkspace 'src/code.al') -Value 'codeunit 1 Test {}'
+        & git -C $AnalysisWorkspace init -q
+        & git -C $AnalysisWorkspace config user.email 'test@example.invalid'
+        & git -C $AnalysisWorkspace config user.name 'Test'
+        & git -C $AnalysisWorkspace add .
+        & git -C $AnalysisWorkspace commit -qm 'fixture'
+    }
+
+    It 'exports reviewable code without loading repository-owned trusted configuration' {
+        New-ReviewDataProjection
+
+        Test-Path -LiteralPath (Join-Path $ReviewDataRoot 'src/code.al') | Should -BeTrue
+        Test-Path -LiteralPath (Join-Path $ReviewDataRoot '.github/skills') | Should -BeFalse
+        Test-Path -LiteralPath (Join-Path $ReviewDataRoot '.agents/skills') | Should -BeFalse
+        Test-Path -LiteralPath (Join-Path $ReviewDataRoot 'AGENTS.md') | Should -BeFalse
+        Test-Path -LiteralPath (Join-Path $AnalysisWorkspace '.github/skills/hostile/SKILL.md') | Should -BeTrue
+    }
+
+    It 'does not let export-ignore omit reviewed files' {
+        Set-Content -LiteralPath (Join-Path $AnalysisWorkspace '.gitattributes') `
+            -Value 'src/code.al export-ignore'
+        & git -C $AnalysisWorkspace add .gitattributes
+        & git -C $AnalysisWorkspace commit -qm 'add hostile export-ignore'
+
+        New-ReviewDataProjection
+
+        $committedContent = [Text.Encoding]::UTF8.GetString(
+            (Invoke-GitCommandBytes -Arguments @(
+                '-C', $AnalysisWorkspace, 'cat-file', 'blob', 'HEAD:src/code.al'
+            ))
+        )
+        Get-Content -LiteralPath (Join-Path $ReviewDataRoot 'src/code.al') -Raw |
+            Should -BeExactly $committedContent
+    }
+
+    It 'does not let export-subst mutate reviewed files' {
+        $substitutionMarker = '$Format:%H$'
+        Set-Content -LiteralPath (Join-Path $AnalysisWorkspace 'src/substituted.txt') `
+            -Value $substitutionMarker -NoNewline
+        Set-Content -LiteralPath (Join-Path $AnalysisWorkspace '.gitattributes') `
+            -Value 'src/substituted.txt export-subst'
+        & git -C $AnalysisWorkspace add .gitattributes src/substituted.txt
+        & git -C $AnalysisWorkspace commit -qm 'add hostile export-subst'
+
+        New-ReviewDataProjection
+
+        Get-Content -LiteralPath (Join-Path $ReviewDataRoot 'src/substituted.txt') -Raw |
+            Should -BeExactly $substitutionMarker
+    }
+}
+
+Describe 'Review output path isolation' {
+    It 'canonicalizes REVIEW_OUTPUT_DIR before deriving the Copilot working directory' {
+        $source = Get-Content -LiteralPath $scriptPath -Raw
+
+        $source | Should -Match '\$ReviewOutputDir\s*=\s*\[IO\.Path\]::GetFullPath\(\$ReviewOutputDirRaw\)'
+        $source.IndexOf('$ReviewOutputDir  = [IO.Path]::GetFullPath($ReviewOutputDirRaw)') |
+            Should -BeLessThan $source.IndexOf('$AgentWorkDir = $ReviewOutputDir')
     }
 }
 
@@ -3144,7 +3213,7 @@ Describe 'Runtime leaf source-bound schemas and prompt' {
         $prompt | Should -Match 'separate per-file line viewer'
         $prompt | Should -Match 'Self-validate the complete final JSON against the supplied leaf'
         $prompt | Should -Not -Match 'No truncated inline list'
-        (Get-CommandLineCharacterUpperBound -Arguments (@($script:CopilotExecutable) + (Get-LeafCopilotArguments -Prompt $prompt))) |
+        (Get-CommandLineCharacterUpperBound -Arguments (@($script:CopilotExecutable) + (Get-LeafCopilotArguments -Prompt $prompt -WorkDir $TestDrive))) |
             Should -BeLessOrEqual 24576
     }
 
@@ -3167,18 +3236,18 @@ Describe 'Runtime leaf source-bound schemas and prompt' {
         $prompt | Should -Not -Match '"src/.*": 1\.\.'
         $schema = (New-FindingsReportRoleSchemas -SharedSchemaJson $boundedShared -SourceFiles $boundedSources).Leaf | ConvertFrom-Json -AsHashtable
         $schema.definitions.location.allOf[0].properties.file.enum.Count | Should -Be 154
-        (Get-CommandLineCharacterUpperBound -Arguments (@($script:CopilotExecutable) + (Get-LeafCopilotArguments -Prompt $prompt))) |
+        (Get-CommandLineCharacterUpperBound -Arguments (@($script:CopilotExecutable) + (Get-LeafCopilotArguments -Prompt $prompt -WorkDir $TestDrive))) |
             Should -BeLessOrEqual 24576
     }
 
     It 'accounts for executable and non-prompt arguments before admitting a small inline list' {
         $inline = New-LeafReviewPrompt -Leaf $promptLeaf -WorkDir $TestDrive
-        $initialBound = Get-CommandLineCharacterUpperBound -Arguments (@($script:CopilotExecutable) + (Get-LeafCopilotArguments -Prompt $inline))
+        $initialBound = Get-CommandLineCharacterUpperBound -Arguments (@($script:CopilotExecutable) + (Get-LeafCopilotArguments -Prompt $inline -WorkDir $TestDrive))
         $extraCharacters = [int][Math]::Ceiling((24576 + 50 - $initialBound) / 2)
         $script:CopilotExecutable += 'x' * $extraCharacters
         $prompt = New-LeafReviewPrompt -Leaf $promptLeaf -WorkDir $TestDrive
         $prompt | Should -Match 'No truncated inline list'
-        (Get-CommandLineCharacterUpperBound -Arguments (@($script:CopilotExecutable) + (Get-LeafCopilotArguments -Prompt $prompt))) |
+        (Get-CommandLineCharacterUpperBound -Arguments (@($script:CopilotExecutable) + (Get-LeafCopilotArguments -Prompt $prompt -WorkDir $TestDrive))) |
             Should -BeLessOrEqual 24576
         (Get-CommandLineCharacterUpperBound -Arguments @('', 'a"b\', 'path with space', ([string][char]0x4e2d))) |
             Should -Be (1 + 3 + (2 * 4 + 3) + (2 * 15 + 3) + 5)

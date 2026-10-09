@@ -142,16 +142,11 @@ $BCQualitySha = Resolve-BCQualityCommitForPhase `
     -Phase $ReviewPhase `
     -Root $BCQualityRoot `
     -ExpectedCommit (($env:BCQUALITY_SHA ?? '').Trim())
-# BCQuality consumption mode. 'cwd' (default, legacy) runs the Copilot CLI with
-# its working directory set to the BCQuality clone, so the agent reads
-# ./skills/entry.md directly and writes per-run artifacts into the clone. 'plugin'
-# mounts the same clone read-only via --plugin-dir and invokes the
-# bcquality-al-review skill, re-homing per-run artifacts to $ReviewOutputDir. The
-# toggle exists for A/B validation; keep 'cwd' as the default so existing CI and
-# BC-Bench behavior is unchanged until 'plugin' is proven at parity.
-$BCQualityConsume = (($env:BCQUALITY_CONSUME ?? 'cwd') + '').Trim().ToLowerInvariant()
-if ($BCQualityConsume -notin @('cwd', 'plugin')) {
-    throw "BCQUALITY_CONSUME must be 'cwd' or 'plugin' (got '$BCQualityConsume')"
+# BCQuality is trusted reviewer knowledge, not a model-writable workspace. Mount
+# it as a plugin and keep every generated artifact in the per-run output tree.
+$BCQualityConsume = (($env:BCQUALITY_CONSUME ?? 'plugin') + '').Trim().ToLowerInvariant()
+if ($BCQualityConsume -ne 'plugin') {
+    throw "BCQUALITY_CONSUME must be 'plugin' (got '$BCQualityConsume'). The legacy writable 'cwd' mode is not supported."
 }
 $CopilotModel     = ($env:COPILOT_MODEL ?? '').Trim()
 $CopilotCliVersion = ($env:COPILOT_REVIEW_CLI_VERSION ?? '').Trim()
@@ -189,7 +184,10 @@ $ReviewApplyTo    = $env:REVIEW_APPLY_TO ?? '**'
 # Used by local wrappers to review a subfolder without shadowing the diff at
 # post-processing time. Empty = review the full diff.
 $ReviewPathSpec   = ($env:REVIEW_PATH_SPEC ?? '').Trim()
-$ReviewOutputDir  = $env:REVIEW_OUTPUT_DIR ?? (Join-Path $TrustedWorkspace 'review-output')
+$ReviewOutputDirRaw = $env:REVIEW_OUTPUT_DIR ?? (Join-Path ([IO.Path]::GetTempPath()) (
+    'bc-review-output-{0}' -f [guid]::NewGuid().ToString('N')
+))
+$ReviewOutputDir  = [IO.Path]::GetFullPath($ReviewOutputDirRaw)
 $BaseBranch       = $env:BASE_BRANCH ?? 'main'
 $AgentLabelRaw    = ($env:COPILOT_REVIEW_AGENT_LABEL ?? '').Trim()
 $AgentSemVerRaw   = ($env:COPILOT_REVIEW_AGENT_VERSION ?? '').Trim()
@@ -239,14 +237,16 @@ $ReportFileName   = '_review-report.json'
 $LeafReportSchemaFileName = '_review-findings-report.leaf.schema.json'
 $RootReportSchemaFileName = '_review-findings-report.root.schema.json'
 
-# Working directory for the Copilot CLI and the home of the per-run agent
-# artifacts (_task-context.json, _review-changed-files.txt,
-# _review-object-index.txt, $ReportFileName). In 'cwd' mode this is the BCQuality
-# clone (the agent's CWD IS the knowledge tree). In 'plugin' mode the clone is
-# mounted read-only via --plugin-dir, so the artifacts live in $ReviewOutputDir
-# instead. Every prompt path to these artifacts is CWD-relative, so it resolves
-# correctly under either root without further changes.
-$AgentWorkDir = if ($BCQualityConsume -eq 'plugin') { $ReviewOutputDir } else { $BCQualityRoot }
+# Working directory for the Copilot CLI and the home of per-run artifacts.
+$AgentWorkDir = $ReviewOutputDir
+$ReviewDataRoot = Join-Path ([System.IO.Path]::GetTempPath()) (
+    'bc-al-review-data-{0}' -f [guid]::NewGuid().ToString('N')
+)
+$ReviewDiffFileName = '_review-diff.patch'
+$reviewDataCleanupPath = $ReviewDataRoot
+$null = Register-EngineEvent -SourceIdentifier PowerShell.Exiting -Action {
+    Remove-Item -LiteralPath $reviewDataCleanupPath -Recurse -Force -ErrorAction SilentlyContinue
+}.GetNewClosure()
 
 # Severity taxonomy used by the comment renderer and the MINIMUM_SEVERITY gate.
 # Lower rank = more severe. BCQuality emits blocker/major/minor/info; we map
@@ -510,6 +510,26 @@ function Assert-Config {
     }
 
     if ($needsCli) {
+        $comparison = if ($IsWindows) {
+            [StringComparison]::OrdinalIgnoreCase
+        } else {
+            [StringComparison]::Ordinal
+        }
+        $analysisPath = [IO.Path]::GetFullPath($AnalysisWorkspace).TrimEnd(
+            [IO.Path]::DirectorySeparatorChar,
+            [IO.Path]::AltDirectorySeparatorChar
+        )
+        $outputPath = [IO.Path]::GetFullPath($ReviewOutputDir).TrimEnd(
+            [IO.Path]::DirectorySeparatorChar,
+            [IO.Path]::AltDirectorySeparatorChar
+        )
+        $analysisPrefix = $analysisPath + [IO.Path]::DirectorySeparatorChar
+        $outputPrefix = $outputPath + [IO.Path]::DirectorySeparatorChar
+        if ($outputPath.StartsWith($analysisPrefix, $comparison) -or
+            $analysisPath.StartsWith($outputPrefix, $comparison) -or
+            $outputPath.Equals($analysisPath, $comparison)) {
+            throw 'REVIEW_OUTPUT_DIR and REVIEW_TARGET_WORKSPACE must be disjoint so the Copilot working directory cannot inherit or expose untrusted repository configuration.'
+        }
         if (-not $BCQualityRoot)   { throw 'BCQUALITY_ROOT is required (set by the runner workflow Fetch BCQuality step)' }
         if (-not (Test-Path $BCQualityRoot)) {
             throw "BCQUALITY_ROOT does not exist: $BCQualityRoot"
@@ -671,7 +691,9 @@ function New-CopilotChildEnvironment {
         }
     }
     elseif ($CopilotToken) {
-        $cleanEnv['GH_TOKEN'] = $CopilotToken
+        # Use the CLI-specific authentication variable instead of exposing a
+        # general-purpose gh credential to the reviewer process.
+        $cleanEnv['COPILOT_GITHUB_TOKEN'] = $CopilotToken
     }
 
     # Copilot CLI authenticates against github.com unless told otherwise. On a
@@ -700,6 +722,90 @@ function Invoke-GitCommand {
         throw "git command failed (exit $LASTEXITCODE): git $argsText`n$details"
     }
     return $output
+}
+
+function New-GitProcess {
+    param([Parameter(Mandatory)][string[]] $Arguments)
+
+    $startInfo = [System.Diagnostics.ProcessStartInfo]::new()
+    $startInfo.FileName = 'git'
+    $startInfo.UseShellExecute = $false
+    $startInfo.CreateNoWindow = $true
+    $startInfo.RedirectStandardInput = $true
+    $startInfo.RedirectStandardOutput = $true
+    $startInfo.RedirectStandardError = $true
+    foreach ($argument in $Arguments) {
+        $startInfo.ArgumentList.Add($argument)
+    }
+
+    $process = [System.Diagnostics.Process]::new()
+    $process.StartInfo = $startInfo
+    if (-not $process.Start()) {
+        $process.Dispose()
+        throw "Failed to start git $($Arguments -join ' ')."
+    }
+    return $process
+}
+
+function Invoke-GitCommandBytes {
+    param([Parameter(Mandatory)][string[]] $Arguments)
+
+    $process = New-GitProcess -Arguments $Arguments
+    try {
+        $process.StandardInput.Close()
+        $errorTask = $process.StandardError.ReadToEndAsync()
+        $output = [IO.MemoryStream]::new()
+        try {
+            $process.StandardOutput.BaseStream.CopyTo($output)
+            $process.WaitForExit()
+            $details = $errorTask.GetAwaiter().GetResult()
+            if ($process.ExitCode -ne 0) {
+                throw "git command failed (exit $($process.ExitCode)): git $($Arguments -join ' ')`n$details"
+            }
+            return ,$output.ToArray()
+        }
+        finally {
+            $output.Dispose()
+        }
+    }
+    finally {
+        $process.Dispose()
+    }
+}
+
+function Read-GitProtocolLine {
+    param([Parameter(Mandatory)][IO.Stream] $Stream)
+
+    $bytes = [System.Collections.Generic.List[byte]]::new()
+    while ($true) {
+        $value = $Stream.ReadByte()
+        if ($value -lt 0) {
+            throw 'Unexpected end of output from git cat-file.'
+        }
+        if ($value -eq 10) {
+            return [Text.Encoding]::ASCII.GetString($bytes.ToArray())
+        }
+        $bytes.Add([byte]$value)
+    }
+}
+
+function Copy-StreamBytes {
+    param(
+        [Parameter(Mandatory)][IO.Stream] $InputStream,
+        [Parameter(Mandatory)][IO.Stream] $OutputStream,
+        [Parameter(Mandatory)][long] $Count
+    )
+
+    $buffer = [byte[]]::new(81920)
+    $remaining = $Count
+    while ($remaining -gt 0) {
+        $read = $InputStream.Read($buffer, 0, [Math]::Min($buffer.Length, $remaining))
+        if ($read -le 0) {
+            throw "Unexpected end of git blob after $($Count - $remaining) of $Count bytes."
+        }
+        $OutputStream.Write($buffer, 0, $read)
+        $remaining -= $read
+    }
 }
 
 # Runs a git command with an ephemeral, host-scoped credential so that fetches
@@ -750,6 +856,158 @@ function Get-GitFilePatch {
     # still get the full patch for each surviving file.
     $output = Invoke-GitCommand -Arguments @('-C', $AnalysisWorkspace, 'diff', $DiffRange, '--', $FilePath)
     return ($output -join "`n")
+}
+
+function New-ReviewDataProjection {
+    if (Test-Path -LiteralPath $ReviewDataRoot) {
+        Remove-Item -LiteralPath $ReviewDataRoot -Recurse -Force
+    }
+    New-Item -ItemType Directory -Path $ReviewDataRoot -Force | Out-Null
+
+    # Read blobs directly from Git's object database. Unlike git archive or a
+    # checkout, cat-file does not honor PR-controlled attributes such as
+    # export-ignore, export-subst, or content filters.
+    $listingBytes = Invoke-GitCommandBytes -Arguments @(
+        '-C', $AnalysisWorkspace, 'ls-tree', '-r', '-z', '--full-tree', 'HEAD'
+    )
+    $entries = [Text.Encoding]::UTF8.GetString($listingBytes).Split(
+        [char]0,
+        [StringSplitOptions]::RemoveEmptyEntries
+    )
+    $blobEntries = [System.Collections.Generic.List[object]]::new()
+    $projectionRoot = [IO.Path]::GetFullPath($ReviewDataRoot).TrimEnd(
+        [IO.Path]::DirectorySeparatorChar,
+        [IO.Path]::AltDirectorySeparatorChar
+    )
+    $projectionPrefix = $projectionRoot + [IO.Path]::DirectorySeparatorChar
+    $pathComparison = if ($IsWindows) {
+        [StringComparison]::OrdinalIgnoreCase
+    } else {
+        [StringComparison]::Ordinal
+    }
+
+    foreach ($entry in $entries) {
+        $tabIndex = $entry.IndexOf("`t", [StringComparison]::Ordinal)
+        if ($tabIndex -lt 0) {
+            throw "Unexpected git ls-tree entry: '$entry'."
+        }
+        $metadata = $entry.Substring(0, $tabIndex).Split(' ')
+        if ($metadata.Count -ne 3) {
+            throw "Unexpected git ls-tree metadata: '$($entry.Substring(0, $tabIndex))'."
+        }
+        if ($metadata[1] -ne 'blob') {
+            continue
+        }
+
+        $relativePath = $entry.Substring($tabIndex + 1)
+        $destination = [IO.Path]::GetFullPath(
+            (Join-Path $projectionRoot ($relativePath -replace '/', [IO.Path]::DirectorySeparatorChar))
+        )
+        if (-not $destination.StartsWith($projectionPrefix, $pathComparison)) {
+            throw "Refusing to project Git path outside the review data root: '$relativePath'."
+        }
+        $blobEntries.Add([pscustomobject]@{
+            ObjectId = $metadata[2]
+            Path = $destination
+        })
+    }
+
+    if ($blobEntries.Count -gt 0) {
+        $process = New-GitProcess -Arguments @('-C', $AnalysisWorkspace, 'cat-file', '--batch')
+        try {
+            $errorTask = $process.StandardError.ReadToEndAsync()
+            foreach ($blob in $blobEntries) {
+                $process.StandardInput.WriteLine($blob.ObjectId)
+                $process.StandardInput.Flush()
+
+                $header = Read-GitProtocolLine -Stream $process.StandardOutput.BaseStream
+                if ($header -notmatch '\A(?<oid>[0-9a-f]+) blob (?<size>\d+)\z' -or
+                    $Matches.oid -ne $blob.ObjectId) {
+                    throw "Unexpected git cat-file response for '$($blob.ObjectId)': '$header'."
+                }
+
+                $parent = Split-Path -Parent $blob.Path
+                if (-not (Test-Path -LiteralPath $parent)) {
+                    New-Item -ItemType Directory -Path $parent -Force | Out-Null
+                }
+                $output = [IO.File]::Open(
+                    $blob.Path,
+                    [IO.FileMode]::CreateNew,
+                    [IO.FileAccess]::Write,
+                    [IO.FileShare]::None
+                )
+                try {
+                    Copy-StreamBytes `
+                        -InputStream $process.StandardOutput.BaseStream `
+                        -OutputStream $output `
+                        -Count ([long]$Matches.size)
+                }
+                finally {
+                    $output.Dispose()
+                }
+                if ($process.StandardOutput.BaseStream.ReadByte() -ne 10) {
+                    throw "Missing delimiter after Git blob '$($blob.ObjectId)'."
+                }
+            }
+
+            $process.StandardInput.Close()
+            $process.WaitForExit()
+            $details = $errorTask.GetAwaiter().GetResult()
+            if ($process.ExitCode -ne 0) {
+                throw "git cat-file failed (exit $($process.ExitCode)):`n$details"
+            }
+        }
+        finally {
+            if (-not $process.HasExited) {
+                $process.Kill($true)
+                $process.WaitForExit()
+            }
+            $process.Dispose()
+        }
+    }
+
+    $trustedConfigurationPaths = @(
+        '.github/skills',
+        '.github/agents',
+        '.github/instructions',
+        '.github/copilot-instructions.md',
+        '.agents/skills',
+        '.claude/skills',
+        'AGENTS.md',
+        'CLAUDE.md',
+        'GEMINI.md'
+    )
+    foreach ($relativePath in $trustedConfigurationPaths) {
+        $candidate = Join-Path $ReviewDataRoot ($relativePath -replace '/', [IO.Path]::DirectorySeparatorChar)
+        if (Test-Path -LiteralPath $candidate) {
+            Remove-Item -LiteralPath $candidate -Recurse -Force
+        }
+    }
+}
+
+function Save-ReviewDiff {
+    $gitArgs = @('-C', $AnalysisWorkspace, 'diff', '--no-ext-diff', '--binary', $DiffRange) + (Get-PathSpecArgs)
+    $diff = Invoke-GitCommand -Arguments $gitArgs
+    Set-Content -LiteralPath (Join-Path $AgentWorkDir $ReviewDiffFileName) `
+        -Value $diff `
+        -Encoding UTF8
+}
+
+function Get-CopilotSecurityArguments {
+    param([Parameter(Mandatory)][string] $WritablePath)
+
+    $writable = ($WritablePath -replace '\\', '/')
+    return @(
+        '--available-tools', 'view', 'glob', 'rg', 'apply_patch',
+        '--disallow-temp-dir',
+        '--allow-tool', 'view',
+        '--allow-tool', 'glob',
+        '--allow-tool', 'rg',
+        '--allow-tool', "write($writable)",
+        '--deny-tool', 'shell',
+        '--deny-tool', 'url',
+        '--secret-env-vars', 'GH_TOKEN,GITHUB_TOKEN,COPILOT_GITHUB_TOKEN'
+    )
 }
 
 function Checkout-PrBranch {
@@ -2073,11 +2331,7 @@ function Get-ReviewLeafPlan {
 
     $indexPath = Join-Path $BCQualityRoot '_skill-index.json'
     if (-not (Test-Path -LiteralPath $indexPath -PathType Leaf)) {
-        $generator = Join-Path $BCQualityRoot 'tools/Build-SkillIndex.ps1'
-        if (-not (Test-Path -LiteralPath $generator -PathType Leaf)) {
-            throw "BCQuality skill-index generator was not found: $generator"
-        }
-        & $generator -BCQualityRoot $BCQualityRoot -IndexPath $indexPath | Out-Null
+        throw "BCQuality skill index was not generated by the trusted filtering phase: $indexPath"
     }
 
     try {
@@ -2151,16 +2405,12 @@ function New-LeafReviewPrompt {
         [Parameter(Mandatory)][string] $WorkDir
     )
 
-    $reviewRoot = ($AnalysisWorkspace -replace '\\', '/')
+    $reviewRoot = ($ReviewDataRoot -replace '\\', '/')
     $bcqualityRootFwd = ($BCQualityRoot -replace '\\', '/')
     $leafPath = "$bcqualityRootFwd/$($Leaf.path)"
     $doPath = "$bcqualityRootFwd/skills/do.md"
     $readPath = "$bcqualityRootFwd/skills/read.md"
     $sourceFiles = $script:FindingsConsumerContext.SourceFiles
-    $pathSpecLine = if ($ReviewPathSpec) {
-        $specs = @($ReviewPathSpec -split ';' | ForEach-Object { $_.Trim() } | Where-Object { $_ })
-        if ($specs.Count -gt 0) { ' -- ' + ($specs -join ' ') } else { '' }
-    } else { '' }
 
     $prompt = @"
 Review only the domain defined by BCQuality leaf skill '$($Leaf.id)'.
@@ -2175,10 +2425,11 @@ Run inputs in your working directory:
 - ./_task-context.json
 - ./_review-changed-files.txt
 - ./_review-object-index.txt
+- ./_review-diff.patch
 - ./_review-source-bounds.json
 
-Target repository worktree: $reviewRoot
-Diff command: git -C "$reviewRoot" --no-pager diff $DiffRange$pathSpecLine
+Sanitized target repository snapshot: $reviewRoot
+Complete review diff: ./$ReviewDiffFileName
 
 Execute the leaf skill's Source -> Relevance -> Worklist -> Action protocol
 exactly once. Read the complete changed-file manifest before selecting the
@@ -2220,7 +2471,7 @@ schema, including its file-specific line maxima, before returning. Emit no other
     # Budget at most 4,096 encoded characters for the entire list and 24,576
     # for the executable plus all arguments, leaving headroom for launch details.
     if ((Get-CommandLineCharacterUpperBound -Arguments @($inlineBounds)) -le 4096 -and
-        (Get-CommandLineCharacterUpperBound -Arguments (@($script:CopilotExecutable) + (Get-LeafCopilotArguments -Prompt $candidate))) -le 24576) {
+        (Get-CommandLineCharacterUpperBound -Arguments (@($script:CopilotExecutable) + (Get-LeafCopilotArguments -Prompt $candidate -WorkDir $WorkDir))) -le 24576) {
         return $candidate
     }
     return "$prompt`n`nThe complete $($sourceFiles.Count)-entry line-limit list is in ./_review-source-bounds.json; read it in full. No truncated inline list is provided."
@@ -2236,47 +2487,28 @@ function Get-CommandLineCharacterUpperBound {
     return $length
 }
 
-function Get-CopilotExcludedToolArguments {
+function Get-LeafCopilotArguments {
     param(
-        [Parameter(Mandatory)][string] $ReviewSource,
-        [Parameter(Mandatory)][bool] $IsWindowsHost
+        [Parameter(Mandatory)][string] $Prompt,
+        [Parameter(Mandatory)][string] $WorkDir
     )
 
-    # Sub-agents launched through the task tool emit OTel chat spans without
-    # usage or cost attributes, so a delegated review can never prove complete
-    # usage telemetry. Keep delegation mechanically unavailable to every
-    # review process instead of relying on prompt instructions alone.
-    $excludedTools = @('task')
-    # Copilot CLI 1.0.77 starts each Windows PowerShell shell tool through a
-    # visible legacy pseudo-terminal. Review agents only need the native file
-    # tools, so keep shell tools unavailable for local Windows reviews. This
-    # prevents one console window from flashing for every review process.
-    if ($ReviewSource -eq 'local' -and $IsWindowsHost) {
-        $excludedTools += @('powershell', 'read_powershell', 'write_powershell', 'stop_powershell', 'list_powershell')
-    }
-    return @('--excluded-tools', ($excludedTools -join ','))
-}
-
-function Get-LeafCopilotArguments {
-    param([Parameter(Mandatory)][string] $Prompt)
-
     $copilotArgs = @(
-        '--allow-all-tools',
         '--no-custom-instructions',
         '--no-color',
         '--log-level', $CopilotLogLevel,
-        '--add-dir', $AnalysisWorkspace,
+        '--add-dir', $ReviewDataRoot,
         '--add-dir', $BCQualityRoot,
         '-p', $Prompt,
         "--model=$LeafModel"
     )
+    $copilotArgs = @(
+        Get-CopilotSecurityArguments -WritablePath (Join-Path $WorkDir $ReportFileName)
+    ) + $copilotArgs
     if (Test-GitHubEnterpriseHost -ServerUrl $GitHubServerUrl) {
         $copilotArgs = @('--host', $GitHubServerUrl) + $copilotArgs
     }
-    if ((($env:COPILOT_ALLOW_ALL_PATHS ?? '') + '').Trim().ToLowerInvariant() -in @('1','true','yes','on')) {
-        $copilotArgs = @('--allow-all-paths') + $copilotArgs
-    }
-    return @(Get-CopilotExcludedToolArguments -ReviewSource $ReviewSource -IsWindowsHost ([bool]$IsWindows)) + $copilotArgs
+    return $copilotArgs
 }
 
 function Start-LeafCopilotProcess {
@@ -2287,11 +2519,18 @@ function Start-LeafCopilotProcess {
     )
 
     New-Item -ItemType Directory -Path $WorkDir -Force | Out-Null
-    foreach ($inputName in @('_task-context.json', '_review-changed-files.txt', '_review-object-index.txt', '_review-source-bounds.json', $LeafReportSchemaFileName)) {
+    foreach ($inputName in @(
+        '_task-context.json',
+        '_review-changed-files.txt',
+        '_review-object-index.txt',
+        $ReviewDiffFileName,
+        '_review-source-bounds.json',
+        $LeafReportSchemaFileName
+    )) {
         Copy-Item -LiteralPath (Join-Path $AgentWorkDir $inputName) -Destination (Join-Path $WorkDir $inputName) -Force
     }
     $otelPath = Join-Path $WorkDir '_copilot-otel.jsonl'
-    $copilotArgs = Get-LeafCopilotArguments -Prompt $Prompt
+    $copilotArgs = Get-LeafCopilotArguments -Prompt $Prompt -WorkDir $WorkDir
 
     $cleanEnv = New-CopilotChildEnvironment `
         -ReviewSource $ReviewSource `
@@ -2829,7 +3068,7 @@ function Build-ConsolidationPrompt {
         [object[]] $FailedLeaves = @()
     )
 
-    $reviewRoot = ($AnalysisWorkspace -replace '\\', '/')
+    $reviewRoot = ($ReviewDataRoot -replace '\\', '/')
     $bcqualityRootFwd = ($BCQualityRoot -replace '\\', '/')
     $taskContextPath = ((Join-Path $AgentWorkDir '_task-context.json') -replace '\\', '/')
     $orderedReports = @($LeafResults | ForEach-Object { ($_.ReportPath -replace '\\', '/') })
@@ -2857,8 +3096,8 @@ $reportList
 Leaf processes that failed without a usable report:
 $failedList
 
-Target repository worktree: $reviewRoot
-Diff range: $DiffRange
+Sanitized target repository snapshot: $reviewRoot
+Complete review diff: ./$ReviewDiffFileName
 
 Read and validate every leaf report. Preserve their order in sub-results.
 Aggregate their findings according to the super-skill contract, then perform
@@ -2953,45 +3192,28 @@ function Invoke-CopilotCli {
     # like '● Read foo' or '└ N lines read'). Sending the prompt via stdin
     # instead leaves the CLI in interactive mode, which renders the live
     # tool-call UI to stdout and breaks downstream JSON parsing.
-    # --allow-all-tools is required for non-interactive runs. --add-dir
-    # grants the sandbox access to the PR worktree, which lives outside the
-    # CLI's working directory ($BCQualityRoot) and would otherwise be denied
-    # for read/git operations. --no-color keeps stdout free of ANSI sequences;
-    # the log level defaults to error but local runs can opt into usage logs.
+    # The reviewer gets only native read tools plus a path-scoped write grant
+    # for its structured report. The original repository is never mounted.
     $copilotArgs = @(
-        '--allow-all-tools',
         '--no-custom-instructions',
         '--no-color',
         '--log-level', $CopilotLogLevel,
-        '--add-dir', $AnalysisWorkspace,
+        '--add-dir', $ReviewDataRoot,
         '--add-dir', $ReviewOutputDir,
         '-p', $Prompt
     )
+    $copilotArgs = @(
+        Get-CopilotSecurityArguments -WritablePath (Join-Path $AgentWorkDir $ReportFileName)
+    ) + $copilotArgs
     # On GitHub Enterprise the CLI must be pointed at the host that issued the
     # token; github.com stays the CLI default and gets no flag.
     if (Test-GitHubEnterpriseHost -ServerUrl $GitHubServerUrl) {
         $copilotArgs = @('--host', $GitHubServerUrl) + $copilotArgs
     }
-    # In 'plugin' mode, mount the BCQuality clone as a Copilot CLI plugin (exposing
-    # the bcquality-al-review skill) and grant read access to its tree via
-    # --add-dir, because the clone is no longer the CLI working directory. In 'cwd'
-    # mode neither flag is added and the agent reads the tree from its CWD as before.
-    if ($BCQualityConsume -eq 'plugin') {
-        $copilotArgs = @('--plugin-dir', $BCQualityRoot, '--add-dir', $BCQualityRoot) + $copilotArgs
-    }
-    # Local runs commonly need to touch tools/binaries outside $AnalysisWorkspace
-    # (e.g. git.exe under Program Files). Opt-in via COPILOT_ALLOW_ALL_PATHS
-    # so CI PR reviews keep their tighter sandbox.
-    if ((($env:COPILOT_ALLOW_ALL_PATHS ?? '') + '').Trim().ToLowerInvariant() -in @('1','true','yes','on')) {
-        $copilotArgs = @('--allow-all-paths') + $copilotArgs
-    }
-    $copilotArgs = @(Get-CopilotExcludedToolArguments -ReviewSource $ReviewSource -IsWindowsHost ([bool]$IsWindows)) + $copilotArgs
+    $copilotArgs = @('--plugin-dir', $BCQualityRoot, '--add-dir', $BCQualityRoot) + $copilotArgs
     if ($CopilotModel) { $copilotArgs += "--model=$CopilotModel" }
 
-    # Pass only a safe allowlist of env vars to the subprocess. PR generation
-    # keeps its existing GH_TOKEN behavior. Local reviews use the credential
-    # store unless the parent is CI, where the dedicated Copilot token is safe
-    # to forward without exposing unrelated inherited tokens.
+    # Pass only a safe allowlist of environment variables to the subprocess.
     $cleanEnv = New-CopilotChildEnvironment `
         -ReviewSource $ReviewSource `
         -CopilotToken $CopilotToken `
@@ -5054,7 +5276,9 @@ Write-Host "Found $($changedFileNames.Count) changed file(s)"
 # generate/all phases (the publish/post job never clones BCQuality). Skip them
 # in post to avoid Join-Path binding against a null $BCQualityRoot.
 if ($ReviewPhase -ne 'post') {
-    if ($BCQualityConsume -eq 'plugin') { $null = New-Item -ItemType Directory -Path $AgentWorkDir -Force }
+    $null = New-Item -ItemType Directory -Path $AgentWorkDir -Force
+    New-ReviewDataProjection
+    Save-ReviewDiff
     $changedFilesManifest = Join-Path $AgentWorkDir '_review-changed-files.txt'
     Set-Content -LiteralPath $changedFilesManifest -Value $changedFileNames -Encoding UTF8
     Write-LogPhaseDetail "Changed-file manifest written to $changedFilesManifest"
@@ -5134,6 +5358,12 @@ if ($ReviewPhase -ne 'post') {
     $prompt = Build-ConsolidationPrompt `
         -LeafResults $leafResults `
         -FailedLeaves $script:FailedLeafReviews
+    foreach ($relativePath in @('.github', '.agents', '.claude', 'AGENTS.md', 'CLAUDE.md', 'GEMINI.md')) {
+        $candidate = Join-Path $AgentWorkDir $relativePath
+        if (Test-Path -LiteralPath $candidate) {
+            Remove-Item -LiteralPath $candidate -Recurse -Force
+        }
+    }
     $rootStartedAt = [DateTime]::UtcNow
     try {
         $output = Invoke-CopilotCli -Prompt $prompt

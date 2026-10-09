@@ -36,6 +36,31 @@ Describe 'Invoke-BCQualityFilter knowledge samples' {
         & $script:filterScript -BCQualityRoot $script:root -Config $script:onlyMicrosoft | Out-Null
     }
 
+    Describe 'Invoke-BCQualityFilter executable integrity' {
+        It 'refuses to execute a modified tracked skill-index generator' {
+            $root = New-BCQualityFixture
+            try {
+                $tools = Join-Path $root 'tools'
+                New-Item -ItemType Directory -Path $tools -Force | Out-Null
+                $generator = Join-Path $tools 'Build-SkillIndex.ps1'
+                Set-Content -LiteralPath $generator -Value 'param($BCQualityRoot, $IndexPath)'
+                & git -C $root init -q
+                & git -C $root config user.email 'test@example.invalid'
+                & git -C $root config user.name 'Test'
+                & git -C $root add .
+                & git -C $root commit -qm 'fixture'
+                Add-Content -LiteralPath $generator -Value 'Write-Output compromised'
+
+                {
+                    & $script:filterScript -BCQualityRoot $root -Config $script:onlyMicrosoft
+                } | Should -Throw '*differs from the resolved Git commit*'
+            }
+            finally {
+                Remove-Item -LiteralPath $root -Recurse -Force -ErrorAction SilentlyContinue
+            }
+        }
+    }
+
     AfterEach {
         Remove-Item -LiteralPath $script:root -Recurse -Force -ErrorAction SilentlyContinue
     }

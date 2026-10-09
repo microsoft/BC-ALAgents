@@ -408,6 +408,7 @@ jobs:
           BCQUALITY_BC_VERSION: ${{ inputs.bc_version }}
           COPILOT_MODEL: ${{ inputs.copilot_model }}
           COPILOT_REVIEW_CLI_VERSION: ${{ steps.copilot-cli.outputs.version }}
+          BCQUALITY_CONSUME: plugin
           COPILOT_REVIEW_LEAF_MODEL: ${{ inputs.copilot_leaf_model }}
           COPILOT_REVIEW_LEAF_EXECUTION: ${{ inputs.leaf_execution }}
           COPILOT_REVIEW_MAX_LEAF_CONCURRENCY: ${{ inputs.max_leaf_concurrency }}
