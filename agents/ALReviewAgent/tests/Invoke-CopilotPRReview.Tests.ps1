@@ -2225,6 +2225,32 @@ Describe 'Local review authentication' {
         $environment.ContainsKey('GH_TOKEN') | Should -BeFalse
     }
 
+    It 'preserves an explicit CLI auto-update setting unchanged' -ForEach @('false', 'true', ' FALSE ') {
+        $original = [System.Environment]::GetEnvironmentVariable('COPILOT_AUTO_UPDATE')
+        try {
+            [System.Environment]::SetEnvironmentVariable('COPILOT_AUTO_UPDATE', $_)
+            $environment = New-CopilotChildEnvironment -ReviewSource 'local' -CiValue 'true'
+
+            $environment['COPILOT_AUTO_UPDATE'] | Should -BeExactly $_
+        }
+        finally {
+            [System.Environment]::SetEnvironmentVariable('COPILOT_AUTO_UPDATE', $original)
+        }
+    }
+
+    It 'does not inject a CLI auto-update default when unset' {
+        $original = [System.Environment]::GetEnvironmentVariable('COPILOT_AUTO_UPDATE')
+        try {
+            [System.Environment]::SetEnvironmentVariable('COPILOT_AUTO_UPDATE', $null)
+            $environment = New-CopilotChildEnvironment -ReviewSource 'local' -CiValue 'true'
+
+            $environment.ContainsKey('COPILOT_AUTO_UPDATE') | Should -BeFalse
+        }
+        finally {
+            [System.Environment]::SetEnvironmentVariable('COPILOT_AUTO_UPDATE', $original)
+        }
+    }
+
     It 'forwards the PR credential only through the Copilot-specific variable' {
         $environment = New-CopilotChildEnvironment `
             -ReviewSource 'pr' `

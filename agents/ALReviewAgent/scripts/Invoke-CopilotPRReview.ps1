@@ -57,6 +57,7 @@
                                                 CLI credential store.
         COPILOT_MODEL                        - explicit model name for Copilot CLI
         COPILOT_REVIEW_CLI_VERSION           - requested pinned Copilot CLI version
+        COPILOT_AUTO_UPDATE                  - optional CLI auto-update setting, forwarded unchanged
         COPILOT_REVIEW_LEAF_MODEL            - model for leaf processes (defaults in review.yml)
         COPILOT_REVIEW_LEAF_EXECUTION        - serial|parallel (default serial)
         COPILOT_REVIEW_MAX_LEAF_CONCURRENCY  - positive concurrency bound for parallel mode
@@ -678,7 +679,8 @@ function New-CopilotChildEnvironment {
     )
 
     $allowedKeys = @('PATH','PATHEXT','HOME','USERPROFILE','TMP','TEMP','TMPDIR','APPDATA','LOCALAPPDATA',
-                     'SystemRoot','ComSpec','CI','TERM','LANG','LC_ALL','npm_config_prefix','NPM_CONFIG_PREFIX')
+                     'SystemRoot','ComSpec','CI','TERM','LANG','LC_ALL','npm_config_prefix','NPM_CONFIG_PREFIX',
+                     'COPILOT_AUTO_UPDATE')
     $cleanEnv = @{}
     foreach ($key in $allowedKeys) {
         $val = [System.Environment]::GetEnvironmentVariable($key)

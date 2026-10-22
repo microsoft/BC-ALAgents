@@ -303,6 +303,11 @@ official `GitHub Copilot CLI <version>.` banner. The requested pin must exactly
 equal that startup probe and must have an explicit entry in
 [`copilot-cli-compatibility.psd1`](agents/ALReviewAgent/copilot-cli-compatibility.psd1).
 
+Direct callers can set `COPILOT_AUTO_UPDATE=false` to prevent the CLI from
+switching to a cached newer version. The engine forwards this optional setting
+unchanged to child processes; it supplies no default when unset. The startup
+version check still rejects a mismatch before any model invocation.
+
 | Exact startup version | OTel `cli_version` contract |
 | --- | --- |
 | `1.0.83` | Required and must exactly equal the startup probe. |
