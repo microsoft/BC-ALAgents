@@ -1,0 +1,90 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "title": "Bounded review lineage and diagnostics (not semantic proof)",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["schema_version", "status", "final_index_basis", "disposition_status", "truncated", "candidates", "final_findings", "root_dispositions", "diagnostics"],
+  "properties": {
+    "schema_version": { "const": 1 },
+    "status": { "enum": ["running", "completed", "partial", "failed"] },
+    "final_index_basis": { "const": "_review-report.json#/findings;zero-based;before-engine-filtering" },
+    "disposition_status": { "enum": ["not_requested", "missing", "invalid", "provided"] },
+    "truncated": { "type": "boolean" },
+    "candidates": { "type": "array", "maxItems": 1000, "items": { "$ref": "#/definitions/candidate" } },
+    "final_findings": { "type": "array", "maxItems": 1000, "items": { "$ref": "#/definitions/final" } },
+    "root_dispositions": { "type": "array", "maxItems": 1000, "items": { "$ref": "#/definitions/disposition" } },
+    "diagnostics": { "type": "array", "maxItems": 128, "items": { "$ref": "#/definitions/diagnostic" } }
+  },
+  "definitions": {
+    "path": {
+      "type": "string", "minLength": 1, "maxLength": 240,
+      "pattern": "^(?!/)(?!.*(?:^|/)\\.{1,2}(?:/|$))(?!.*//)[A-Za-z0-9_. /()\\-]+$"
+    },
+    "refs": {
+      "type": ["array", "null"], "maxItems": 8, "uniqueItems": true,
+      "items": { "type": "string", "maxLength": 200, "pattern": "^(microsoft|community|custom)/knowledge/[a-z0-9-]+/[a-z0-9-]+\\.md$" }
+    },
+    "location": {
+      "type": "object", "additionalProperties": false, "required": ["file", "line", "end_line"],
+      "properties": {
+        "file": { "anyOf": [{ "$ref": "#/definitions/path" }, { "type": "null" }] },
+        "line": { "type": ["integer", "null"], "minimum": 1, "maximum": 2147483647 },
+        "end_line": { "type": ["integer", "null"], "minimum": 1, "maximum": 2147483647 }
+      }
+    },
+    "severity": { "enum": ["blocker", "major", "minor", "info", "Critical", "High", "Medium", "Low", null] },
+    "candidate": {
+      "type": "object", "additionalProperties": false,
+      "required": ["candidate_id", "leaf_id", "leaf_ordinal", "finding_index", "report_sha256", "admission", "article_refs", "location", "severity", "normalizations", "body", "body_status"],
+      "properties": {
+        "candidate_id": { "type": "string", "maxLength": 40, "pattern": "^l[0-9]+-f[0-9]+$" },
+        "leaf_id": { "type": ["string", "null"], "maxLength": 80, "pattern": "^[a-z0-9-]+$" },
+        "leaf_ordinal": { "type": "integer", "minimum": 1, "maximum": 2147483647 },
+        "finding_index": { "type": "integer", "minimum": 0, "maximum": 2147483647 },
+        "report_sha256": { "type": ["string", "null"], "pattern": "^[a-f0-9]{64}$" },
+        "admission": { "enum": ["accepted", "rejected", "unknown"] },
+        "body": { "type": ["string", "null"], "maxLength": 1024 },
+        "body_status": { "enum": ["retained", "truncated", "redacted", "omitted"] },
+        "article_refs": { "$ref": "#/definitions/refs" },
+        "location": { "$ref": "#/definitions/location" },
+        "severity": { "$ref": "#/definitions/severity" },
+        "normalizations": { "type": "array", "maxItems": 2, "uniqueItems": true, "items": { "enum": ["finding-id", "location-range"] } }
+      }
+    },
+    "final": {
+      "type": "object", "additionalProperties": false,
+      "required": ["final_index", "article_refs", "location", "severity"],
+      "properties": {
+        "final_index": { "type": "integer", "minimum": 0, "maximum": 2147483647 },
+        "article_refs": { "$ref": "#/definitions/refs" },
+        "location": { "$ref": "#/definitions/location" },
+        "severity": { "$ref": "#/definitions/severity" }
+      }
+    },
+    "disposition": {
+      "type": "object", "additionalProperties": false,
+      "required": ["candidate_id", "disposition", "final_indices", "basis", "reason_code", "article_refs"],
+      "properties": {
+        "candidate_id": { "type": "string", "maxLength": 40, "pattern": "^l[0-9]+-f[0-9]+$" },
+        "disposition": { "enum": ["kept", "merged", "downgraded", "removed", "unknown"] },
+        "final_indices": { "type": ["array", "null"], "maxItems": 8, "uniqueItems": true, "items": { "type": "integer", "minimum": 0, "maximum": 999 } },
+        "basis": { "enum": ["model_declared", "unknown"] },
+        "reason_code": { "enum": ["duplicate", "severity_reassessment", "unsupported", "out_of_scope", "not_actionable", null] },
+        "article_refs": { "$ref": "#/definitions/refs" }
+      }
+    },
+    "diagnostic": {
+      "type": "object", "additionalProperties": false,
+      "required": ["role", "ordinal", "stage", "code", "process_status", "report_outcome", "exit_code"],
+      "properties": {
+        "role": { "enum": ["leaf", "root", "run"] },
+        "ordinal": { "type": ["integer", "null"], "minimum": 1, "maximum": 2147483647 },
+        "stage": { "enum": ["process-start", "process-exit", "telemetry", "report-read", "report-parse", "report-validation", "report-outcome", "consolidation", "unknown"] },
+        "code": { "enum": ["start_failed", "timeout", "nonzero_exit", "process_not_exited", "telemetry_invalid", "report_missing", "report_invalid_json", "report_invalid", "report_failed", "report_partial", "coverage_partial", "all_leaves_failed", "unknown_failure", null] },
+        "process_status": { "enum": ["completed", "failed", "unknown"] },
+        "report_outcome": { "enum": ["completed", "not-applicable", "no-knowledge", "partial", "failed", null] },
+        "exit_code": { "type": ["integer", "null"], "minimum": -2147483648, "maximum": 2147483647 }
+      }
+    }
+  }
+}

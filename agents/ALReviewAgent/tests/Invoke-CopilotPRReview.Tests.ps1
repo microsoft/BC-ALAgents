@@ -15,6 +15,7 @@ param(
 BeforeAll {
     $scriptPath = Join-Path (Join-Path (Split-Path -Parent $PSScriptRoot) 'scripts') 'Invoke-CopilotPRReview.ps1'
     $EngineRoot = Split-Path -Parent (Split-Path -Parent (Split-Path -Parent (Split-Path -Parent $scriptPath)))
+    . (Join-Path (Split-Path -Parent $scriptPath) 'ReviewTrace.ps1')
     $tokens = $null
     $parseErrors = $null
     $ast = [System.Management.Automation.Language.Parser]::ParseFile(
@@ -878,6 +879,7 @@ Describe 'Domain rendering safety' {
 
 Describe 'Deterministic leaf orchestration contract' {
     BeforeEach {
+        Initialize-ReviewTrace
         $BCQualityRoot = Join-Path $TestDrive 'deterministic-bcquality'
         $ReviewOutputDir = Join-Path $TestDrive 'review-output'
         $ReviewStartedAt = [DateTime]::UtcNow.AddSeconds(-5)
@@ -1227,6 +1229,9 @@ Describe 'Deterministic leaf orchestration contract' {
 
         $prompt | Should -Match ([regex]::Escape('./_review-findings-report.root.schema.json'))
         $prompt | Should -Match 'every\s+sub-result is a leaf report that MUST NOT contain sub-results or\s+skipped-sub-skills'
+        $prompt | Should -Match '_root-dispositions.json'
+        $prompt | Should -Match 'zero-based'
+        $prompt | Should -Match 'Omit uncertain source relationships'
     }
 
     It 'accepts a normal leaf report without super-skill fields' {
@@ -1276,6 +1281,7 @@ Describe 'Deterministic leaf orchestration contract' {
     }
 
     It 'harvests OTel before recovering a nonzero leaf exit' {
+        Initialize-ReviewTrace
         $workDir = Join-Path $TestDrive 'nonzero-leaf'
         New-Item -ItemType Directory -Path $workDir -Force | Out-Null
         $otel = @(
@@ -1307,9 +1313,13 @@ Describe 'Deterministic leaf orchestration contract' {
         $failed = @($script:ReviewProcessTelemetry | Where-Object status -eq 'failed')
         $failed[0].metrics.total_tokens | Should -Be 100
         $failed[0].failure_reason | Should -Match 'exited with code 7'
+        (Get-ReviewTraceState).diagnostics[0].stage | Should -Be 'process-exit'
+        (Get-ReviewTraceState).diagnostics[0].code | Should -Be 'nonzero_exit'
+        (Get-ReviewTraceState).diagnostics[0].exit_code | Should -Be 7
     }
 
     It 'harvests OTel before recovering a timed-out leaf' {
+        Initialize-ReviewTrace
         $workDir = Join-Path $TestDrive 'timeout-leaf'
         New-Item -ItemType Directory -Path $workDir -Force | Out-Null
         @(
@@ -1343,6 +1353,7 @@ Describe 'Deterministic leaf orchestration contract' {
             $failed = @($script:ReviewProcessTelemetry | Where-Object status -eq 'failed')
             $failed[0].metrics.total_tokens | Should -Be 46
             $failed[0].failure_reason | Should -Match 'timed out'
+            (Get-ReviewTraceState).diagnostics[0].code | Should -Be 'timeout'
         }
         finally {
             $CopilotCliTimeoutMinutes = $oldTimeout
@@ -1573,6 +1584,29 @@ Describe 'Deterministic leaf orchestration contract' {
         @($manifest.processes | Where-Object status -eq 'failed').Count | Should -Be 2
         @($manifest.processes | Where-Object status -eq 'failed').skill_id |
             Should -Be @('al-security-review', 'al-style-review')
+        $trace = Get-Content -LiteralPath (Join-Path $ReviewOutputDir '_review-trace.json') -Raw | ConvertFrom-Json
+        $trace.status | Should -Be failed
+        $trace.diagnostics[-1].code | Should -Be all_leaves_failed
+        $manifest.trace_schema_version | Should -Be 1
+    }
+
+    It 'records exit-zero failed report outcomes without changing usable leaf eligibility' {
+        $plan = @(Get-ReviewLeafPlan)
+        foreach ($leaf in $plan) {
+            $script:TestLeafReports[$leaf.id] = @{
+                skill = @{ id = $leaf.id }
+                outcome = 'failed'
+                findings = @()
+                suppressed = @()
+            }
+        }
+        $results = @(Invoke-DeterministicLeafReviews -Plan $plan)
+        $results.Count | Should -Be 2
+        $trace = Get-Content -LiteralPath (Join-Path $ReviewOutputDir '_review-trace.json') -Raw | ConvertFrom-Json
+        $trace.diagnostics | Should -HaveCount 2
+        $trace.diagnostics[0].exit_code | Should -Be 0
+        $trace.diagnostics[0].report_outcome | Should -Be failed
+        $trace.diagnostics[0].code | Should -Be report_failed
     }
 
     It 'rejects a consumer-invalid leaf before consolidation without salvaging findings or changing raw bytes' {

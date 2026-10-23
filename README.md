@@ -292,6 +292,61 @@ In the reusable two-job workflow, `BCQUALITY_ROOT` is required only by the
 checkout-free `post` phase as `BCQUALITY_SHA`; post requires that value and
 publishes only the generated artifact.
 
+### Bounded reviewer trace
+
+Instrumented runs advertise `trace_schema_version: 1` in `_run-manifest.json`
+and write `_review-trace.json` alongside it. The
+[`review-trace.schema.json`](agents/ALReviewAgent/schemas/review-trace.schema.json)
+and [example](agents/ALReviewAgent/tests/fixtures/review-trace.v1.json) define the
+collector contract. Older manifests without the marker have no promised trace;
+consumers should label that evidence unavailable rather than fabricate lineage.
+Failures before engine manifest creation (including knowledge preparation) may
+also have no trace.
+
+Candidates retain the original leaf's finding index, leaf ordinal/ID, original
+report SHA-256, supplied article paths, location, severity and bounded finding
+prose. `lN-fM` is a **run-local** identity: ordinal N, zero-based original finding
+index M, not an article ID or a cross-run semantic identity. `admission` records
+whether the report was accepted; deterministic ID/range normalization is listed
+separately and does not overwrite the original candidate projection.
+
+The root receives `_trace-candidates.json` and may write a separate
+`_root-dispositions.json`. This optional output does not extend BCQuality's
+findings schema. Explicit kept/merged/downgraded/removed relationships are marked
+`model_declared`, **not independently proven causality**. Missing, duplicate,
+invalid or unsupported relationships remain `unknown`; the engine never matches
+by wording, proximity or counts. Unmapped final findings have unknown origin,
+not automatically a root-only origin. `final_indices` addresses only the root
+`_review-report.json` top-level `findings` array, zero-based and before engine
+filtering. It is not an index into `al-code-review-findings.json` or BC-Bench
+finding IDs. Root rationale is limited to an optional fixed `reason_code` and
+explicit article paths; no free-text root or failure reason is copied.
+
+Bounds: 1,000 candidates/final findings/dispositions, 128 diagnostics, eight
+article paths/final indices per record, and a 4 MiB UTF-8 artifact limit. Source
+paths are at most 240 characters and must belong to the captured source
+inventory; article paths are at most 200, leaf IDs 80. Unrepresentable fields
+become null. `body` contains only the original finding `message` (or `body`
+when message is absent), at most 1,024 characters, never suggested code or a
+report envelope. `body_status` is retained/truncated/redacted/omitted.
+Defensive redaction removes control characters and recognizable GitHub tokens,
+Bearer credentials and password/secret/token/API-key assignments. **This is not
+a guarantee that arbitrary secrets in model-authored prose are detected**;
+treat candidate prose with the same access controls as final findings. Clipping
+sets top-level `truncated`; redacted-and-clipped text uses `body_status=redacted`.
+If the total byte bound is reached, trailing candidates and their relationships
+are omitted and `truncated=true`. Null refs mean no usable explicit references,
+not that the engine inferred an article.
+
+Diagnostics separate process status/exit code from report outcome. A process
+can exit zero with a failed report, and all processes can finish while the run
+is partial. Stage/code values come from the executing branch, not exception
+text; unsupported causes remain unknown. Existing review eligibility, retries,
+severity filtering, reports and metrics are unchanged. The additional root
+observability prompt and write grant **can affect model behavior** and must be
+shared by both arms of a controlled comparison. No behavior invariance or
+functional coverage improvement is established by trace-only tests.
+
 ### Copilot CLI compatibility
 
 The reusable workflow installs the exact `copilot_cli_version` input (default:
