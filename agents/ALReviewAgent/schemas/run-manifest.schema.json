@@ -17,6 +17,7 @@
   ],
   "properties": {
     "schema_version": { "const": 1 },
+    "trace_schema_version": { "const": 1 },
     "status": { "enum": ["running", "completed", "partial", "failed"] },
     "started_at": { "type": "string", "format": "date-time" },
     "completed_at": { "type": ["string", "null"], "format": "date-time" },

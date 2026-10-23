@@ -57,6 +57,7 @@
                                                 CLI credential store.
         COPILOT_MODEL                        - explicit model name for Copilot CLI
         COPILOT_REVIEW_CLI_VERSION           - requested pinned Copilot CLI version
+        COPILOT_AUTO_UPDATE                  - optional CLI auto-update setting, forwarded unchanged
         COPILOT_REVIEW_LEAF_MODEL            - model for leaf processes (defaults in review.yml)
         COPILOT_REVIEW_LEAF_EXECUTION        - serial|parallel (default serial)
         COPILOT_REVIEW_MAX_LEAF_CONCURRENCY  - positive concurrency bound for parallel mode
@@ -79,6 +80,8 @@
 
 Set-StrictMode -Version Latest
 $ErrorActionPreference = 'Stop'
+. (Join-Path $PSScriptRoot 'ReviewTrace.ps1')
+Initialize-ReviewTrace
 
 # ---------------------------------------------------------------------------
 # Configuration
@@ -678,7 +681,8 @@ function New-CopilotChildEnvironment {
     )
 
     $allowedKeys = @('PATH','PATHEXT','HOME','USERPROFILE','TMP','TEMP','TMPDIR','APPDATA','LOCALAPPDATA',
-                     'SystemRoot','ComSpec','CI','TERM','LANG','LC_ALL','npm_config_prefix','NPM_CONFIG_PREFIX')
+                     'SystemRoot','ComSpec','CI','TERM','LANG','LC_ALL','npm_config_prefix','NPM_CONFIG_PREFIX',
+                     'COPILOT_AUTO_UPDATE')
     $cleanEnv = @{}
     foreach ($key in $allowedKeys) {
         $val = [System.Environment]::GetEnvironmentVariable($key)
@@ -1896,6 +1900,7 @@ function Clear-CopilotMetricsArtifacts {
     if ($OutputDir) {
         [void]$paths.Add((Join-Path $OutputDir '_run-metrics.json'))
         [void]$paths.Add((Join-Path $OutputDir '_run-manifest.json'))
+        [void]$paths.Add((Join-Path $OutputDir '_review-trace.json'))
         [void]$paths.Add((Join-Path $OutputDir '_copilot-otel.jsonl'))
     }
     foreach ($path in $paths) {
@@ -2264,6 +2269,7 @@ function Save-ReviewRunManifest {
     $orderedProcesses = @($script:ReviewProcessTelemetry | Sort-Object ordinal, role)
     $manifest = [pscustomobject][ordered]@{
         schema_version = 1
+        trace_schema_version = 1
         status = $Status
         started_at = $ReviewStartedAt.ToString('o')
         completed_at = if ($null -ne $script:ReviewRunCompletedAt) { $script:ReviewRunCompletedAt.ToString('o') } else { $null }
@@ -2302,6 +2308,7 @@ function Save-ReviewRunManifest {
         throw 'Generated review run manifest does not conform to its schema.'
     }
     New-Item -ItemType Directory -Path $ReviewOutputDir -Force | Out-Null
+    Save-ReviewTrace -OutputDir $ReviewOutputDir -Status $Status
     Set-Content -LiteralPath (Join-Path $ReviewOutputDir '_run-manifest.json') `
         -Value $manifestJson `
         -Encoding UTF8
@@ -2322,6 +2329,7 @@ function Assert-UsableLeafReviewCoverage {
     if ($failedIds.Count -gt 0) {
         $reason += " Failed leaves: $($failedIds -join ', ')."
     }
+    Add-ReviewTraceDiagnostic -Role run -Stage consolidation -Code all_leaves_failed
     Save-ReviewRunManifest -Status failed -FailureReason $reason
     throw $reason
 }
@@ -2814,6 +2822,9 @@ function Receive-LeafCopilotProcess {
     $elapsed = [DateTime]::UtcNow - $State.StartedAt
     $timedOut = $CopilotCliTimeoutMinutes -gt 0 -and $elapsed.TotalMinutes -ge $CopilotCliTimeoutMinutes
     $integrityFailure = $false
+    $traceStage = 'process-exit'
+    $traceCode = 'process_not_exited'
+    $reportObject = $null
     try {
         if ($timedOut -and -not $process.HasExited) {
             try {
@@ -2846,6 +2857,7 @@ function Receive-LeafCopilotProcess {
             $integrityFailure = $true
             throw "Leaf '$($State.Leaf.id)' was received before completion."
         }
+        $traceCode = 'unknown_failure'
         $stdout = $State.StdoutTask.GetAwaiter().GetResult()
         $stderr = $State.StderrTask.GetAwaiter().GetResult()
         Set-Content -LiteralPath (Join-Path $State.WorkDir 'stdout.txt') -Value $stdout -Encoding UTF8
@@ -2863,6 +2875,8 @@ function Receive-LeafCopilotProcess {
             $terminationFailure = "Copilot CLI leaf '$($State.Leaf.id)' exited with code $($process.ExitCode)."
         }
 
+        $traceStage = 'telemetry'
+        $traceCode = 'telemetry_invalid'
         $parsedTelemetry = if (Test-Path -LiteralPath $State.OtelPath -PathType Leaf) {
             Read-CopilotOtelFile -OtelPath $State.OtelPath
         } else {
@@ -2889,21 +2903,32 @@ function Receive-LeafCopilotProcess {
         }
 
         if ($terminationFailure) {
+            $traceStage = 'process-exit'
+            $traceCode = if ($timedOut) { 'timeout' } else { 'nonzero_exit' }
             throw $terminationFailure
         }
 
+        $traceStage = 'report-read'
+        $traceCode = 'report_missing'
         if (-not (Test-Path -LiteralPath $reportPath -PathType Leaf)) {
             throw "Leaf '$($State.Leaf.id)' did not produce '$reportPath'."
         }
+        $traceCode = 'unknown_failure'
         $rawReportPath = Join-Path $State.WorkDir '_review-report.raw.json'
         Copy-Item -LiteralPath $reportPath -Destination $rawReportPath -Force -ErrorAction Stop
         $reportText = Get-Content -LiteralPath $rawReportPath -Raw
+        $traceStage = 'report-parse'
+        $traceCode = 'report_invalid_json'
         try {
             $reportObject = $reportText | ConvertFrom-Json -Depth 30 -ErrorAction Stop
         }
         catch {
             throw "Leaf '$($State.Leaf.id)' produced invalid JSON: $($_.Exception.Message)"
         }
+        Add-ReviewTraceCandidates -Leaf $State.Leaf -Report $reportObject `
+            -ReportHash (Get-FileHash -LiteralPath $rawReportPath -Algorithm SHA256).Hash.ToLowerInvariant()
+        $traceStage = 'report-validation'
+        $traceCode = 'report_invalid'
         if ([string]$reportObject.skill.id -ne [string]$State.Leaf.id) {
             throw "Leaf '$($State.Leaf.id)' returned report for '$($reportObject.skill.id)'."
         }
@@ -2915,6 +2940,7 @@ function Receive-LeafCopilotProcess {
         $accepted = New-AcceptedLeafReport -ReportText $reportText `
             -Schema (Get-FindingsReportRoleSchema -Role leaf) -Context $script:FindingsConsumerContext
         $reportObject = $accepted.Report
+        Set-ReviewTraceAdmission -Ordinal $State.Leaf.ordinal -Admission accepted -Changes $accepted.Changes
         $normalization = $null
         if ($accepted.Changes.Count -gt 0) {
             $normalization = [ordered]@{
@@ -2929,6 +2955,14 @@ function Receive-LeafCopilotProcess {
 
         Write-LogPhaseDetail "Leaf $($State.Leaf.ordinal)/$($State.Leaf.id) completed: $(@($reportObject.findings).Count) finding(s), $($leafMetrics.total_tokens) token(s)."
         $completedAt = [DateTime]::UtcNow
+        $outcome = Get-TraceProperty $reportObject 'outcome'
+        $diagnostic = @{
+            Role = 'leaf'; Ordinal = $State.Leaf.ordinal; Stage = 'report-outcome'
+            ProcessStatus = 'completed'; ReportOutcome = $outcome; ExitCode = $process.ExitCode
+        }
+        if ($outcome -eq 'failed') { $diagnostic.Code = 'report_failed' }
+        elseif ($outcome -eq 'partial') { $diagnostic.Code = 'report_partial' }
+        Add-ReviewTraceDiagnostic @diagnostic
         Add-ReviewProcessTelemetry `
             -Role leaf `
             -Ordinal $State.Leaf.ordinal `
@@ -2953,6 +2987,9 @@ function Receive-LeafCopilotProcess {
         $failure = $_
         $completedAt = [DateTime]::UtcNow
         $exitCode = try { if ($process.HasExited) { $process.ExitCode } else { $null } } catch { $null }
+        Set-ReviewTraceAdmission -Ordinal $State.Leaf.ordinal -Admission rejected
+        Add-ReviewTraceDiagnostic -Role leaf -Ordinal $State.Leaf.ordinal -Stage $traceStage `
+            -Code $traceCode -ProcessStatus failed -ReportOutcome (Get-TraceProperty $reportObject 'outcome') -ExitCode $exitCode
         Add-ReviewProcessTelemetry `
             -Role leaf `
             -Ordinal $State.Leaf.ordinal `
@@ -3003,6 +3040,7 @@ function Invoke-DeterministicLeafReviews {
                     $active.Add((Start-LeafCopilotProcess -Leaf $leaf -WorkDir $workDir -Prompt $prompt)) | Out-Null
                 }
                 catch {
+                    Add-ReviewTraceDiagnostic -Role leaf -Ordinal $leaf.ordinal -Stage process-start -Code start_failed -ProcessStatus failed
                     Add-ReviewProcessTelemetry `
                         -Role leaf `
                         -Ordinal $leaf.ordinal `
@@ -3089,6 +3127,22 @@ Authoritative contracts:
 - Super-skill: $bcqualityRootFwd/microsoft/skills/review/al-code-review.md
 - Findings protocol: $bcqualityRootFwd/skills/do.md
 - Run task context: $taskContextPath
+
+Optional observability output (does not change finding selection or severity):
+Read ./_trace-candidates.json for run-local original leaf finding identities.
+candidate_id lN-fM means leaf ordinal N and zero-based original findings index M;
+report_sha256 identifies the original leaf artifact. Do not infer missing lineage.
+After writing the normal review report, optionally write ./_root-dispositions.json:
+{"schema_version":1,"dispositions":[{"candidate_id":"l1-f0","disposition":"kept","final_indices":[0],"reason_code":null,"article_refs":null}]}
+Use only actual decisions you made: kept, merged, downgraded, or removed.
+final_indices addresses the final root report's top-level findings array (zero-based,
+before engine filtering), never sub-results. Removed uses []; other decisions
+reference at least one final index. A merge can reference the same final index for
+multiple source candidates. Omit uncertain source relationships; do not guess.
+Optional reason_code is duplicate, severity_reassessment, unsupported, out_of_scope,
+not_actionable, or null. article_refs is only supplied BCQuality article paths or null.
+No free-text explanation. At most 1000 decisions, 8 indices/refs per decision.
+This sidecar is model-declared lineage, not independent proof of causality.
 
 Leaf findings-reports, already ordered by the super-skill contract:
 $reportList
@@ -3211,6 +3265,8 @@ function Invoke-CopilotCli {
         $copilotArgs = @('--host', $GitHubServerUrl) + $copilotArgs
     }
     $copilotArgs = @('--plugin-dir', $BCQualityRoot, '--add-dir', $BCQualityRoot) + $copilotArgs
+    $traceOutputPath = (Join-Path $AgentWorkDir '_root-dispositions.json') -replace '\\', '/'
+    $copilotArgs += @('--allow-tool', "write($traceOutputPath)")
     if ($CopilotModel) { $copilotArgs += "--model=$CopilotModel" }
 
     # Pass only a safe allowlist of environment variables to the subprocess.
@@ -3275,6 +3331,8 @@ function Invoke-CopilotCli {
         # them after WaitForExit() guarantees we have the full output.
         $null = $process.Start()
         $processStarted = $true
+        $script:RootTraceStage = 'process-exit'
+        $script:RootTraceCode = 'unknown_failure'
         $stdoutTask = $process.StandardOutput.ReadToEndAsync()
         $stderrTask = $process.StandardError.ReadToEndAsync()
         if ($CopilotCliTimeoutMinutes -eq 0) {
@@ -3286,8 +3344,10 @@ function Invoke-CopilotCli {
             $completed = $process.WaitForExit($timeoutMs)
         }
         if (-not $completed) {
+            $script:RootTraceCode = 'timeout'
             throw "Copilot CLI timed out after $CopilotCliTimeoutMinutes minutes."
         }
+        $script:RootTraceExitCode = $process.ExitCode
 
         $stdout = $stdoutTask.GetAwaiter().GetResult()
         $stderr = $stderrTask.GetAwaiter().GetResult()
@@ -3315,6 +3375,7 @@ function Invoke-CopilotCli {
         $script:AgentTranscript += $transcriptBuilder.ToString()
 
         if ($process.ExitCode -ne 0) {
+            $script:RootTraceCode = 'nonzero_exit'
             Write-LogErr 'Copilot CLI failed' "Copilot CLI exited with code $($process.ExitCode)"
             throw "Copilot CLI exited with code $($process.ExitCode)"
         }
@@ -3331,7 +3392,14 @@ function Invoke-CopilotCli {
         Complete-CopilotProcess `
             -Process $process `
             -ProcessStarted $processStarted `
-            -HarvestAction { Save-CurrentCopilotRunMetrics }
+            -HarvestAction {
+                try { Save-CurrentCopilotRunMetrics }
+                catch {
+                    $script:RootTraceStage = 'telemetry'
+                    $script:RootTraceCode = 'telemetry_invalid'
+                    throw
+                }
+            }
     }
 }
 
@@ -5188,6 +5256,9 @@ function Save-ReviewArtifacts {
     if (Test-Path -LiteralPath (Join-Path $ReviewOutputDir '_run-manifest.json') -PathType Leaf) {
         $savedFiles.Add('_run-manifest.json') | Out-Null
     }
+    if (Test-Path -LiteralPath (Join-Path $ReviewOutputDir '_review-trace.json') -PathType Leaf) {
+        $savedFiles.Add('_review-trace.json') | Out-Null
+    }
 
     Write-Host "Saved review artifacts to $ReviewOutputDir"
     foreach ($f in $savedFiles) { Write-LogPhaseDetail "- $f" }
@@ -5355,6 +5426,7 @@ if ($ReviewPhase -ne 'post') {
     $leafResults = @(Invoke-DeterministicLeafReviews -Plan $leafPlan)
     $reviewCompletionStatus = Assert-UsableLeafReviewCoverage -Plan $leafPlan -LeafResults $leafResults
     Write-LogPhaseDetail "$($leafResults.Count) leaf process(es) produced usable reports; $(@($script:FailedLeafReviews).Count) failed. Starting root consolidation on $CopilotModel."
+    Initialize-RootTraceInput -WorkDir $AgentWorkDir
     $prompt = Build-ConsolidationPrompt `
         -LeafResults $leafResults `
         -FailedLeaves $script:FailedLeafReviews
@@ -5365,8 +5437,13 @@ if ($ReviewPhase -ne 'post') {
         }
     }
     $rootStartedAt = [DateTime]::UtcNow
+    $script:RootTraceStage = 'process-start'
+    $script:RootTraceCode = 'start_failed'
+    $script:RootTraceExitCode = $null
     try {
         $output = Invoke-CopilotCli -Prompt $prompt
+        $script:RootTraceStage = 'telemetry'
+        $script:RootTraceCode = 'telemetry_invalid'
         Assert-CopilotInvocationMetrics `
             -Metrics $script:LastCopilotInvocationMetrics `
             -RequestedModel $CopilotModel `
@@ -5375,6 +5452,8 @@ if ($ReviewPhase -ne 'post') {
     }
     catch {
         $rootFailure = $_
+        Add-ReviewTraceDiagnostic -Role root -Ordinal ($leafPlan.Count + 1) -Stage $script:RootTraceStage `
+            -Code $script:RootTraceCode -ProcessStatus failed -ExitCode $script:RootTraceExitCode
         Add-ReviewProcessTelemetry `
             -Role root `
             -Ordinal ($leafPlan.Count + 1) `
@@ -5427,6 +5506,8 @@ if ($ReviewPhase -ne 'post') {
     }
     catch {
         $rootFailure = $_
+        Add-ReviewTraceDiagnostic -Role root -Ordinal ($leafPlan.Count + 1) -Stage report-validation `
+            -Code report_invalid -ProcessStatus completed -ExitCode 0
         Add-ReviewProcessTelemetry `
             -Role root `
             -Ordinal ($leafPlan.Count + 1) `
@@ -5457,6 +5538,15 @@ if ($ReviewPhase -ne 'post') {
         -Plan $leafPlan `
         -LeafResults $leafResults `
         -Report $consolidatedReport
+    Complete-ReviewTrace -Report $consolidatedReport -DispositionPath (Join-Path $AgentWorkDir '_root-dispositions.json')
+    $rootDiagnostic = @{
+        Role = 'root'; Ordinal = ($leafPlan.Count + 1); Stage = 'report-outcome'
+        ProcessStatus = 'completed'; ReportOutcome = [string]$consolidatedReport.outcome; ExitCode = 0
+    }
+    if ($consolidatedReport.outcome -eq 'failed') { $rootDiagnostic.Code = 'report_failed' }
+    elseif ($consolidatedReport.outcome -eq 'partial') { $rootDiagnostic.Code = 'report_partial' }
+    elseif ($reviewCompletionStatus -eq 'partial') { $rootDiagnostic.Code = 'coverage_partial' }
+    Add-ReviewTraceDiagnostic @rootDiagnostic
     Save-ReviewRunManifest `
         -Status $reviewCompletionStatus `
         -FailureReason $(if ($reviewCompletionStatus -eq 'failed') { [string]$consolidatedReport.'outcome-reason' } else { $null })
