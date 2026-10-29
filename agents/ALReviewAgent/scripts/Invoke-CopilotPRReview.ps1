@@ -2495,6 +2495,190 @@ function Get-CommandLineCharacterUpperBound {
     return $length
 }
 
+function ConvertTo-LeafCliFailureDiagnostic {
+    param(
+        [AllowNull()][string] $Stdout,
+        [AllowNull()][object] $ExitCode,
+        [AllowNull()][object] $TimedOut,
+        [Parameter(Mandatory)][int] $Ordinal,
+        [Parameter(Mandatory)][string] $Stage,
+        [Parameter(Mandatory)][string] $Code
+    )
+
+    $events = [System.Collections.Generic.List[object]]::new()
+    $malformed = 0
+    $unsupported = 0
+    $limited = $false
+    $truncated = $false
+    $leadingRecordDiscarded = $false
+    $incompleteRecordDiscarded = $false
+    $state = 'unavailable'
+    if ($Stdout) {
+        # Bound parsing, not ReadToEndAsync memory. Encode only a bounded suffix.
+        $suffix = $Stdout.Substring([Math]::Max(0, $Stdout.Length - 65536))
+        $bytes = [System.Text.Encoding]::UTF8.GetBytes($suffix)
+        $truncated = $suffix.Length -lt $Stdout.Length -or $bytes.Length -gt 65536
+        $text = [System.Text.Encoding]::UTF8.GetString($bytes, [Math]::Max(0, $bytes.Length - 65536), [Math]::Min(65536, $bytes.Length))
+        if ($truncated) {
+            $leadingRecordDiscarded = $true
+            $firstNewline = $text.IndexOf("`n")
+            $text = if ($firstNewline -ge 0) { $text.Substring($firstNewline + 1) } else { '' }
+        }
+        $lines = $text.Split("`n")
+        if ($lines[-1].Length -gt 0) { $truncated = $true; $incompleteRecordDiscarded = $true }
+        $options = [System.Text.Json.JsonDocumentOptions]::new()
+        $options.MaxDepth = 32
+        $uuid = '\A[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-4[0-9a-fA-F]{3}-[89abAB][0-9a-fA-F]{3}-[0-9a-fA-F]{12}\z'
+        $state = 'complete'
+        for ($i = 0; $i -lt $lines.Length - 1; $i++) {
+            $line = $lines[$i]
+            if ([string]::IsNullOrWhiteSpace($line)) { continue }
+            $document = $null
+            try {
+                $document = [System.Text.Json.JsonDocument]::Parse([string]$line, $options)
+                $root = $document.RootElement
+                # Reject duplicate keys rather than choosing an ambiguous value.
+                $pending = [System.Collections.Generic.Stack[System.Text.Json.JsonElement]]::new()
+                $pending.Push($root)
+                $duplicate = $false
+                while ($pending.Count -gt 0 -and -not $duplicate) {
+                    $element = $pending.Pop()
+                    if ($element.ValueKind -eq [System.Text.Json.JsonValueKind]::Object) {
+                        $keys = [System.Collections.Generic.HashSet[string]]::new([StringComparer]::Ordinal)
+                        foreach ($property in $element.EnumerateObject()) {
+                            if (-not $keys.Add($property.Name)) { $duplicate = $true; break }
+                            $pending.Push($property.Value)
+                        }
+                    } elseif ($element.ValueKind -eq [System.Text.Json.JsonValueKind]::Array) {
+                        foreach ($item in $element.EnumerateArray()) { $pending.Push($item) }
+                    }
+                }
+                if ($duplicate) { $malformed++; continue }
+                $envelope = [System.Collections.Generic.Dictionary[string,System.Text.Json.JsonElement]]::new([StringComparer]::Ordinal)
+                if ($root.ValueKind -eq [System.Text.Json.JsonValueKind]::Object) {
+                    foreach ($property in $root.EnumerateObject()) { $envelope[$property.Name] = $property.Value }
+                }
+                $timestamp = [DateTimeOffset]::MinValue
+                if (-not $envelope.ContainsKey('id') -or
+                    $envelope['id'].ValueKind -ne [System.Text.Json.JsonValueKind]::String -or
+                    $envelope['id'].GetString() -cnotmatch $uuid -or
+                    -not $envelope.ContainsKey('timestamp') -or
+                    $envelope['timestamp'].ValueKind -ne [System.Text.Json.JsonValueKind]::String -or
+                    $envelope['timestamp'].GetString() -cnotmatch '\A\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d{1,7})?(?:Z|[+-]\d{2}:\d{2})\z' -or
+                    -not [DateTimeOffset]::TryParse($envelope['timestamp'].GetString(), [Globalization.CultureInfo]::InvariantCulture, [Globalization.DateTimeStyles]::None, [ref]$timestamp) -or
+                    -not $envelope.ContainsKey('parentId') -or
+                    ($envelope['parentId'].ValueKind -ne [System.Text.Json.JsonValueKind]::Null -and
+                        ($envelope['parentId'].ValueKind -ne [System.Text.Json.JsonValueKind]::String -or $envelope['parentId'].GetString() -cnotmatch $uuid)) -or
+                    -not $envelope.ContainsKey('type') -or
+                    $envelope['type'].ValueKind -ne [System.Text.Json.JsonValueKind]::String -or
+                    -not $envelope.ContainsKey('data') -or
+                    $envelope['data'].ValueKind -ne [System.Text.Json.JsonValueKind]::Object) {
+                    $unsupported++; continue
+                }
+                $type = $envelope['type'].GetString()
+                if ($type -cnotin @('model.call_failure', 'session.error')) { continue }
+                if ($type -ceq 'model.call_failure' -and
+                    (-not $envelope.ContainsKey('ephemeral') -or $envelope['ephemeral'].ValueKind -ne [System.Text.Json.JsonValueKind]::True)) {
+                    $unsupported++; continue
+                }
+                $data = [System.Collections.Generic.Dictionary[string,System.Text.Json.JsonElement]]::new([StringComparer]::Ordinal)
+                foreach ($property in $envelope['data'].EnumerateObject()) { $data[$property.Name] = $property.Value }
+                $observation = [ordered]@{ type = $type; status_code = $null; status_state = 'unavailable' }
+                if ($data.ContainsKey('statusCode')) {
+                    $observation.status_state = 'invalid'
+                    # Normalize decimal digits exactly; floating-point rounding
+                    # must not turn a fractional server value into an HTTP code.
+                    if ($data['statusCode'].ValueKind -eq [System.Text.Json.JsonValueKind]::Number -and
+                        $data['statusCode'].GetRawText() -cmatch '^([0-9]+)(?:\.([0-9]+))?(?:[eE]([+-]?[0-9]+))?$') {
+                        $fraction = [string]$Matches[2]
+                        $digits = ([string]$Matches[1] + $fraction).TrimStart('0')
+                        $significand = $digits.TrimEnd('0')
+                        $exponent = 0
+                        $validExponent = -not $Matches[3] -or [int]::TryParse($Matches[3], [ref]$exponent)
+                        $power = [long]$exponent - $fraction.Length + $digits.Length - $significand.Length
+                        if ($validExponent -and $power -ge 0 -and $power -le 2 -and $significand.Length + $power -eq 3) {
+                            $number = [int]($significand + ('0' * [int]$power))
+                            if ($number -ge 400 -and $number -le 599) {
+                                $observation.status_code = $number
+                                $observation.status_state = 'available'
+                            }
+                        }
+                    }
+                }
+                $fields = if ($type -ceq 'model.call_failure') {
+                    @{
+                        failureKind = @('api', 'transport')
+                        transport = @('http', 'websocket')
+                        source = @('top_level', 'subagent', 'mcp_sampling')
+                        badRequestKind = @('bodyless', 'structured_error')
+                    }
+                } else {
+                    @{ errorType = @('authentication', 'authorization', 'quota', 'rate_limit', 'context_limit', 'query', 'session', 'model_call') }
+                }
+                foreach ($name in $fields.Keys) {
+                    $value = 'unknown'
+                    if ($data.ContainsKey($name) -and $data[$name].ValueKind -eq [System.Text.Json.JsonValueKind]::String) {
+                        foreach ($constant in $fields[$name]) {
+                            if ($data[$name].GetString() -ceq $constant) { $value = $constant; break }
+                        }
+                    }
+                    $observation[$name] = $value
+                }
+                if ($events.Count -eq 8) { $events.RemoveAt(0); $limited = $true }
+                $events.Add($observation)
+            }
+            catch {
+                # Never surface parser exceptions: they may contain raw content.
+                $malformed++
+            }
+            finally {
+                if ($null -ne $document) { $document.Dispose() }
+            }
+        }
+        if ($unsupported -gt 0) { $state = 'unsupported' }
+        if ($malformed -gt 0) { $state = 'malformed' }
+        if ($truncated -or $limited) { $state = 'truncated' }
+    }
+    $safeExit = if ($ExitCode -is [int]) { $ExitCode } else { $null }
+    $safeTimeout = if ($TimedOut -is [bool]) { $TimedOut } else { $null }
+    $safeStage = if ($Stage -cin @('process-start', 'process-exit', 'telemetry', 'report-read', 'report-parse', 'report-validation')) { $Stage } else { 'unknown' }
+    $safeCode = if ($Code -cin @('start_failed', 'process_not_exited', 'unknown_failure', 'telemetry_invalid', 'timeout', 'nonzero_exit', 'report_missing', 'report_invalid_json', 'report_invalid')) { $Code } else { 'unknown' }
+    return [ordered]@{
+        schema_version = 1
+        leaf_ordinal = if ($Ordinal -gt 0) { $Ordinal } else { $null }
+        process = [ordered]@{ exit_code = $safeExit; timeout_observed = $safeTimeout; signal = 'unknown' }
+        capture = [ordered]@{
+            state = $state; history_omitted = $truncated; records_limited = $limited
+            leading_record_discarded = $leadingRecordDiscarded; incomplete_record_discarded = $incompleteRecordDiscarded
+            malformed_records = $malformed; unsupported_records = $unsupported
+        }
+        cli = [ordered]@{ cause = 'unknown'; observations = @($events.ToArray()) }
+        engine = [ordered]@{ stage = $safeStage; code = $safeCode }
+    }
+}
+
+function Save-LeafCliFailureDiagnostic {
+    param(
+        [Parameter(Mandatory)][string] $WorkDir,
+        [AllowNull()][string] $Stdout,
+        [AllowNull()][object] $ExitCode,
+        [AllowNull()][object] $TimedOut,
+        [Parameter(Mandatory)][int] $Ordinal,
+        [Parameter(Mandatory)][string] $Stage,
+        [Parameter(Mandatory)][string] $Code
+    )
+
+    try {
+        $diagnostic = ConvertTo-LeafCliFailureDiagnostic -Stdout $Stdout -ExitCode $ExitCode -TimedOut $TimedOut -Ordinal $Ordinal -Stage $Stage -Code $Code
+        $json = $diagnostic | ConvertTo-Json -Depth 8 -Compress
+        if ([Text.Encoding]::UTF8.GetByteCount($json) -gt 4096) { throw 'Diagnostic exceeds size limit.' }
+        Set-Content -LiteralPath (Join-Path $WorkDir '_cli-failure-diagnostic.json') -Value $json -Encoding UTF8 -NoNewline -ErrorAction Stop
+    }
+    catch {
+        [Console]::Error.WriteLine('CLI failure diagnostic unavailable.')
+    }
+}
+
 function Get-LeafCopilotArguments {
     param(
         [Parameter(Mandatory)][string] $Prompt,
@@ -2504,6 +2688,7 @@ function Get-LeafCopilotArguments {
     $copilotArgs = @(
         '--no-custom-instructions',
         '--no-color',
+        '--output-format', 'json',
         '--log-level', $CopilotLogLevel,
         '--add-dir', $ReviewDataRoot,
         '--add-dir', $BCQualityRoot,
@@ -2825,6 +3010,7 @@ function Receive-LeafCopilotProcess {
     $traceStage = 'process-exit'
     $traceCode = 'process_not_exited'
     $reportObject = $null
+    $stdout = $null
     try {
         if ($timedOut -and -not $process.HasExited) {
             try {
@@ -2859,12 +3045,7 @@ function Receive-LeafCopilotProcess {
         }
         $traceCode = 'unknown_failure'
         $stdout = $State.StdoutTask.GetAwaiter().GetResult()
-        $stderr = $State.StderrTask.GetAwaiter().GetResult()
-        Set-Content -LiteralPath (Join-Path $State.WorkDir 'stdout.txt') -Value $stdout -Encoding UTF8
-        Set-Content -LiteralPath (Join-Path $State.WorkDir 'stderr.txt') -Value $stderr -Encoding UTF8
-        $script:AgentTranscript += "=== leaf $($State.Leaf.id) ===`n"
-        if ($stdout) { $script:AgentTranscript += "out: $stdout`n" }
-        if ($stderr) { $script:AgentTranscript += "err: $stderr`n" }
+        $null = $State.StderrTask.GetAwaiter().GetResult()
 
         $terminationFailure = $null
         if ($timedOut) {
@@ -2987,6 +3168,8 @@ function Receive-LeafCopilotProcess {
         $failure = $_
         $completedAt = [DateTime]::UtcNow
         $exitCode = try { if ($process.HasExited) { $process.ExitCode } else { $null } } catch { $null }
+        Save-LeafCliFailureDiagnostic -WorkDir $State.WorkDir -Stdout $stdout -ExitCode $exitCode `
+            -TimedOut $timedOut -Ordinal $State.Leaf.ordinal -Stage $traceStage -Code $traceCode
         Set-ReviewTraceAdmission -Ordinal $State.Leaf.ordinal -Admission rejected
         Add-ReviewTraceDiagnostic -Role leaf -Ordinal $State.Leaf.ordinal -Stage $traceStage `
             -Code $traceCode -ProcessStatus failed -ReportOutcome (Get-TraceProperty $reportObject 'outcome') -ExitCode $exitCode
@@ -3040,6 +3223,9 @@ function Invoke-DeterministicLeafReviews {
                     $active.Add((Start-LeafCopilotProcess -Leaf $leaf -WorkDir $workDir -Prompt $prompt)) | Out-Null
                 }
                 catch {
+                    $startFailure = $_
+                    Save-LeafCliFailureDiagnostic -WorkDir $workDir -Stdout $null -ExitCode $null `
+                        -TimedOut $null -Ordinal $leaf.ordinal -Stage process-start -Code start_failed
                     Add-ReviewTraceDiagnostic -Role leaf -Ordinal $leaf.ordinal -Stage process-start -Code start_failed -ProcessStatus failed
                     Add-ReviewProcessTelemetry `
                         -Role leaf `
@@ -3050,11 +3236,11 @@ function Invoke-DeterministicLeafReviews {
                         -StartedAt $leafStart `
                         -CompletedAt ([DateTime]::UtcNow) `
                         -ExitCode $null `
-                        -FailureReason $_.Exception.Message
+                        -FailureReason $startFailure.Exception.Message
                     Save-ReviewRunManifest -Status running
                     $failedLeaves.Add([pscustomobject]@{
                         Leaf = $leaf
-                        Reason = $_.Exception.Message
+                        Reason = $startFailure.Exception.Message
                     }) | Out-Null
                 }
             }

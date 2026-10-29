@@ -1354,10 +1354,43 @@ Describe 'Deterministic leaf orchestration contract' {
             $failed[0].metrics.total_tokens | Should -Be 46
             $failed[0].failure_reason | Should -Match 'timed out'
             (Get-ReviewTraceState).diagnostics[0].code | Should -Be 'timeout'
+                $diagnostic = Get-Content -LiteralPath (Join-Path $workDir '_cli-failure-diagnostic.json') -Raw | ConvertFrom-Json
+                $diagnostic.process.timeout_observed | Should -BeTrue
+                $diagnostic.process.exit_code | Should -Be 0
+                $diagnostic.engine.code | Should -BeExactly 'timeout'
         }
         finally {
             $CopilotCliTimeoutMinutes = $oldTimeout
         }
+    }
+
+    It 'records a completed timeout kill without inferring a signal from its exit code' {
+        $workDir = Join-Path $TestDrive 'diagnostic-timeout-kill'
+        New-Item -ItemType Directory -Path $workDir -Force | Out-Null
+        $process = [pscustomobject]@{ HasExited = $false; ExitCode = 137; KillCalled = $false }
+        $process | Add-Member -MemberType ScriptMethod -Name Kill -Value {
+            param($EntireProcessTree)
+            $this.KillCalled = $true
+            $this.HasExited = $true
+        }
+        $process | Add-Member -MemberType ScriptMethod -Name WaitForExit -Value { param($Milliseconds) return $true }
+        $process | Add-Member -MemberType ScriptMethod -Name Dispose -Value {}
+        $CopilotCliTimeoutMinutes = 1
+        $state = [pscustomobject]@{
+            Leaf = @(Get-ReviewLeafPlan)[0]; WorkDir = $workDir
+            OtelPath = Join-Path $workDir 'absent.jsonl'; Process = $process
+            StartedAt = [DateTime]::UtcNow.AddMinutes(-2)
+            StdoutTask = [System.Threading.Tasks.Task]::FromResult([string]'')
+            StderrTask = [System.Threading.Tasks.Task]::FromResult([string]'SENTINEL kill stderr')
+        }
+        Receive-LeafCopilotProcess -State $state | Should -BeNullOrEmpty
+        $process.KillCalled | Should -BeTrue
+        $diagnostic = Get-Content -LiteralPath (Join-Path $workDir '_cli-failure-diagnostic.json') -Raw | ConvertFrom-Json
+        $diagnostic.process.timeout_observed | Should -BeTrue
+        $diagnostic.process.exit_code | Should -Be 137
+        $diagnostic.process.signal | Should -BeExactly 'unknown'
+        $diagnostic.engine.code | Should -BeExactly 'timeout'
+        $script:AgentTranscript | Should -BeExactly ''
     }
 
     It 'records an uncontrolled timed-out leaf before refusing to drain output' {
@@ -1397,6 +1430,10 @@ Describe 'Deterministic leaf orchestration contract' {
             { Receive-LeafCopilotProcess -State $state } |
                 Should -Throw "*remained running after timeout kill*"
             $script:OutputDrainAttempted | Should -BeFalse
+            $diagnostic = Get-Content -LiteralPath (Join-Path $workDir '_cli-failure-diagnostic.json') -Raw | ConvertFrom-Json
+            $diagnostic.capture.state | Should -BeExactly 'unavailable'
+            $diagnostic.process.exit_code | Should -BeNullOrEmpty
+            $diagnostic.process.timeout_observed | Should -BeTrue
             Should -Invoke Add-ReviewProcessTelemetry -Times 1 -Exactly -ParameterFilter {
                 $Status -eq 'failed' -and
                 $FailureReason -match 'remained running after timeout kill'
@@ -1438,6 +1475,107 @@ Describe 'Deterministic leaf orchestration contract' {
         { Receive-LeafCopilotProcess -State $state } |
             Should -Throw "*required model 'gpt-5.4'*"
         $script:CopilotOtelRecords.Count | Should -Be 2
+    }
+
+    It 'separates structured observations from exit and usage guard failure without retaining streams' {
+        $workDir = Join-Path $TestDrive 'diagnostic-usage-failure'
+        New-Item -ItemType Directory -Path $workDir -Force | Out-Null
+        $process = [pscustomobject]@{ HasExited = $true; ExitCode = 1 }
+        $process | Add-Member -MemberType ScriptMethod -Name Dispose -Value {}
+        $state = [pscustomobject]@{
+            Leaf = @(Get-ReviewLeafPlan)[0]; WorkDir = $workDir
+            OtelPath = Join-Path $workDir 'absent.jsonl'; Process = $process
+            StartedAt = [DateTime]::UtcNow.AddSeconds(-1)
+            StdoutTask = [System.Threading.Tasks.Task]::FromResult([string](
+                '{"id":"12345678-1234-4234-8234-123456789abc","parentId":null,"timestamp":"2026-10-29T09:00:00Z","type":"session.error","data":{"errorType":"rate_limit","statusCode":429,"message":"SENTINEL raw prompt secret"}}' + "`n"
+            ))
+            StderrTask = [System.Threading.Tasks.Task]::FromResult([string]'SENTINEL stderr secret')
+        }
+        $script:TestLeafMetrics.usage_complete = $false
+        $caught = $null
+        try { Receive-LeafCopilotProcess -State $state } catch { $caught = $_ }
+        $caught | Should -Not -BeNullOrEmpty
+        $caught.Exception.Message | Should -Match 'usage|telemetry'
+        $text = Get-Content -LiteralPath (Join-Path $workDir '_cli-failure-diagnostic.json') -Raw
+        $text | Should -Not -Match 'SENTINEL|raw prompt|stderr secret'
+        $diagnostic = $text | ConvertFrom-Json
+        $diagnostic.process.exit_code | Should -Be 1
+        $diagnostic.process.timeout_observed | Should -BeFalse
+        $diagnostic.cli.observations[0].errorType | Should -BeExactly 'rate_limit'
+        $diagnostic.cli.observations[0].status_code | Should -Be 429
+        $diagnostic.cli.cause | Should -BeExactly 'unknown'
+        $diagnostic.engine.stage | Should -BeExactly 'telemetry'
+        $diagnostic.engine.code | Should -BeExactly 'telemetry_invalid'
+        $script:AgentTranscript | Should -BeExactly ''
+        @(Get-ChildItem -LiteralPath $workDir).Name | Should -Be @('_cli-failure-diagnostic.json')
+    }
+
+    It 'keeps the original guard error record when diagnostic persistence fails' {
+        $state = Start-LeafCopilotProcess -Leaf (@(Get-ReviewLeafPlan)[0]) -WorkDir (Join-Path $TestDrive 'diagnostic-write-failure') -Prompt 'unused'
+        $script:OriginalGuardError = [System.Management.Automation.ErrorRecord]::new(
+            [InvalidOperationException]::new('Original usage guard failure'),
+            'OriginalUsageGuard',
+            [System.Management.Automation.ErrorCategory]::InvalidData,
+            $null
+        )
+        Mock Assert-CopilotInvocationMetrics { throw $script:OriginalGuardError }
+        New-Item -ItemType Directory -Path (Join-Path $state.WorkDir '_cli-failure-diagnostic.json') -Force | Out-Null
+        $writer = [IO.StringWriter]::new()
+        $original = [Console]::Error
+        $caught = $null
+        try {
+            [Console]::SetError($writer)
+            try { Receive-LeafCopilotProcess -State $state } catch { $caught = $_ }
+        } finally {
+            [Console]::SetError($original)
+        }
+        $caught.Exception.Message | Should -BeExactly 'Original usage guard failure'
+        $caught.FullyQualifiedErrorId | Should -Match 'OriginalUsageGuard'
+        $writer.ToString().Trim() | Should -BeExactly 'CLI failure diagnostic unavailable.'
+    }
+
+    It 'keeps successful report transport byte-identical while draining and discarding both JSON-mode streams' {
+        $leaf = @(Get-ReviewLeafPlan)[0]
+        $script:TestLeafReports[$leaf.id] = @{
+            skill = @{ id = $leaf.id }; findings = @(); suppressed = @()
+        }
+        $state = Start-LeafCopilotProcess -Leaf $leaf -WorkDir (Join-Path $TestDrive 'diagnostic-success') -Prompt 'unused'
+        $path = Join-Path $state.WorkDir $ReportFileName
+        $before = [Convert]::ToBase64String([IO.File]::ReadAllBytes($path))
+        $state.StdoutTask = [System.Threading.Tasks.Task]::FromResult([string]'SENTINEL fabricated stdout report')
+        $script:DiagnosticStderrDrained = $false
+        $stderrTask = [pscustomobject]@{}
+        $stderrTask | Add-Member -MemberType ScriptMethod -Name GetAwaiter -Value { return $this }
+        $stderrTask | Add-Member -MemberType ScriptMethod -Name GetResult -Value {
+            $script:DiagnosticStderrDrained = $true
+            return 'SENTINEL stderr'
+        }
+        $state.StderrTask = $stderrTask
+        $result = Receive-LeafCopilotProcess -State $state
+        $result.Report.findings.Count | Should -Be 0
+        [Convert]::ToBase64String([IO.File]::ReadAllBytes($path)) | Should -BeExactly $before
+        $script:DiagnosticStderrDrained | Should -BeTrue
+        $script:AgentTranscript | Should -BeExactly ''
+        @(Get-ChildItem -LiteralPath $state.WorkDir).Name | Should -Be @('_review-report.json', '_review-report.raw.json')
+    }
+
+    It 'records startup failure as unknown without replacing the existing failure reason' {
+        Mock Start-LeafCopilotProcess {
+            param($WorkDir)
+            New-Item -ItemType Directory -Path $WorkDir -Force | Out-Null
+            throw 'Original pre-stream startup failure'
+        }
+        $leaf = @(Get-ReviewLeafPlan)[0]
+        @(Invoke-DeterministicLeafReviews -Plan @($leaf)).Count | Should -Be 0
+        $path = Join-Path $ReviewOutputDir 'leaf-results/01-al-security-review/_cli-failure-diagnostic.json'
+        $diagnostic = Get-Content -LiteralPath $path -Raw | ConvertFrom-Json
+        $diagnostic.engine.stage | Should -BeExactly 'process-start'
+        $diagnostic.engine.code | Should -BeExactly 'start_failed'
+        $diagnostic.process.exit_code | Should -BeNullOrEmpty
+        $diagnostic.process.timeout_observed | Should -BeNullOrEmpty
+        $diagnostic.capture.state | Should -BeExactly 'unavailable'
+        $diagnostic.cli.observations.Count | Should -Be 0
+        $script:FailedLeafReviews[0].Reason | Should -BeExactly 'Original pre-stream startup failure'
     }
 
     It 'consolidates only after ordered leaf reports exist and forbids leaf retries' {

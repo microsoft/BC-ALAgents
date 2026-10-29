@@ -206,6 +206,25 @@ raw reports follow the existing `_review-*`/`leaf-results` cleanup lifecycle.
 Article retrieval proof and review knowledge remain BCQuality responsibilities;
 this gate does not claim that an existing cited article was read in full.
 
+Leaf CLI invocations use JSONL output, but neither stream is saved or appended
+to the agent transcript. Reports still come exclusively from report files.
+On failure, `leaf-results/*/_cli-failure-diagnostic.json` separates local
+exit/timeout facts, allowlisted CLI error observations, and the engine validation
+stage/code. Its cause and signal remain `unknown`; a request failure may have
+been retried and is not proof of the terminal cause. Startup failures may have
+no structured observations. Diagnostics never replace the original exception
+or bypass model/usage validation.
+
+The projection parses only the last 64 KiB of stdout and keeps at most eight
+complete error events. It rejects duplicate keys, validates envelopes, and
+exports only fixed categories/enums and integral HTTP error statuses (400-599),
+never messages, IDs, URLs, credentials or model/tool/user content. Missing,
+malformed, unsupported and truncated capture is explicit. The diagnostic is
+limited to 4 KiB; a write failure emits a fixed notice. This bounds parsing and
+retained evidence, **not** the existing `ReadToEndAsync` memory usage. Root
+invocation/transcript handling is unchanged. Uploaders must explicitly validate
+and allowlist this file rather than uploading raw streams or broadening globs.
+
 The consumer may accept a **bounded normalized copy**, never a modified raw
 payload. The original must pass JSON/role/schema validation and all mechanical
 semantic checks except citation-ID equality and an eligible range-start mismatch.
